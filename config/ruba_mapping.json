@@ -1,0 +1,186 @@
+{
+  "_meta": {
+    "descripcion": "Mapeo desacoplado entre RegistroServicio.to_flat_dict() (core/models.py) y los selectores HTML del portal RUBA. El bot de Playwright NO debe tener selectores hardcodeados: siempre debe leer este archivo.",
+    "convenciones": {
+      "selector_type": "id | name | css | xpath",
+      "tipo_campo": "text | textarea | number | date | time | datetime | select | radio | checkbox",
+      "opciones": "Para selects/radios: mapea el valor interno del modelo (izquierda) al value real del <option>/<input> en RUBA (derecha). Todos los 'TODO_*' deben completarse inspeccionando el DOM real del portal antes de activar el bot.",
+      "dotaciones": "Los campos de dotaciones NO se listan uno por uno: se arman en runtime a partir de 'dotacion_plantilla', reemplazando '{n}' por el número de dotación (1 o 2).",
+      "bomberos_dotacion": "El PCD numera los roles de bombero de la dotación del 4 al 12 (Jefe Dotación, Jefe Seguridad y Chofer ocupan los roles 1 a 3). '{b}' en la plantilla recorre 4..12 y corresponde a personal.bomberos[{b} - 4] en la lista interna (índice 0-based)."
+    }
+  },
+
+  "url_formulario": "TODO_URL_ALTA_SINIESTRO_RUBA",
+
+  "campos": {
+    "pedido_socorro.n_siniestro": {
+      "selector": "TODO_id_n_siniestro", "selector_type": "id", "tipo_campo": "text",
+      "notas": "N° de siniestro / acta."
+    },
+    "pedido_socorro.fecha": {
+      "selector": "TODO_id_fecha", "selector_type": "id", "tipo_campo": "date",
+      "formato": "DD/MM/AAAA", "notas": "Verificar formato de fecha esperado por el datepicker de RUBA."
+    },
+    "pedido_socorro.dia": {
+      "selector": "TODO_id_dia_semana", "selector_type": "id", "tipo_campo": "text",
+      "notas": "Puede no existir en RUBA si se calcula solo a partir de la fecha; en ese caso, omitir este campo en el bot."
+    },
+    "pedido_socorro.hora_llamado": {
+      "selector": "TODO_id_hora_llamado", "selector_type": "id", "tipo_campo": "time",
+      "formato": "HH:mm"
+    },
+    "pedido_socorro.comunico": {
+      "selector": "TODO_id_comunico", "selector_type": "id", "tipo_campo": "text"
+    },
+    "pedido_socorro.domicilio_denunciante": {
+      "selector": "TODO_id_domicilio_denunciante", "selector_type": "id", "tipo_campo": "text"
+    },
+    "pedido_socorro.medio_contacto": {
+      "selector": "TODO_id_medio_contacto", "selector_type": "id", "tipo_campo": "select",
+      "opciones": {
+        "Personal": "TODO_value_personal",
+        "Radio": "TODO_value_radio",
+        "Teléfono": "TODO_value_telefono"
+      }
+    },
+    "pedido_socorro.medio_contacto_detalle": {
+      "selector": "TODO_id_medio_contacto_detalle", "selector_type": "id", "tipo_campo": "text",
+      "notas": "N° de teléfono o canal de radio."
+    },
+    "pedido_socorro.recibio_aviso.nombre": {
+      "selector": "TODO_id_recibio_aviso_nombre", "selector_type": "id", "tipo_campo": "text"
+    },
+    "pedido_socorro.recibio_aviso.grado": {
+      "selector": "TODO_id_recibio_aviso_grado", "selector_type": "id", "tipo_campo": "select",
+      "opciones": { "Bombero": "TODO", "Cabo": "TODO", "Sargento": "TODO", "Oficial": "TODO" }
+    },
+    "pedido_socorro.alarma_activada": {
+      "selector": "TODO_name_alarma_activada", "selector_type": "name", "tipo_campo": "radio",
+      "opciones": { "true": "TODO_value_si", "false": "TODO_value_no" }
+    },
+    "pedido_socorro.sab": {
+      "selector": "TODO_id_sab", "selector_type": "id", "tipo_campo": "text"
+    },
+    "pedido_socorro.hora_alarma": {
+      "selector": "TODO_id_hora_alarma", "selector_type": "id", "tipo_campo": "time"
+    },
+    "pedido_socorro.autorizo_salida.nombre": {
+      "selector": "TODO_id_autorizo_salida_nombre", "selector_type": "id", "tipo_campo": "text"
+    },
+    "pedido_socorro.autorizo_salida.grado": {
+      "selector": "TODO_id_autorizo_salida_grado", "selector_type": "id", "tipo_campo": "select",
+      "opciones": { "Bombero": "TODO", "Cabo": "TODO", "Sargento": "TODO", "Oficial": "TODO" }
+    },
+
+    "datos_siniestro.tipo": {
+      "selector": "TODO_id_tipo_siniestro", "selector_type": "id", "tipo_campo": "select",
+      "opciones": {
+        "Accidente": "TODO", "Factor Climático": "TODO", "Incendio": "TODO",
+        "Rescate": "TODO", "Mat-Pel": "TODO", "Otro": "TODO"
+      }
+    },
+    "datos_siniestro.subtipo": {
+      "selector": "TODO_id_subtipo_siniestro", "selector_type": "id", "tipo_campo": "select",
+      "notas": "Depende de 'tipo'; suele ser un <select> que RUBA repuebla vía AJAX. El bot debe esperar a que se repueble antes de elegir el value.",
+      "opciones": { "*": "TODO_completar_por_subtipo" }
+    },
+    "datos_siniestro.magnitud": {
+      "selector": "TODO_id_magnitud", "selector_type": "id", "tipo_campo": "select",
+      "opciones": { "1": "TODO", "2": "TODO", "3": "TODO" }
+    },
+    "datos_siniestro.localidad": {
+      "selector": "TODO_id_localidad", "selector_type": "id", "tipo_campo": "select",
+      "opciones": { "Adelia María": "TODO" }
+    },
+    "datos_siniestro.calle_lugar": {
+      "selector": "TODO_id_calle_lugar", "selector_type": "id", "tipo_campo": "text"
+    },
+    "datos_siniestro.zona_barrio": {
+      "selector": "TODO_id_zona_barrio", "selector_type": "id", "tipo_campo": "text"
+    },
+    "datos_siniestro.descripcion": {
+      "selector": "TODO_id_descripcion", "selector_type": "id", "tipo_campo": "textarea"
+    },
+
+    "totales.total_cuartel": {
+      "selector": "TODO_id_total_cuartel", "selector_type": "id", "tipo_campo": "number",
+      "notas": "Solo si RUBA no lo calcula automáticamente a partir del personal cargado."
+    },
+    "totales.total_servicio": {
+      "selector": "TODO_id_total_servicio", "selector_type": "id", "tipo_campo": "number"
+    },
+    "totales.total_general": {
+      "selector": "TODO_id_total_general", "selector_type": "id", "tipo_campo": "number"
+    }
+  },
+
+  "dotacion_plantilla": {
+    "descripcion": "Selectores parametrizados por N° de dotación ({n} = 1 o 2). El bot los interpola antes de usarlos con Playwright.",
+    "campos": {
+      "movil": {
+        "selector": "TODO_id_dotacion_{n}_movil", "selector_type": "id", "tipo_campo": "select",
+        "opciones": { "*": "TODO_completar_con_moviles_del_cuartel" }
+      },
+      "fecha_hora_salida": {
+        "selector": "TODO_id_dotacion_{n}_salida", "selector_type": "id", "tipo_campo": "datetime"
+      },
+      "hora_arribo_qth": {
+        "selector": "TODO_id_dotacion_{n}_arribo_qth", "selector_type": "id", "tipo_campo": "time"
+      },
+      "fecha_hora_regreso": {
+        "selector": "TODO_id_dotacion_{n}_regreso", "selector_type": "id", "tipo_campo": "datetime"
+      },
+      "personal.jefe_dotacion.nombre": {
+        "selector": "TODO_id_dotacion_{n}_jefe_nombre", "selector_type": "id", "tipo_campo": "text"
+      },
+      "personal.jefe_dotacion.grado": {
+        "selector": "TODO_id_dotacion_{n}_jefe_grado", "selector_type": "id", "tipo_campo": "select"
+      },
+      "personal.jefe_seguridad.nombre": {
+        "selector": "TODO_id_dotacion_{n}_jefe_seguridad_nombre", "selector_type": "id", "tipo_campo": "text"
+      },
+      "personal.chofer.nombre": {
+        "selector": "TODO_id_dotacion_{n}_chofer_nombre", "selector_type": "id", "tipo_campo": "text"
+      },
+      "personal.bomberos.{b}.nombre": {
+        "selector": "TODO_id_dotacion_{n}_bombero_{b}_nombre", "selector_type": "id", "tipo_campo": "text",
+        "rango_b": [4, 12],
+        "notas": "Corresponde a personal.bomberos[{b}-4] en el modelo interno."
+      },
+      "personal.bomberos.{b}.grado": {
+        "selector": "TODO_id_dotacion_{n}_bombero_{b}_grado", "selector_type": "id", "tipo_campo": "select",
+        "rango_b": [4, 12]
+      },
+      "informe_tactico": {
+        "selector": "TODO_id_dotacion_{n}_informe", "selector_type": "id", "tipo_campo": "textarea"
+      },
+      "damnificados_personas": {
+        "selector": "TODO_name_dotacion_{n}_damnificados_personas", "selector_type": "name", "tipo_campo": "radio",
+        "opciones": { "true": "TODO_value_si", "false": "TODO_value_no" }
+      },
+      "cantidad_damnificados_personas": {
+        "selector": "TODO_id_dotacion_{n}_cant_damnificados", "selector_type": "id", "tipo_campo": "number"
+      },
+      "damnificados_bomberos": {
+        "selector": "TODO_name_dotacion_{n}_damnificados_bomberos", "selector_type": "name", "tipo_campo": "radio",
+        "opciones": { "true": "TODO_value_si", "false": "TODO_value_no" }
+      },
+      "superficie_afectada": {
+        "selector": "TODO_id_dotacion_{n}_superficie", "selector_type": "id", "tipo_campo": "text"
+      },
+      "causa": {
+        "selector": "TODO_id_dotacion_{n}_causa", "selector_type": "id", "tipo_campo": "select",
+        "opciones": {
+          "Negligencia": "TODO", "Intencional": "TODO", "Desconocida": "TODO", "Natural": "TODO"
+        }
+      },
+      "coordenadas_gps": {
+        "selector": "TODO_id_dotacion_{n}_gps", "selector_type": "id", "tipo_campo": "text"
+      },
+      "firma_jefe_dotacion": {
+        "selector": "TODO_id_dotacion_{n}_firma_confirmada", "selector_type": "id", "tipo_campo": "checkbox",
+        "notas": "En RUBA probablemente no exista un campo de firma digital equivalente; confirmar si corresponde omitir."
+      }
+    }
+  }
+}

@@ -1,0 +1,17 @@
+# GUI
+customtkinter==5.2.2
+Pillow==10.4.0
+
+# Planillas Excel (PCS.xlsx / PCD2.xlsx) manteniendo estilos y celdas combinadas
+openpyxl==3.1.5
+
+# Conversión a PDF / impresión (requiere Microsoft Excel instalado en Windows)
+pywin32==306
+
+# Automatización web del portal RUBA
+playwright==1.47.0
+
+# Utilidades de fecha/hora
+python-dateutil==2.9.0.post0
+
+# Base de datos local: sqlite3 es módulo estándar de Python, no requiere instalación.
