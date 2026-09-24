@@ -1,185 +1,354 @@
 {
   "_meta": {
-    "descripcion": "Mapeo desacoplado entre RegistroServicio.to_flat_dict() (core/models.py) y los selectores HTML del portal RUBA. El bot de Playwright NO debe tener selectores hardcodeados: siempre debe leer este archivo.",
-    "convenciones": {
-      "selector_type": "id | name | css | xpath",
-      "tipo_campo": "text | textarea | number | date | time | datetime | select | radio | checkbox",
-      "opciones": "Para selects/radios: mapea el valor interno del modelo (izquierda) al value real del <option>/<input> en RUBA (derecha). Todos los 'TODO_*' deben completarse inspeccionando el DOM real del portal antes de activar el bot.",
-      "dotaciones": "Los campos de dotaciones NO se listan uno por uno: se arman en runtime a partir de 'dotacion_plantilla', reemplazando '{n}' por el número de dotación (1 o 2).",
-      "bomberos_dotacion": "El PCD numera los roles de bombero de la dotación del 4 al 12 (Jefe Dotación, Jefe Seguridad y Chofer ocupan los roles 1 a 3). '{b}' en la plantilla recorre 4..12 y corresponde a personal.bomberos[{b} - 4] en la lista interna (índice 0-based)."
-    }
+    "sistema": "Gestión Bomberil / RUBA Oficial",
+    "url_base": "https://www.gestionbomberos.org",
+    "url_login": "https://www.gestionbomberos.org/login",
+    "url_incidentes": "https://www.gestionbomberos.org/estructura/incidente/",
+    "url_agregar": "https://www.gestionbomberos.org/estructura/incidente/agregar"
   },
-
-  "url_formulario": "TODO_URL_ALTA_SINIESTRO_RUBA",
-
-  "campos": {
-    "pedido_socorro.n_siniestro": {
-      "selector": "TODO_id_n_siniestro", "selector_type": "id", "tipo_campo": "text",
-      "notas": "N° de siniestro / acta."
-    },
-    "pedido_socorro.fecha": {
-      "selector": "TODO_id_fecha", "selector_type": "id", "tipo_campo": "date",
-      "formato": "DD/MM/AAAA", "notas": "Verificar formato de fecha esperado por el datepicker de RUBA."
-    },
-    "pedido_socorro.dia": {
-      "selector": "TODO_id_dia_semana", "selector_type": "id", "tipo_campo": "text",
-      "notas": "Puede no existir en RUBA si se calcula solo a partir de la fecha; en ese caso, omitir este campo en el bot."
-    },
-    "pedido_socorro.hora_llamado": {
-      "selector": "TODO_id_hora_llamado", "selector_type": "id", "tipo_campo": "time",
-      "formato": "HH:mm"
-    },
-    "pedido_socorro.comunico": {
-      "selector": "TODO_id_comunico", "selector_type": "id", "tipo_campo": "text"
-    },
-    "pedido_socorro.domicilio_denunciante": {
-      "selector": "TODO_id_domicilio_denunciante", "selector_type": "id", "tipo_campo": "text"
-    },
-    "pedido_socorro.medio_contacto": {
-      "selector": "TODO_id_medio_contacto", "selector_type": "id", "tipo_campo": "select",
-      "opciones": {
-        "Personal": "TODO_value_personal",
-        "Radio": "TODO_value_radio",
-        "Teléfono": "TODO_value_telefono"
+  "catalogo": {
+    "1": {
+      "nombre": "Accidentes",
+      "subtipos": {
+        "1": "Aéreo",
+        "2": "Embarcaciones",
+        "3": "Tránsito",
+        "4": "Otros"
       }
     },
-    "pedido_socorro.medio_contacto_detalle": {
-      "selector": "TODO_id_medio_contacto_detalle", "selector_type": "id", "tipo_campo": "text",
-      "notas": "N° de teléfono o canal de radio."
-    },
-    "pedido_socorro.recibio_aviso.nombre": {
-      "selector": "TODO_id_recibio_aviso_nombre", "selector_type": "id", "tipo_campo": "text"
-    },
-    "pedido_socorro.recibio_aviso.grado": {
-      "selector": "TODO_id_recibio_aviso_grado", "selector_type": "id", "tipo_campo": "select",
-      "opciones": { "Bombero": "TODO", "Cabo": "TODO", "Sargento": "TODO", "Oficial": "TODO" }
-    },
-    "pedido_socorro.alarma_activada": {
-      "selector": "TODO_name_alarma_activada", "selector_type": "name", "tipo_campo": "radio",
-      "opciones": { "true": "TODO_value_si", "false": "TODO_value_no" }
-    },
-    "pedido_socorro.sab": {
-      "selector": "TODO_id_sab", "selector_type": "id", "tipo_campo": "text"
-    },
-    "pedido_socorro.hora_alarma": {
-      "selector": "TODO_id_hora_alarma", "selector_type": "id", "tipo_campo": "time"
-    },
-    "pedido_socorro.autorizo_salida.nombre": {
-      "selector": "TODO_id_autorizo_salida_nombre", "selector_type": "id", "tipo_campo": "text"
-    },
-    "pedido_socorro.autorizo_salida.grado": {
-      "selector": "TODO_id_autorizo_salida_grado", "selector_type": "id", "tipo_campo": "select",
-      "opciones": { "Bombero": "TODO", "Cabo": "TODO", "Sargento": "TODO", "Oficial": "TODO" }
-    },
-
-    "datos_siniestro.tipo": {
-      "selector": "TODO_id_tipo_siniestro", "selector_type": "id", "tipo_campo": "select",
-      "opciones": {
-        "Accidente": "TODO", "Factor Climático": "TODO", "Incendio": "TODO",
-        "Rescate": "TODO", "Mat-Pel": "TODO", "Otro": "TODO"
+    "2": {
+      "nombre": "Factores Climáticos",
+      "subtipos": {
+        "5": "Ciclón",
+        "6": "Tornados y Huracanes",
+        "7": "Nevadas",
+        "8": "Granizo",
+        "9": "Tormentas",
+        "10": "Volcán",
+        "11": "Avalancha y Alud",
+        "12": "Inundaciones",
+        "43": "Sismo",
+        "13": "Otros"
       }
     },
-    "datos_siniestro.subtipo": {
-      "selector": "TODO_id_subtipo_siniestro", "selector_type": "id", "tipo_campo": "select",
-      "notas": "Depende de 'tipo'; suele ser un <select> que RUBA repuebla vía AJAX. El bot debe esperar a que se repueble antes de elegir el value.",
-      "opciones": { "*": "TODO_completar_por_subtipo" }
+    "3": {
+      "nombre": "Incendios",
+      "subtipos": {
+        "14": "Aeronaves",
+        "15": "Comercio",
+        "16": "Embarcaciones",
+        "17": "Establecimientos Educativos",
+        "18": "Establecimiento Público",
+        "19": "Forestal",
+        "20": "Hospitales y Clínicas",
+        "21": "Industrias",
+        "22": "Vehicular",
+        "23": "Vivienda",
+        "24": "Otros"
+      }
     },
-    "datos_siniestro.magnitud": {
-      "selector": "TODO_id_magnitud", "selector_type": "id", "tipo_campo": "select",
-      "opciones": { "1": "TODO", "2": "TODO", "3": "TODO" }
+    "4": {
+      "nombre": "Materiales Peligrosos",
+      "subtipos": {
+        "25": "Escape o Fuga",
+        "26": "Derrame",
+        "27": "Explosión"
+      }
     },
-    "datos_siniestro.localidad": {
-      "selector": "TODO_id_localidad", "selector_type": "id", "tipo_campo": "select",
-      "opciones": { "Adelia María": "TODO" }
+    "5": {
+      "nombre": "Rescates",
+      "subtipos": {
+        "28": "Personas",
+        "29": "Animales",
+        "44": "Objetos"
+      }
     },
-    "datos_siniestro.calle_lugar": {
-      "selector": "TODO_id_calle_lugar", "selector_type": "id", "tipo_campo": "text"
-    },
-    "datos_siniestro.zona_barrio": {
-      "selector": "TODO_id_zona_barrio", "selector_type": "id", "tipo_campo": "text"
-    },
-    "datos_siniestro.descripcion": {
-      "selector": "TODO_id_descripcion", "selector_type": "id", "tipo_campo": "textarea"
-    },
-
-    "totales.total_cuartel": {
-      "selector": "TODO_id_total_cuartel", "selector_type": "id", "tipo_campo": "number",
-      "notas": "Solo si RUBA no lo calcula automáticamente a partir del personal cargado."
-    },
-    "totales.total_servicio": {
-      "selector": "TODO_id_total_servicio", "selector_type": "id", "tipo_campo": "number"
-    },
-    "totales.total_general": {
-      "selector": "TODO_id_total_general", "selector_type": "id", "tipo_campo": "number"
+    "6": {
+      "nombre": "Servicios Especiales",
+      "subtipos": {
+        "30": "Servicio de Ambulancia",
+        "31": "Capacitación",
+        "32": "Servicios Especiales",
+        "33": "Prevención",
+        "34": "Falsa Alarma",
+        "35": "Representación",
+        "36": "Falso Aviso",
+        "38": "Suministro de agua",
+        "39": "Extracción de panales",
+        "40": "Retirado de óbito",
+        "41": "Colaboración con fuerzas de seguridad",
+        "42": "Colocación de driza",
+        "37": "Otros"
+      }
     }
   },
-
-  "dotacion_plantilla": {
-    "descripcion": "Selectores parametrizados por N° de dotación ({n} = 1 o 2). El bot los interpola antes de usarlos con Playwright.",
-    "campos": {
-      "movil": {
-        "selector": "TODO_id_dotacion_{n}_movil", "selector_type": "id", "tipo_campo": "select",
-        "opciones": { "*": "TODO_completar_con_moviles_del_cuartel" }
-      },
-      "fecha_hora_salida": {
-        "selector": "TODO_id_dotacion_{n}_salida", "selector_type": "id", "tipo_campo": "datetime"
-      },
-      "hora_arribo_qth": {
-        "selector": "TODO_id_dotacion_{n}_arribo_qth", "selector_type": "id", "tipo_campo": "time"
-      },
-      "fecha_hora_regreso": {
-        "selector": "TODO_id_dotacion_{n}_regreso", "selector_type": "id", "tipo_campo": "datetime"
-      },
-      "personal.jefe_dotacion.nombre": {
-        "selector": "TODO_id_dotacion_{n}_jefe_nombre", "selector_type": "id", "tipo_campo": "text"
-      },
-      "personal.jefe_dotacion.grado": {
-        "selector": "TODO_id_dotacion_{n}_jefe_grado", "selector_type": "id", "tipo_campo": "select"
-      },
-      "personal.jefe_seguridad.nombre": {
-        "selector": "TODO_id_dotacion_{n}_jefe_seguridad_nombre", "selector_type": "id", "tipo_campo": "text"
-      },
-      "personal.chofer.nombre": {
-        "selector": "TODO_id_dotacion_{n}_chofer_nombre", "selector_type": "id", "tipo_campo": "text"
-      },
-      "personal.bomberos.{b}.nombre": {
-        "selector": "TODO_id_dotacion_{n}_bombero_{b}_nombre", "selector_type": "id", "tipo_campo": "text",
-        "rango_b": [4, 12],
-        "notas": "Corresponde a personal.bomberos[{b}-4] en el modelo interno."
-      },
-      "personal.bomberos.{b}.grado": {
-        "selector": "TODO_id_dotacion_{n}_bombero_{b}_grado", "selector_type": "id", "tipo_campo": "select",
-        "rango_b": [4, 12]
-      },
-      "informe_tactico": {
-        "selector": "TODO_id_dotacion_{n}_informe", "selector_type": "id", "tipo_campo": "textarea"
-      },
-      "damnificados_personas": {
-        "selector": "TODO_name_dotacion_{n}_damnificados_personas", "selector_type": "name", "tipo_campo": "radio",
-        "opciones": { "true": "TODO_value_si", "false": "TODO_value_no" }
-      },
-      "cantidad_damnificados_personas": {
-        "selector": "TODO_id_dotacion_{n}_cant_damnificados", "selector_type": "id", "tipo_campo": "number"
-      },
-      "damnificados_bomberos": {
-        "selector": "TODO_name_dotacion_{n}_damnificados_bomberos", "selector_type": "name", "tipo_campo": "radio",
-        "opciones": { "true": "TODO_value_si", "false": "TODO_value_no" }
-      },
-      "superficie_afectada": {
-        "selector": "TODO_id_dotacion_{n}_superficie", "selector_type": "id", "tipo_campo": "text"
-      },
-      "causa": {
-        "selector": "TODO_id_dotacion_{n}_causa", "selector_type": "id", "tipo_campo": "select",
-        "opciones": {
-          "Negligencia": "TODO", "Intencional": "TODO", "Desconocida": "TODO", "Natural": "TODO"
+  "vehiculos_cuartel": {
+    "4326": "Nº Móvil: Rojo 18 (Ford - F-100 4x4)",
+    "4327": "Nº Móvil: Rojo 12 (Ford - 14000)",
+    "5629": "Nº Móvil: Rojo 19 (Ford - Ranger)",
+    "9181": "Nº Móvil: Rojo 22 (Daf - DAF LS)",
+    "9182": "Nº Móvil: Rojo 21 (Hyundai - H 1)",
+    "9906": "Nº Móvil: Rojo 23 (Man - 076-TGM 13.250)",
+    "11699": "Nº Móvil: Rojo 24 (Man - TGM-13.290)",
+    "11706": "Nº Móvil: Rojo 25 (Daf - 75-250)",
+    "12416": "Nº Móvil: 26 (Ford - Ranger)",
+    "14795": "Nº Móvil: 27 (Chevrolet - 840-SILVERADO Z71 TRAIL BOSS)"
+  },
+  "selectores": {
+    "inicializacion": {
+      "numero_parte": "#bomberos_estructurabundle_inicializacionIncidenteType_numeroParte",
+      "tipo_incidente": "#bomberos_estructurabundle_inicializacionIncidenteType_tipoIncidente",
+      "categoria_incidente": "#bomberos_estructurabundle_inicializacionIncidenteType_categoriaIncidente",
+      "hay_participaciones": "#bomberos_estructurabundle_inicializacionIncidenteType_hayParticipciones",
+      "cuerpos": "#bomberos_estructurabundle_inicializacionIncidenteType_cuerpos",
+      "btn_guardar": "button.js-submit"
+    },
+    "editar_general": {
+      "localidad_autocomplete": "input[id^='autocomplete_'][id*='_localidad']:visible, input[id*='_otraLocalidad']:visible",
+      "otra_localidad": "input[id*='_otraLocalidad']",
+      "calle": "input[id*='_ubicacion_calle']",
+      "altura": "input[id*='_ubicacion_altura']",
+      "provincia": "select[id*='_provincia']",
+      "tipo_zona": "select[id*='_tipoZona']",
+      "radio_direccion": "input[name='optionsUbicacion'][value='option_direccion']",
+      "btn_buscar_puntos": ".js-buscar-puntos, button:has-text('Buscar Puntos')",
+      "combo_direccion_confirmar": "#combo_direccion",
+      "latitud": "input[id$='_ubicacion_latitud']",
+      "longitud": "input[id$='_ubicacion_longitud']",
+      "nombre_solicitante": "input[id*='_nombreSolicitante']",
+      "apellido_solicitante": "input[id*='_apellidoSolicitante']",
+      "telefono_solicitante": "input[id*='_telefonoSolicitante']",
+      "dni_solicitante": "input[id*='_dniSolicitante']",
+      "hay_intervinientes_personas": "select[id$='_hayIntervinientesPersonas']",
+      "descripcion": "textarea[id*='_descripcion']",
+      "civiles_heridos": "input[id*='_cantidadCivilesHeridos']",
+      "civiles_fallecidos": "input[id*='_cantidadCivilesFallecidos']",
+      "civiles_desaparecidos": "input[id*='_cantidadCivilesDesaparecidos']",
+      "compania_seguro": "input[id*='_companiaSeguro']",
+      "numero_poliza": "input[id*='_numeroPoliza']",
+      "liberar_si_vacios": [
+        "otraLocalidad",
+        "fechaVencimientoSeguro",
+        "otroTipoLugarForestal"
+      ],
+      "btn_guardar_continuar": "button[name='save_&_continue']",
+      "condicionales": {
+        "incendio_forestal": {
+          "tipo_lugar": "#bomberos_estructurabundle_incidenteIncendioType_tipoLugarForestal",
+          "tipo_lugar_opciones": {
+            "campo": "1",
+            "bosque": "2",
+            "isla": "3",
+            "montana": "4",
+            "bosque_nativo": "5",
+            "bosque_cultivado": "6",
+            "pastizal": "7",
+            "arbustal_matorral": "8",
+            "interfase": "9",
+            "basural": "10",
+            "otro": "999"
+          },
+          "unidad_superficie": "#bomberos_estructurabundle_incidenteIncendioType_evacuacion",
+          "unidad_superficie_opciones": {
+            "no_se_evacuo": "1",
+            "kilometros": "2",
+            "hectareas": "3",
+            "metros": "4",
+            "evacuacion_parcial": "5",
+            "evacuacion_total": "6"
+          },
+          "cantidad_superficie": "#bomberos_estructurabundle_incidenteIncendioType_superficieEvacuada",
+          "causa": "#bomberos_estructurabundle_incidenteIncendioType_causaIncendio",
+          "causa_opciones": {
+            "desconocida": "4",
+            "negligencia": "1",
+            "intencional": "2",
+            "natural": "3"
+          },
+          "causa_default": "4"
+        },
+        "incendio_estructural": {
+          "tipo_lugar": "#bomberos_estructurabundle_incidenteIncendioType_tipoLugar",
+          "tipo_lugar_opciones": {
+            "casa": "1",
+            "dpto": "2",
+            "casilla": "3",
+            "rancho": "4",
+            "multifamiliar": "5",
+            "otros": "999"
+          },
+          "unidad_superficie": "#bomberos_estructurabundle_incidenteIncendioType_evacuacion",
+          "cantidad_superficie": "#bomberos_estructurabundle_incidenteIncendioType_superficieEvacuada",
+          "cantidad_pisos": "#bomberos_estructurabundle_incidenteIncendioType_cantidadPisos",
+          "cantidad_ambientes": "#bomberos_estructurabundle_incidenteIncendioType_cantidadAmbientes",
+          "numero_piso": "#bomberos_estructurabundle_incidenteIncendioType_numeroPiso",
+          "tipo_techo": "#bomberos_estructurabundle_incidenteIncendioType_tipoTecho",
+          "tipo_techo_opciones": {
+            "madera_paja": "1",
+            "yeso": "2",
+            "tejas": "3",
+            "chapa_metalica": "4",
+            "chapa_carton": "5",
+            "otro": "999"
+          },
+          "tipo_abertura": "#bomberos_estructurabundle_incidenteIncendioType_tipoAbertura",
+          "tipo_abertura_opciones": {
+            "madera": "1",
+            "acero_hierro": "2",
+            "aluminio": "3",
+            "plastica": "4",
+            "otro": "999"
+          },
+          "deteccion_automatica": {
+            "si": "#bomberos_estructurabundle_incidenteIncendioType_huboDeteccionAutomatica_0",
+            "no": "#bomberos_estructurabundle_incidenteIncendioType_huboDeteccionAutomatica_1"
+          },
+          "habia_extintores": {
+            "si": "#bomberos_estructurabundle_incidenteIncendioType_habiaExtintores_0",
+            "no": "#bomberos_estructurabundle_incidenteIncendioType_habiaExtintores_1",
+            "desconoce": "#bomberos_estructurabundle_incidenteIncendioType_habiaExtintores_2"
+          },
+          "habia_nichos": {
+            "si": "#bomberos_estructurabundle_incidenteIncendioType_habiaNichos_0",
+            "no": "#bomberos_estructurabundle_incidenteIncendioType_habiaNichos_1",
+            "desconoce": "#bomberos_estructurabundle_incidenteIncendioType_habiaNichos_2"
+          },
+          "causa": "#bomberos_estructurabundle_incidenteIncendioType_causaIncendio",
+          "causa_opciones": {
+            "desconocida": "4",
+            "negligencia": "1",
+            "intencional": "2",
+            "natural": "3"
+          },
+          "causa_default": "4"
+        },
+        "incendio": {
+          "causa": "#bomberos_estructurabundle_incidenteIncendioType_causaIncendio",
+          "causa_opciones": {
+            "desconocida": "4",
+            "negligencia": "1",
+            "intencional": "2",
+            "natural": "3"
+          },
+          "causa_default": "4"
+        },
+        "accidente": {
+          "clima": "#bomberos_estructurabundle_incidenteAccidenteType_tipoClima",
+          "clima_opciones": {
+            "soleado": "3",
+            "lluvia": "1",
+            "neblina": "2",
+            "ventoso": "4",
+            "noche": "6",
+            "otros": "5"
+          },
+          "clima_default": "3",
+          "causa": "#bomberos_estructurabundle_incidenteAccidenteType_causaAccidente",
+          "causa_opciones": {
+            "choque": "2",
+            "vuelco": "1",
+            "despiste": "3",
+            "derrame": "4"
+          },
+          "causa_default": "2"
+        },
+        "rescate": {
+          "tipo_lugar": "#bomberos_estructurabundle_incidenteRescateType_tipoLugar"
+        },
+        "climatico": {
+          "evacuacion": "#bomberos_estructurabundle_incidenteClimaticoType_evacuacion"
+        },
+        "matpel": {
+          "evacuacion": "#bomberos_estructurabundle_incidenteMatPelType_evacuacion"
+        },
+        "servicio": {
+          "organizacion_beneficiada": "#bomberos_estructurabundle_incidenteServicioType_tipoOrganizacionBeneficiada"
         }
+      }
+    },
+    "damnificados": {
+      "url_patron": "/estructura/incidente/damnificados/",
+      "fila_herido": {
+        "nombre": "#Heridos_{i}_nombre",
+        "apellido": "#Heridos_{i}_apellido",
+        "dni": "#Heridos_{i}_dni",
+        "genero": "#Heridos_{i}_genero"
       },
-      "coordenadas_gps": {
-        "selector": "TODO_id_dotacion_{n}_gps", "selector_type": "id", "tipo_campo": "text"
+      "btn_guardar_continuar": "button[name='save_&_continue']"
+    },
+    "participacion": {
+      "url_patron": "/estructura/incidente/participacion/",
+      "numero_parte": "#bomberos_estructurabundle_participacionType_numeroParte",
+      "hora_llamado": "#timepicker_bomberos_estructurabundle_participacionType_horaLlamado",
+      "hora_toque": "#timepicker_bomberos_estructurabundle_participacionType_horaToque",
+      "hora_salida": "#timepicker_bomberos_estructurabundle_participacionType_fechaHoraSalida_time",
+      "fecha_salida": "#datepicker_bomberos_estructurabundle_participacionType_fechaHoraSalida_date",
+      "hora_llegada": "#timepicker_bomberos_estructurabundle_participacionType_fechaHoraLlegada_time",
+      "fecha_llegada": "#datepicker_bomberos_estructurabundle_participacionType_fechaHoraLlegada_date",
+      "bomberos_heridos": "#bomberos_estructurabundle_participacionType_cantidadBomberosHeridos",
+      "bomberos_fallecidos": "#bomberos_estructurabundle_participacionType_cantidadBomberosFallecidos",
+      "bomberos_desaparecidos": "#bomberos_estructurabundle_participacionType_cantidadBomberosDesaparecidos",
+      "intervencion_vehiculos": "#bomberos_estructurabundle_participacionType_intervencionVehiculo",
+      "intervencion_comision": "#bomberos_estructurabundle_participacionType_intervencionComision",
+      "hay_intervinientes_bomberos": "#bomberos_estructurabundle_participacionType_hayIntervinientesBomberos",
+      "btn_guardar": "div.form-actions button.btn-success",
+      "btn_guardar_continuar": "button[name='save_&_continue']"
+    },
+    "intervencion_bomberos": {
+      "cantidad_bomberos": "#cantBomberos",
+      "btn_agregar_filas": "a[onclick*='agregarBombero']",
+      "fila_bombero": {
+        "autocomplete_nombre": "#autocomplete_bomberos_estructurabundle_intervencionType_bomberos_{i}_bombero",
+        "fecha_inicio": "#datepicker_bomberos_estructurabundle_intervencionType_bomberos_{i}_fechaHoraInicio_date",
+        "hora_inicio": "#timepicker_bomberos_estructurabundle_intervencionType_bomberos_{i}_fechaHoraInicio_time",
+        "fecha_fin": "#datepicker_bomberos_estructurabundle_intervencionType_bomberos_{i}_fechaHoraFin_date",
+        "hora_fin": "#timepicker_bomberos_estructurabundle_intervencionType_bomberos_{i}_fechaHoraFin_time",
+        "tipo_tarea": "#bomberos_estructurabundle_intervencionType_bomberos_{i}_tipoTarea",
+        "is_encargado": "#bomberos_estructurabundle_intervencionType_bomberos_{i}_is_encargado"
       },
-      "firma_jefe_dotacion": {
-        "selector": "TODO_id_dotacion_{n}_firma_confirmada", "selector_type": "id", "tipo_campo": "checkbox",
-        "notas": "En RUBA probablemente no exista un campo de firma digital equivalente; confirmar si corresponde omitir."
+      "tipo_tarea_opciones": {
+        "interviniente": "1",
+        "apresto": "2"
+      },
+      "btn_guardar_continuar": "button[name='save_&_continue']"
+    },
+    "intervencion_vehiculos": {
+      "url_patron": "/estructura/incidente/participacion/intervenciones/vehiculos/",
+      "btn_agregar_fila": "a[onclick*='agregarVehiculo']",
+      "fila_vehiculo": {
+        "select_vehiculo": "#bomberos_estructurabundle_intervencionType_vehiculos_{i}_vehiculo",
+        "autocomplete_chofer": "#autocomplete_bomberos_estructurabundle_intervencionType_vehiculos_{i}_chofer",
+        "autocomplete_chofer_comision": "#autocomplete_bomberos_estructurabundle_intervencionType_vehiculos_{i}_chofer_comision",
+        "fecha_salida": "#datepicker_bomberos_estructurabundle_intervencionType_vehiculos_{i}_fechaHoraSalida_date",
+        "hora_salida": "#timepicker_bomberos_estructurabundle_intervencionType_vehiculos_{i}_fechaHoraSalida_time",
+        "fecha_llegada": "#datepicker_bomberos_estructurabundle_intervencionType_vehiculos_{i}_fechaHoraLlegada_date",
+        "hora_llegada": "#timepicker_bomberos_estructurabundle_intervencionType_vehiculos_{i}_fechaHoraLlegada_time"
+      },
+      "btn_guardar_cambios": "button.js-submit, button:has-text('Guardar cambios')"
+    },
+    "vehiculos_accidentes": {
+      "boton_agregar": "a[onclick*='agregarVehiculo']",
+      "prefijo_id": "bomberos_estructurabundle_incidenteAccidenteType_datosVehiculosAccidentes",
+      "_nota": "Cada vehiculo agregado genera #{prefijo_id}_{indice}_{campo}; campos = sufijo del id de cada input.",
+      "campos": {
+        "marca": "marca",
+        "dominio": "dominio",
+        "modelo": "modelo",
+        "anio": "anio",
+        "asegurado": "asegurado",
+        "aseguradora": "aseguradora",
+        "poliza": "poliza"
+      },
+      "marcas": {
+        "Fiat": "17",
+        "Ford": "18",
+        "Chevrolet": "9",
+        "Renault": "44",
+        "Toyota": "47",
+        "Volkswagen": "48",
+        "Mercedes Benz": "36",
+        "Peugeot": "41",
+        "Otra": "62"
       }
     }
   }

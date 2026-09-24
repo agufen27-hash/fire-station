@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<title>Fire Station — Cartografía Táctica</title>
+<link rel="stylesheet" href="leaflet.css">
+<link rel="stylesheet" href="leaflet.draw.css">
+<style>
+  /* Fondo blanco mientras llegan los mosaicos (antes quedaba en negro). */
+  html, body, #mapa { height: 100%; margin: 0; padding: 0; background-color: #FFFFFF; }
+  .leaflet-control-attribution { font-size: 10px; }
+
+  /* Marcador táctico propio (evita depender de los PNG por defecto de Leaflet) */
+  .marcador-incidente {
+    width: 30px; height: 30px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 20px;
+    filter: drop-shadow(0 0 3px rgba(0,0,0,0.8));
+    cursor: grab;
+  }
+
+  /* Selector de capas propio, estilo institucional oscuro (reemplaza el
+     control de capas por defecto de Leaflet, que viene en blanco) */
+  #selector-capas {
+    position: absolute; top: 10px; right: 10px; z-index: 1000;
+    background: rgba(26,29,33,0.92); border: 1px solid #3a3f44; border-radius: 6px;
+    padding: 6px 10px; font: 12px/1.6 "Segoe UI", sans-serif; color: #e8e8e8;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.4);
+  }
+  #selector-capas label { display: block; cursor: pointer; user-select: none; }
+  #selector-capas input { margin-right: 6px; }
+
+  /* Pin rojo del Lugar del Siniestro */
+  .marcador-siniestro { background: transparent; border: none; }
+  .marcador-siniestro .pin {
+    width: 26px; height: 26px; border-radius: 50% 50% 50% 0;
+    background: #d32f2f; border: 2px solid #fff; transform: rotate(-45deg);
+    box-shadow: 0 0 4px rgba(0,0,0,0.6); cursor: grab;
+  }
+  .marcador-siniestro .pin::after {
+    content: ""; position: absolute; width: 10px; height: 10px; border-radius: 50%;
+    background: #fff; top: 8px; left: 8px;
+  }
+
+  /* Base: Cuartel de Bomberos */
+  .marcador-cuartel { background: transparent; border: none; }
+  .marcador-cuartel .base {
+    width: 32px; height: 32px; border-radius: 6px; background: #1565c0; border: 2px solid #fff;
+    display: flex; align-items: center; justify-content: center; font-size: 18px;
+    box-shadow: 0 0 4px rgba(0,0,0,0.6);
+  }
+
+  /* Distancia / tiempo de la ruta, sobre el mapa */
+  #panel-ruta {
+    position: absolute; top: 10px; left: 56px; z-index: 1000; display: none;
+    background: rgba(255,255,255,0.95); color: #1a1d21; border: 1px solid #cfd6e2; border-radius: 6px;
+    padding: 5px 10px; font: 12px/1.5 "Segoe UI", sans-serif; box-shadow: 0 2px 6px rgba(0,0,0,0.25);
+  }
+  #panel-ruta b { font-size: 14px; }
+  #panel-ruta .aviso { color: #e65100; }
+
+  #banner-sin-conexion {
+    position: absolute; bottom: 10px; left: 10px; z-index: 1000;
+    background: rgba(239,108,0,0.92); color: #fff; font: 12px/1.4 "Segoe UI", sans-serif;
+    padding: 4px 10px; border-radius: 4px; display: none;
+  }
+</style>
+</head>
+<body>
+<div id="mapa"></div>
+<div id="selector-capas">
+  <label><input type="radio" name="capa" value="voyager" checked> Callejero (CARTO)</label>
+  <label><input type="radio" name="capa" value="satelital"> Satelital (Esri)</label>
+  <label><input type="radio" name="capa" value="satelital_google"> Satelital (Google)</label>
+  <label><input type="radio" name="capa" value="callejero"> OpenStreetMap</label>
+  <label><input type="radio" name="capa" value="oscuro"> Oscuro</label>
+</div>
+<div id="panel-ruta"></div>
+<div id="banner-sin-conexion">Sin conexión: las imágenes del mapa pueden no cargar.</div>
+
+<script src="qwebchannel.js"></script>
+<script src="leaflet.js"></script>
+<script src="leaflet.draw.js"></script>
+<script>
+"use strict";
+
+// ---------------------------------------------------------------------
+// Estado global e inicialización del mapa
+// ---------------------------------------------------------------------
+
+const ADELIA_MARIA = [-33.6324, -64.0195];
+const ZOOM_OPERATIVO = 14;
+
+// minZoom: 3 evita que se pueda alejar tanto que Leaflet pida teselas que
+// ningún proveedor tiene (pantalla en negro por error 400/404 en cascada).
+const mapa = L.map("mapa", { zoomControl: true, attributionControl: true, minZoom: 3 })
+  .setView(ADELIA_MARIA, ZOOM_OPERATIVO);
+
+const OPCIONES_CAPA = { maxZoom: 19, minZoom: 3 };
+
+const capaSatelital = L.tileLayer(
+  "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+  { ...OPCIONES_CAPA, attribution: "Esri World Imagery" }
+);
+// Alternativa/fallback si Esri no responde (servidor caído, firewall,
+// etc.): Google Satelital Híbrido, con nombres de calle superpuestos.
+const capaSatelitalGoogle = L.tileLayer(
+  "https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
+  { ...OPCIONES_CAPA, attribution: "Google Hybrid" }
+);
+// Capa por defecto: CARTO Voyager (no exige Referer, a diferencia de las
+// teselas de OSM, que desde un file:// de QtWebEngine devolvían error y
+// dejaban el mapa en negro).
+const capaVoyager = L.tileLayer(
+  "https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png",
+  { ...OPCIONES_CAPA, attribution: "&copy; OpenStreetMap &copy; CARTO", subdomains: "abcd" }
+);
+const capaCallejero = L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+  ...OPCIONES_CAPA, attribution: "&copy; OpenStreetMap",
+});
+const capaOscura = L.tileLayer(
+  "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
+  { ...OPCIONES_CAPA, attribution: "&copy; OpenStreetMap &copy; CARTO", subdomains: "abcd" }
+);
+
+capaVoyager.addTo(mapa);
+let capaActual = capaVoyager;
+
+const CAPAS_POR_NOMBRE = {
+  voyager: capaVoyager,
+  satelital: capaSatelital,
+  satelital_google: capaSatelitalGoogle,
+  callejero: capaCallejero,
+  oscuro: capaOscura,
+};
+
+function cambiarCapa(nombre) {
+  mapa.removeLayer(capaActual);
+  capaActual = CAPAS_POR_NOMBRE[nombre] || capaVoyager;
+  capaActual.addTo(mapa);
+}
+document.querySelectorAll('#selector-capas input[name="capa"]').forEach((radio) => {
+  radio.addEventListener("change", (ev) => cambiarCapa(ev.target.value));
+});
+
+// El contenedor del mapa vive dentro de un QScrollArea con scroll dinámico
+// (Fase 9): si Leaflet se inicializa mientras el widget todavía no tiene su
+// tamaño final (pestaña oculta, layout en curso), calcula mal el tamaño del
+// lienzo y queda en negro/cortado hasta que algo lo obligue a recalcular.
+window.addEventListener("resize", () => mapa.invalidateSize());
+setTimeout(() => mapa.invalidateSize(), 300);
+
+// Se muestra un aviso discreto si las teselas no llegan a cargar (sin
+// internet) -- no bloquea nada, el mapa sigue usable para colocar el
+// marcador y dibujar el polígono sobre fondo gris.
+let erroresDeTesela = 0;
+[capaVoyager, capaSatelital, capaSatelitalGoogle, capaCallejero, capaOscura].forEach((capa) => {
+  capa.on("tileerror", () => {
+    erroresDeTesela += 1;
+    if (erroresDeTesela > 3) {
+      document.getElementById("banner-sin-conexion").style.display = "block";
+    }
+  });
+});
+
+const iconoIncidente = L.divIcon({
+  className: "marcador-incidente",
+  html: "🔥",
+  iconSize: [30, 30],
+  iconAnchor: [15, 26],
+});
+
+const iconoSiniestro = L.divIcon({
+  className: "marcador-siniestro",
+  html: '<div class="pin"></div>',
+  iconSize: [30, 30],
+  iconAnchor: [15, 30],
+});
+
+const iconoCuartel = L.divIcon({
+  className: "marcador-cuartel",
+  html: '<div class="base">🚒</div>',
+  iconSize: [36, 36],
+  iconAnchor: [18, 18],
+});
+
+// Python llama a configurar() al terminar la carga. Hasta entonces el mapa
+// NO acepta clics (así la vista de solo lectura nunca coloca un marcador).
+let editable = false;
+let marcadorCuartel = L.marker(ADELIA_MARIA, { icon: iconoCuartel, keyboard: false, zIndexOffset: 1000 })
+  .bindTooltip("Cuartel de Bomberos", { direction: "top", offset: [0, -16] })
+  .addTo(mapa);
+let capaRuta = new L.FeatureGroup().addTo(mapa);
+
+let marcador = null;
+let ignorarClicsHasta = 0;
+let edicionPoligonoActiva = false;
+let capaDibujo = new L.FeatureGroup().addTo(mapa);
+let capaSoloLectura = new L.FeatureGroup().addTo(mapa);
+let poligonoActual = null;
+let controladorDibujo = null;
+let bridge = null;
+
+// ---------------------------------------------------------------------
+// Marcador del incidente (punto)
+// ---------------------------------------------------------------------
+
+function colocarMarcador(lat, lng, notificarPython) {
+  if (marcador) {
+    marcador.setLatLng([lat, lng]);
+  } else {
+    marcador = L.marker([lat, lng], { icon: iconoSiniestro, draggable: editable })
+      .bindTooltip("Lugar del Siniestro", { direction: "top", offset: [0, -28] })
+      .addTo(mapa);
+    marcador.on("dragend", () => {
+      const p = marcador.getLatLng();
+      if (bridge) bridge.actualizar_marcador(p.lat, p.lng);
+    });
+  }
+  if (notificarPython && bridge) bridge.actualizar_marcador(lat, lng);
+}
+
+function quitarMarcador() {
+  if (marcador) {
+    mapa.removeLayer(marcador);
+    marcador = null;
+  }
+  limpiarRuta();
+}
+
+// Un clic en el mapa coloca (o mueve) el Lugar del Siniestro, salvo
+// mientras se dibuja o edita el polígono: ahí los clics son vértices.
+mapa.on("click", (ev) => {
+  if (!editable) return;
+  if (controladorDibujo && controladorDibujo.enabled()) return;
+  if (Date.now() < ignorarClicsHasta) return;  // el clic que cerró el polígono
+  if (edicionPoligonoActiva) {
+    // Clic fuera de los vértices = terminar la edición (no mueve el marcador).
+    deshabilitarEdicionPoligono();
+    return;
+  }
+  colocarMarcador(ev.latlng.lat, ev.latlng.lng, true);
+  modoColocarMarcador = false;
+  mapa.getContainer().style.cursor = "";
+});
+
+let modoColocarMarcador = false;
+function activarModoColocarMarcador() {
+  modoColocarMarcador = true;
+  mapa.getContainer().style.cursor = "crosshair";
+}
+
+// ---------------------------------------------------------------------
+// Polígono del área afectada + cálculo de superficie/perímetro
+// ---------------------------------------------------------------------
+
+function calcularAreaYPerimetro(layer) {
+  const latlngs = layer.getLatLngs()[0];
+  const areaM2 = L.GeometryUtil.geodesicArea(latlngs);
+  let perimetroM = 0;
+  for (let i = 0; i < latlngs.length; i++) {
+    const a = latlngs[i];
+    const b = latlngs[(i + 1) % latlngs.length];
+    perimetroM += a.distanceTo(b);
+  }
+  return { areaM2, perimetroM };
+}
+
+function notificarPoligono(layer) {
+  if (!bridge) return;
+  const { areaM2, perimetroM } = calcularAreaYPerimetro(layer);
+  const geojson = JSON.stringify(layer.toGeoJSON());
+  bridge.actualizar_poligono(geojson, areaM2, perimetroM);
+}
+
+function dibujarPoligonoDesdeGeoJSON(geojsonTexto) {
+  limpiarPoligono(false);
+  const datos = JSON.parse(geojsonTexto);
+  const capa = L.geoJSON(datos, {
+    style: { color: "#ff5722", weight: 3, fillColor: "#ff5722", fillOpacity: 0.25 },
+  });
+  capa.eachLayer((l) => {
+    poligonoActual = l;
+    capaDibujo.addLayer(l);
+  });
+  if (poligonoActual) {
+    mapa.fitBounds(poligonoActual.getBounds(), { padding: [40, 40] });
+    notificarPoligono(poligonoActual);
+  }
+}
+
+function iniciarDibujoPoligono() {
+  if (controladorDibujo) controladorDibujo.disable();
+  limpiarPoligono(true);
+  controladorDibujo = new L.Draw.Polygon(mapa, {
+    shapeOptions: { color: "#ff5722", weight: 3, fillColor: "#ff5722", fillOpacity: 0.25 },
+  });
+  controladorDibujo.enable();
+}
+
+function cancelarDibujoPoligono() {
+  if (controladorDibujo) {
+    controladorDibujo.disable();
+    controladorDibujo = null;
+  }
+}
+
+function limpiarPoligono(notificar) {
+  if (poligonoActual) {
+    if (poligonoActual.editing) poligonoActual.editing.disable();
+    capaDibujo.removeLayer(poligonoActual);
+    poligonoActual = null;
+    edicionPoligonoActiva = false;
+  }
+  if (notificar && bridge) bridge.actualizar_poligono("", 0, 0);
+}
+
+mapa.on(L.Draw.Event.CREATED, (ev) => {
+  poligonoActual = ev.layer;
+  capaDibujo.addLayer(poligonoActual);
+  notificarPoligono(poligonoActual);
+  controladorDibujo = null;
+  ignorarClicsHasta = Date.now() + 400;
+});
+
+// Permite re-arrastrar vértices de un polígono ya dibujado/importado
+// (L.Edit.Poly, que Leaflet.draw agrega a todo L.Polygon como `.editing`).
+function habilitarEdicionPoligono() {
+  if (!poligonoActual || !poligonoActual.editing) return;
+  poligonoActual.editing.enable();
+  edicionPoligonoActiva = true;
+  poligonoActual.on("edit", () => notificarPoligono(poligonoActual));
+}
+
+function deshabilitarEdicionPoligono() {
+  if (poligonoActual && poligonoActual.editing) poligonoActual.editing.disable();
+  edicionPoligonoActiva = false;
+}
+
+// ---------------------------------------------------------------------
+// Ruta cuartel -> siniestro (la calcula Python contra OSRM y la manda acá)
+// ---------------------------------------------------------------------
+
+function limpiarRuta() {
+  capaRuta.clearLayers();
+  const panel = document.getElementById("panel-ruta");
+  panel.style.display = "none";
+  panel.innerHTML = "";
+}
+
+function mostrarRutaCalculando() {
+  const panel = document.getElementById("panel-ruta");
+  panel.innerHTML = "Calculando ruta desde el cuartel…";
+  panel.style.display = "block";
+}
+
+// coordsLonLat: [[lon, lat], ...] (GeoJSON). offline=true -> línea recta
+// discontinua (sin internet / OSRM no disponible).
+function dibujarRuta(coordsLonLat, textoDistancia, textoDuracion, offline) {
+  capaRuta.clearLayers();
+  const latlngs = coordsLonLat.map((c) => [c[1], c[0]]);
+  if (latlngs.length < 2) return;
+  if (!offline) {
+    // Contorno blanco debajo para que la ruta se lea sobre cualquier capa.
+    L.polyline(latlngs, { color: "#ffffff", weight: 8, opacity: 0.9, interactive: false }).addTo(capaRuta);
+  }
+  L.polyline(latlngs, {
+    color: offline ? "#d32f2f" : "#1565c0",
+    weight: offline ? 3 : 5,
+    opacity: 0.9,
+    dashArray: offline ? "8 8" : null,
+    interactive: false,
+  }).addTo(capaRuta);
+
+  const panel = document.getElementById("panel-ruta");
+  panel.innerHTML = offline
+    ? `🚒 <b>${textoDistancia}</b> en línea recta<br><span class="aviso">Sin conexión al servicio de rutas</span>`
+    : `🚒 <b>${textoDistancia}</b> · ⏱ ${textoDuracion} <span style="color:#667">(estimado)</span>`;
+  panel.style.display = "block";
+
+  const limites = L.latLngBounds(latlngs);
+  if (!mapa.getBounds().contains(limites)) mapa.fitBounds(limites, { padding: [50, 50], maxZoom: 16 });
+}
+
+function configurar(opciones) {
+  editable = !!opciones.editable;
+  if (opciones.cuartel) marcadorCuartel.setLatLng(opciones.cuartel);
+  if (marcador && marcador.dragging) {
+    if (editable) marcador.dragging.enable(); else marcador.dragging.disable();
+  }
+}
+
+// ---------------------------------------------------------------------
+// API expuesta a Python (llamada vía page().runJavaScript)
+// ---------------------------------------------------------------------
+
+window.fireStationMapa = {
+  centrar: (lat, lng, zoom) => mapa.setView([lat, lng], zoom || ZOOM_OPERATIVO),
+  colocarMarcador: (lat, lng) => colocarMarcador(lat, lng, false),
+  quitarMarcador: quitarMarcador,
+  activarModoColocarMarcador: activarModoColocarMarcador,
+  iniciarDibujoPoligono: iniciarDibujoPoligono,
+  cancelarDibujoPoligono: cancelarDibujoPoligono,
+  limpiarPoligono: () => limpiarPoligono(true),
+  dibujarPoligonoDesdeGeoJSON: dibujarPoligonoDesdeGeoJSON,
+  habilitarEdicionPoligono: habilitarEdicionPoligono,
+  deshabilitarEdicionPoligono: deshabilitarEdicionPoligono,
+  cambiarCapa: cambiarCapa,
+  configurar: configurar,
+  dibujarRuta: dibujarRuta,
+  mostrarRutaCalculando: mostrarRutaCalculando,
+  limpiarRuta: limpiarRuta,
+  limpiarSoloLectura: () => capaSoloLectura.clearLayers(),
+  agregarMarcadorSoloLectura: (lat, lng, etiqueta) => {
+    L.marker([lat, lng], { icon: iconoIncidente })
+      .bindTooltip(etiqueta || "", { direction: "top" })
+      .addTo(capaSoloLectura);
+  },
+  agregarPoligonoSoloLectura: (geojsonTexto) => {
+    const datos = JSON.parse(geojsonTexto);
+    L.geoJSON(datos, { style: { color: "#ff5722", weight: 2, fillColor: "#ff5722", fillOpacity: 0.15 } })
+      .eachLayer((l) => capaSoloLectura.addLayer(l));
+  },
+  ajustarVistaATodo: () => {
+    if (capaSoloLectura.getLayers().length) mapa.fitBounds(capaSoloLectura.getBounds(), { padding: [30, 30] });
+  },
+};
+
+// ---------------------------------------------------------------------
+// Puente QWebChannel con Python (si corre dentro de QWebEngineView)
+// ---------------------------------------------------------------------
+
+if (typeof qt !== "undefined" && qt.webChannelTransport) {
+  new QWebChannel(qt.webChannelTransport, (canal) => {
+    bridge = canal.objects.bridge;
+  });
+}
+</script>
+</body>
+</html>

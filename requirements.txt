@@ -1,6 +1,10 @@
-# GUI
+# GUI (prototipo inicial en core/ + ui/)
 customtkinter==5.2.2
 Pillow==10.4.0
+
+# GUI oficial "Fire Station" (app/ + run.py)
+PySide6==6.11.1
+SQLAlchemy==2.0.45
 
 # Planillas Excel (PCS.xlsx / PCD2.xlsx) manteniendo estilos y celdas combinadas
 openpyxl==3.1.5
@@ -11,7 +15,14 @@ pywin32==306
 # Automatización web del portal RUBA
 playwright==1.47.0
 
+# Certificados HTTPS actualizados (ruteo OSRM: en PCs con la raíz de Windows vencida)
+certifi==2026.05.20
+
 # Utilidades de fecha/hora
 python-dateutil==2.9.0.post0
 
 # Base de datos local: sqlite3 es módulo estándar de Python, no requiere instalación.
+
+# Empaquetado a .exe (solo necesario en la máquina que corre tools/build_exe.py,
+# no hace falta en la máquina de guardia que usa el .exe ya generado)
+pyinstaller==6.22.2

@@ -1,6 +1,33 @@
-__pycache__/ 
-*.pyc 
-.venv/ 
-venv/ 
-*.log 
-.DS_Store 
+# --- Datos locales y secretos (NUNCA al repo) ---
+# data/: base SQLite, config.json con usuario/clave de RUBA, padrón de
+# bomberos (Reporte de bomberos.xlsx), firmas, sesión de RUBA, backups.
+# data/config.example.json lo regenera tools/build_exe.py.
+data/
+*.db
+*.db-journal
+*.sqlite3
+config/config.json
+.env
+
+# Planillas e informes generados: tienen nombres y DNI de casos reales.
+output/
+
+# Logs y capturas de RUBA (HTML del portal con datos de incidentes)
+logs/
+*.log
+
+# --- Empaquetado (PyInstaller) ---
+dist/
+build/
+*.spec
+
+# --- Python ---
+__pycache__/
+*.pyc
+venv/
+.venv/
+.pytest_cache/
+
+# --- Sistema ---
+.DS_Store
+Thumbs.db
