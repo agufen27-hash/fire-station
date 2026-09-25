@@ -12,7 +12,7 @@
 ; arranque; reinstalar, actualizar o desinstalar las deja como están.
 
 #ifndef MyAppVersion
-  #define MyAppVersion "1.0.2"
+  #define MyAppVersion "1.0.4"
 #endif
 #define MyAppName "Fire Station - Cuartel Adelia María"
 #define MyAppShortName "Fire Station"
@@ -56,6 +56,11 @@ Name: "desktopicon"; Description: "Crear un acceso directo en el Escritorio"; Gr
 [Files]
 ; Solo el programa: el .exe y _internal\. Las carpetas de datos se excluyen aunque
 ; alguna vez aparezcan dentro de dist\ (p. ej. si se abrió el .exe desde ahí).
+; _internal\ms-playwright\ (Chromium para RUBA) viaja acá adentro: la app apunta
+; PLAYWRIGHT_BROWSERS_PATH a esa carpeta al arrancar (app/paths.py). build_exe.py
+; embebe EXACTAMENTE la revisión que pide la Playwright empaquetada y
+; build_installer.py lo verifica antes de compilar. Si aun así faltara, la app
+; usa Chrome/Edge de Windows o el Chromium de %LOCALAPPDATA%\ms-playwright.
 Source: "{#DistDir}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#DistDir}\_internal\*"; DestDir: "{app}\_internal"; Flags: ignoreversion recursesubdirs createallsubdirs
 

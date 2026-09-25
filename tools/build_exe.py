@@ -50,7 +50,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -85,23 +84,75 @@ def _detectar_carpeta_ms_playwright() -> Optional[Path]:
     return None
 
 
-def _elegir_versiones_mas_nuevas(carpeta_ms_playwright: Path) -> List[Path]:
-    """De cada prefijo (chromium-, chromium_headless_shell-) elige la
-    subcarpeta con el número de versión más alto, para no embeber
-    instalaciones viejas duplicadas."""
-    mejores: Dict[str, Path] = {}
-    for entrada in carpeta_ms_playwright.iterdir():
-        if not entrada.is_dir():
-            continue
-        for prefijo in PREFIJOS_CHROMIUM:
-            m = re.fullmatch(rf"{re.escape(prefijo)}(\d+)", entrada.name)
-            if not m:
-                continue
-            version = int(m.group(1))
-            actual = mejores.get(prefijo)
-            if actual is None or version > int(re.search(r"(\d+)$", actual.name).group(1)):
-                mejores[prefijo] = entrada
-    return list(mejores.values())
+# Nombre en browsers.json de Playwright -> prefijo de la carpeta en ms-playwright/.
+NAVEGADORES_REQUERIDOS = {"chromium": "chromium-", "chromium-headless-shell": "chromium_headless_shell-"}
+
+
+def revisiones_requeridas() -> Dict[str, str]:
+    """Revisiones EXACTAS de Chromium que espera el paquete `playwright`
+    instalado (driver/package/browsers.json), p. ej. {"chromium-": "1223",
+    "chromium_headless_shell-": "1223"}.
+
+    Antes se embebía la carpeta de número más alto que hubiera en
+    %LOCALAPPDATA%\\ms-playwright: si quedaba una de otra versión de
+    Playwright (1234 con Playwright 1.60, que pide 1223) el .exe instalado
+    fallaba con "BrowserType.launch: Executable doesn't exist at
+    ...\\_internal\\ms-playwright\\chromium_headless_shell-1223\\...".
+    """
+    import playwright
+
+    ruta = Path(playwright.__file__).parent / "driver" / "package" / "browsers.json"
+    try:
+        navegadores = json.loads(ruta.read_text(encoding="utf-8"))["browsers"]
+    except (OSError, ValueError, KeyError) as e:
+        sys.exit(f"No se pudo leer {ruta} ({e}): ¿está bien instalado el paquete playwright?")
+    revisiones = {}
+    for navegador in navegadores:
+        prefijo = NAVEGADORES_REQUERIDOS.get(navegador.get("name"))
+        if prefijo:
+            overrides = navegador.get("revisionOverrides") or {}
+            revisiones[prefijo] = str(overrides.get("win64") or navegador["revision"])
+    faltan = set(NAVEGADORES_REQUERIDOS.values()) - set(revisiones)
+    if faltan:
+        sys.exit(f"{ruta} no declara {sorted(faltan)}: versión de Playwright no soportada por este script.")
+    return revisiones
+
+
+def _carpetas_requeridas(carpeta_ms_playwright: Path) -> List[Path]:
+    """Las carpetas de las revisiones que pide Playwright (no "la más nueva").
+    Si falta alguna se corta con la instrucción para instalarla."""
+    carpetas = [carpeta_ms_playwright / f"{prefijo}{revision}" for prefijo, revision in revisiones_requeridas().items()]
+    faltantes = [c for c in carpetas if not (c / "INSTALLATION_COMPLETE").is_file()]
+    if faltantes:
+        sys.exit(
+            "Falta el Chromium que necesita la versión de Playwright instalada:\n"
+            + "\n".join(f"  - {c}" for c in faltantes)
+            + "\nCorré:  playwright install chromium   (instala exactamente esas revisiones)"
+        )
+    otras = sorted(e.name for e in carpeta_ms_playwright.iterdir()
+                   if e.is_dir() and e.name.startswith(PREFIJOS_CHROMIUM) and e not in carpetas)
+    if otras:
+        print(f"Aviso: se ignoran versiones de Chromium que esta Playwright no usa: {', '.join(otras)}")
+    return carpetas
+
+
+def verificar_chromium_embebido(dist_app: Path) -> None:
+    """Después de PyInstaller: que _internal/ms-playwright tenga los
+    ejecutables de las revisiones que va a buscar el Playwright embebido."""
+    base = dist_app / "_internal" / "ms-playwright"
+    ejecutables = {
+        "chromium-": ("chrome-win64", "chrome.exe"),
+        "chromium_headless_shell-": ("chrome-headless-shell-win64", "chrome-headless-shell.exe"),
+    }
+    faltantes = []
+    for prefijo, revision in revisiones_requeridas().items():
+        carpeta = base / f"{prefijo}{revision}"
+        subcarpeta, exe = ejecutables[prefijo]
+        if not (carpeta / subcarpeta / exe).is_file() and not any(carpeta.glob(f"*/{exe}")):
+            faltantes.append(str(carpeta / subcarpeta / exe))
+    if faltantes:
+        sys.exit("El bundle quedó SIN el Chromium que pide Playwright:\n  " + "\n  ".join(faltantes))
+    print(f"Chromium embebido OK en {base} ({', '.join(f'{p}{r}' for p, r in revisiones_requeridas().items())})")
 
 
 def _preparar_config_example() -> Path:
@@ -158,16 +209,11 @@ def main() -> None:
             "y volvé a intentar -- sin esto, la sincronización con RUBA no va a funcionar "
             "en una máquina destino sin Python/Node."
         )
-    carpetas_chromium = _elegir_versiones_mas_nuevas(carpeta_ms_playwright)
-    if not carpetas_chromium:
-        sys.exit(
-            f"'{carpeta_ms_playwright}' existe pero no tiene ninguna carpeta chromium-* / "
-            "chromium_headless_shell-* adentro. Corré:  playwright install chromium"
-        )
+    carpetas_chromium = _carpetas_requeridas(carpeta_ms_playwright)
 
     config_example = _preparar_config_example()
 
-    print("Se van a embeber estas versiones de Chromium:")
+    print("Se van a embeber estas versiones de Chromium (las que pide Playwright):")
     for carpeta in carpetas_chromium:
         print(f"  - {carpeta}")
 
@@ -198,6 +244,7 @@ def main() -> None:
     resultado = subprocess.run(comando, cwd=BASE_DIR)
     if resultado.returncode != 0:
         sys.exit(resultado.returncode)
+    verificar_chromium_embebido(DIST_DIR / NOMBRE_APP)
 
     print()
     print(f"Listo: {DIST_DIR / NOMBRE_APP / (NOMBRE_APP + '.exe')}")

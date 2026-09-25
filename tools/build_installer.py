@@ -87,6 +87,20 @@ def buscar_iscc() -> Optional[Path]:
     return next((c for c in candidatos if c.is_file()), None)
 
 
+def verificar_chromium(dist_app: Path) -> None:
+    """Que dist/ traiga en _internal/ms-playwright la revisión de Chromium
+    que pide la Playwright empaquetada (si no, la app instalada falla con
+    "Executable doesn't exist ... _internal/ms-playwright/..."). Se
+    recompila con --compilar."""
+    sys.path.insert(0, str(BASE_DIR / "tools"))
+    from build_exe import verificar_chromium_embebido
+
+    try:
+        verificar_chromium_embebido(dist_app)
+    except SystemExit as e:
+        sys.exit(f"{e}\n\nRecompilá con:  python tools/build_installer.py --compilar")
+
+
 def asegurar_dist(recompilar: bool) -> None:
     if recompilar or not (DIST_APP / "FireStation.exe").is_file():
         motivo = "se pidió --compilar" if recompilar else "no existe dist/FireStation/FireStation.exe"
@@ -94,6 +108,7 @@ def asegurar_dist(recompilar: bool) -> None:
         resultado = subprocess.run([sys.executable, str(BASE_DIR / "tools" / "build_exe.py")], cwd=BASE_DIR)
         if resultado.returncode != 0 or not (DIST_APP / "FireStation.exe").is_file():
             sys.exit("La compilación del .exe falló: no se puede armar el instalador.")
+    verificar_chromium(DIST_APP)
     datos = [c for c in ("data", "output", "logs", "resources") if (DIST_APP / c).exists()]
     if datos:
         # No viajan igual (installer.iss solo toma FireStation.exe y _internal\), pero conviene saberlo.

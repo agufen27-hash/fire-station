@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QMessageBox,
     QProgressBar,
     QPushButton,
     QVBoxLayout,
@@ -107,6 +108,7 @@ class DialogoLoteRuba(QDialog):
         worker.item_ok.connect(self.on_item_ok)
         worker.item_error.connect(self.on_item_error)
         worker.item_omitido.connect(self.on_item_omitido)
+        worker.navegador_faltante.connect(self.on_navegador_faltante)
         worker.terminado.connect(self.on_terminado)
 
     def on_item_iniciado(self, indice: int, total: int, incidente_id: int, numero_parte: str) -> None:
@@ -143,6 +145,20 @@ class DialogoLoteRuba(QDialog):
 
     def on_item_omitido(self, incidente_id: int, numero_parte: str, motivo: str) -> None:
         self._completar(incidente_id, f"⏭ Parte N° {numero_parte}: omitido ({motivo})", "texto_secundario")
+
+    def on_navegador_faltante(self, mensaje: str) -> None:
+        """Aviso visual con las instrucciones (Chrome / Edge / playwright install)."""
+        self.label_detalle.setText("❌ No hay un navegador disponible para conectarse a RUBA.")
+        theme.set_tono(self.label_detalle, "error")
+        caja = QMessageBox(self)
+        caja.setIcon(QMessageBox.Icon.Warning)
+        caja.setWindowTitle("Falta un navegador para RUBA")
+        texto, _, detalle = mensaje.partition("\n\nDetalle técnico:\n")
+        caja.setText(texto)
+        if detalle:
+            caja.setDetailedText(detalle)
+        caja.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        caja.open()  # no bloquea: el lote termina de cerrarse detrás
 
     def on_terminado(self, ok: int, errores: int, omitidos: int, sin_procesar: int) -> None:
         if sin_procesar:

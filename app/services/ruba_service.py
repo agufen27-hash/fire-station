@@ -32,7 +32,9 @@ from PySide6.QtCore import QObject, QThread, Signal
 from app.core.semilla import denunciante_por_defecto
 from app.db import get_session
 from app.models import EstadoRuba, Incidente
-from app.services.ruba_automation import EventoProgreso, PasoRuba, RubaAutomationError, RubaServiceAutomation
+from app.services.ruba_automation import (
+    EventoProgreso, NavegadorNoDisponibleError, PasoRuba, RubaAutomationError, RubaServiceAutomation,
+)
 from app.services.ruba_payload import payload_desde_incidente, validar_payload
 
 
@@ -270,6 +272,7 @@ class RubaLoteWorker(QObject):
     item_ok = Signal(int, str, str, str)         # incidente_id, numero_parte, ruba_id_remoto, url_final
     item_error = Signal(int, str, str, str)      # incidente_id, numero_parte, mensaje, ruta_captura
     item_omitido = Signal(int, str, str)         # incidente_id, numero_parte, motivo
+    navegador_faltante = Signal(str)             # sin Chrome/Edge/Chromium: mensaje con instrucciones
     terminado = Signal(int, int, int, int)       # ok, errores, omitidos, sin_procesar (por cancelación)
 
     def __init__(self, incidente_ids: List[int]) -> None:
@@ -277,6 +280,7 @@ class RubaLoteWorker(QObject):
         self.incidente_ids = list(incidente_ids)
         self.incidente_actual: Optional[int] = None
         self._cancelado = False
+        self._sin_navegador = False
 
     def cancelar(self) -> None:
         """Pedido desde la UI: se respeta al terminar el parte en curso."""
@@ -293,7 +297,7 @@ class RubaLoteWorker(QObject):
             total = len(lote)
             with NavegadorLote() as navegador:
                 for indice, (incidente_id, numero, motivo) in enumerate(lote, start=1):
-                    if self._cancelado:
+                    if self._cancelado or self._sin_navegador:
                         break
                     procesados += 1
                     self.incidente_actual = incidente_id
@@ -325,6 +329,14 @@ class RubaLoteWorker(QObject):
 
         try:
             resultado = sincronizar_incidente(incidente_id, on_progreso=progreso, navegador=navegador)
+        except NavegadorNoDisponibleError as e:
+            # No es culpa del parte (queda PENDIENTE) y los siguientes fallarían
+            # igual: se corta el lote y la UI muestra cómo resolverlo.
+            self._sin_navegador = True
+            self.item_error.emit(incidente_id, numero,
+                                 "No hay un navegador disponible para RUBA (Chrome, Edge o Chromium).", "")
+            self.navegador_faltante.emit(str(e))
+            return False
         except Exception as e:  # noqa: BLE001 - la falla de un parte no corta el lote
             mensaje, captura = _describir_error(e)
             try:

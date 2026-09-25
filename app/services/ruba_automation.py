@@ -24,7 +24,9 @@ que cada paso recorre el payload y resuelve el selector por nombre.
 from __future__ import annotations
 
 import enum
+import json
 import logging
+import os
 import re
 import unicodedata
 from contextlib import contextmanager
@@ -37,7 +39,7 @@ from playwright.sync_api import BrowserContext, Error as PlaywrightError, Page, 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from app.core.catalogos import leer_mapping
-from app.paths import configurar_entorno_playwright, get_writable_dir
+from app.paths import configurar_entorno_playwright, get_writable_dir, is_frozen
 from app.services.ruba_helpers import (
     SELECTORES_CLAVE,
     URL_INCIDENTE_DEFAULT,
@@ -153,6 +155,120 @@ def _limpiar_para_archivo(texto: str) -> str:
     return re.sub(r"[^\w.-]+", "_", texto).strip("_") or "servicio"
 
 
+# ---------------------------------------------------------------------------
+# Lanzamiento de Chromium con fallback
+# ---------------------------------------------------------------------------
+
+class NavegadorNoDisponibleError(RuntimeError):
+    """Ninguna de las 3 estrategias pudo abrir un navegador. No es un problema
+    del parte: la UI lo muestra aparte, con las instrucciones."""
+
+
+MENSAJE_SIN_NAVEGADOR = (
+    "No se encontró un navegador para conectarse a RUBA.\n\n"
+    "Fire Station necesita UNO de estos:\n"
+    "  • Google Chrome o Microsoft Edge instalados en esta PC (lo más simple), o\n"
+    "  • el Chromium de Playwright: en una consola, ejecutar\n"
+    "        playwright install chromium\n"
+    "  • o reinstalar Fire Station con el instalador completo (trae su propio Chromium).\n\n"
+    "Los partes no se modificaron: siguen pendientes de carga."
+)
+
+# Ejecutables dentro de %LOCALAPPDATA%\ms-playwright (por revisión). El
+# headless shell es el que usa Playwright con headless=True; chrome.exe sirve
+# para ambos modos. `headless_shell.exe` es el nombre en versiones viejas.
+_PATRONES_HEADLESS = ("chromium_headless_shell-*/*/chrome-headless-shell.exe",
+                      "chromium_headless_shell-*/*/headless_shell.exe")
+_PATRONES_CHROME = ("chromium-*/*/chrome.exe",)
+
+
+def _revision_esperada() -> Optional[str]:
+    """Revisión de Chromium que pide el paquete playwright en uso (la del
+    bundle o la del entorno de desarrollo), leída de su browsers.json."""
+    try:
+        import playwright
+
+        ruta = Path(playwright.__file__).parent / "driver" / "package" / "browsers.json"
+        for navegador in json.loads(ruta.read_text(encoding="utf-8"))["browsers"]:
+            if navegador.get("name") == "chromium":
+                return str(navegador["revision"])
+    except Exception:  # noqa: BLE001 - es solo para ordenar candidatos
+        return None
+    return None
+
+
+def _revision_de(exe: Path) -> int:
+    m = re.search(r"-(\d+)$", exe.parent.parent.name)
+    return int(m.group(1)) if m else 0
+
+
+def ejecutables_en_cache_usuario(headless: bool = True) -> List[Path]:
+    """Chromium instalados con `playwright install` en la cuenta del usuario
+    (%LOCALAPPDATA%\\ms-playwright). Primero la revisión que espera Playwright,
+    después las demás de la más nueva a la más vieja."""
+    base_local = os.environ.get("LOCALAPPDATA")
+    if not base_local:
+        return []
+    base = Path(base_local) / "ms-playwright"
+    if not base.is_dir():
+        return []
+    patrones = (_PATRONES_HEADLESS + _PATRONES_CHROME) if headless else _PATRONES_CHROME
+    encontrados: List[Path] = []
+    for patron in patrones:
+        encontrados.extend(sorted(base.glob(patron), key=_revision_de, reverse=True))
+    esperada = _revision_esperada()
+    return sorted(encontrados, key=lambda exe: 0 if esperada and exe.parent.parent.name.endswith(f"-{esperada}") else 1)
+
+
+def lanzar_chromium(p, headless: bool = True):
+    """Abre Chromium probando, en orden:
+
+      A. El Chromium de Playwright que corresponde a esta instalación: en el
+         .exe, el embebido en _internal/ms-playwright (configurar_entorno_
+         playwright apunta PLAYWRIGHT_BROWSERS_PATH ahí); en desarrollo, el
+         caché del usuario.
+      B. El navegador de Windows: Google Chrome (channel="chrome") y, si no,
+         Microsoft Edge (channel="msedge", viene con Windows 10/11).
+      C. Cualquier Chromium de `playwright install` en %LOCALAPPDATA%\\ms-playwright,
+         por ruta directa (executable_path).
+
+    Devuelve (browser, descripción). Si todo falla: NavegadorNoDisponibleError."""
+    intentos: List[str] = []
+
+    def intentar(descripcion: str, **opciones):
+        try:
+            navegador = p.chromium.launch(headless=headless, **opciones)
+        except PlaywrightError as e:
+            primera_linea = (str(e).strip().splitlines() or [type(e).__name__])[0]
+            intentos.append(f"{descripcion}: {primera_linea}")
+            log.warning("RUBA: no se pudo abrir %s -> %s", descripcion, primera_linea)
+            return None
+        log.info("RUBA: navegador en uso -> %s", descripcion)
+        return navegador
+
+    # A
+    embebido = "Chromium embebido (_internal/ms-playwright)" if is_frozen() else "Chromium de Playwright"
+    navegador = intentar(embebido)
+    if navegador:
+        return navegador, embebido
+    # B
+    for canal, nombre in (("chrome", "Google Chrome"), ("msedge", "Microsoft Edge")):
+        navegador = intentar(nombre, channel=canal)
+        if navegador:
+            return navegador, nombre
+    # C
+    for exe in ejecutables_en_cache_usuario(headless):
+        descripcion = f"Chromium del usuario ({exe.parent.parent.name})"
+        navegador = intentar(descripcion, executable_path=str(exe))
+        if navegador:
+            return navegador, descripcion
+    if not any(i.startswith("Chromium del usuario") for i in intentos):
+        intentos.append("Chromium del usuario: no hay ninguno en %LOCALAPPDATA%\\ms-playwright")
+
+    log.error("RUBA: ningún navegador disponible:\n  %s", "\n  ".join(intentos))
+    raise NavegadorNoDisponibleError(MENSAJE_SIN_NAVEGADOR + "\n\nDetalle técnico:\n• " + "\n• ".join(intentos))
+
+
 @contextmanager
 def navegador_compartido(
     *, headless: bool = True, cdp_url: Optional[str] = None, ruta_sesion: Optional[Path] = None,
@@ -168,7 +284,7 @@ def navegador_compartido(
             contexto = browser.contexts[0] if browser.contexts else browser.new_context(viewport=VIEWPORT)
             yield contexto, False
             return
-        browser = p.chromium.launch(headless=headless)
+        browser, _ = lanzar_chromium(p, headless=headless)
         estado = str(ruta_sesion) if ruta_sesion is not None and ruta_sesion.exists() else None
         try:
             yield browser.new_context(viewport=VIEWPORT, storage_state=estado), True
