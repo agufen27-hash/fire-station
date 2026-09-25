@@ -109,9 +109,7 @@ class TarjetaUnidad(QFrame):
         grid.addWidget(QLabel(theme.etiqueta_requerida("Móvil"), self), 0, 0, 1, 2)
         grid.addWidget(QLabel(theme.etiqueta_requerida("Chofer"), self), 0, 2, 1, 3)
         self.combo_movil = QComboBox(self)
-        self.combo_movil.addItem("— Seleccionar —", None)
-        for movil in moviles:
-            self.combo_movil.addItem(texto_movil(movil), movil.id_ruba)
+        self.set_moviles(moviles)
         self.selector_chofer = SelectorBombero(self._padron, self)
         self.selector_chofer.cambiado.connect(self.dotacion_cambiada.emit)
         grid.addWidget(self.combo_movil, 1, 0, 1, 2)
@@ -170,6 +168,21 @@ class TarjetaUnidad(QFrame):
         layout.addWidget(self.boton_agregar, 0, Qt.AlignmentFlag.AlignLeft)
         _ajustar_alto(self.tabla)
         self.set_numero(numero)
+
+    def set_moviles(self, moviles: Sequence[MovilRuba]) -> None:
+        """(Re)carga las unidades ofrecidas sin perder la elegida, aunque ya
+        no esté en la lista (se agrega al final para no vaciar la dotación)."""
+        actual_dato, actual_texto = self.combo_movil.currentData(), self.combo_movil.currentText()
+        self.combo_movil.blockSignals(True)
+        self.combo_movil.clear()
+        self.combo_movil.addItem("— Seleccionar —", None)
+        for movil in moviles:
+            self.combo_movil.addItem(texto_movil(movil), movil.id_ruba)
+        if actual_dato is not None:
+            if self.combo_movil.findData(actual_dato) < 0:
+                self.combo_movil.addItem(actual_texto, actual_dato)
+            self.combo_movil.setCurrentIndex(self.combo_movil.findData(actual_dato))
+        self.combo_movil.blockSignals(False)
 
     def set_numero(self, numero: int) -> None:
         self.numero = numero
@@ -354,6 +367,13 @@ class PanelDotaciones(QWidget):
         layout.addLayout(fila)
         self._actualizar_resumen()
 
+    def actualizar_moviles(self, moviles: Sequence[MovilRuba]) -> None:
+        """Tras importar / eliminar / dar de baja unidades: las dotaciones
+        nuevas y las abiertas ofrecen el parque actual de la base."""
+        self._moviles = list(moviles)
+        for tarjeta in self._tarjetas:
+            tarjeta.set_moviles(self._moviles)
+
     def agregar_unidad(self) -> TarjetaUnidad:
         tarjeta = TarjetaUnidad(len(self._tarjetas) + 1, self._moviles, self._padron, self, self._resolver_personal)
         tarjeta.aplicar_horario(self._horario)
@@ -446,6 +466,13 @@ class PanelDotaciones(QWidget):
         """Repone las dotaciones de un servicio guardado (con su firma si la tenía)."""
         self.limpiar()
         self.set_horario_general(general)
+        ids = {u["movil_id_ruba"] for u in unidades if u.get("movil_id_ruba") is not None}
+        if ids - {m.id_ruba for m in self._moviles}:
+            # El parte usa una unidad que hoy está de baja: se la ofrece (marcada)
+            # para no perderla al volver a guardar.
+            from app.db import moviles_para_despacho
+
+            self.actualizar_moviles(moviles_para_despacho(incluir_id_ruba=tuple(ids)))
         for u in unidades:
             tarjeta = self.agregar_unidad()
             tarjeta.combo_movil.setCurrentIndex(max(tarjeta.combo_movil.findData(u["movil_id_ruba"]), 0))

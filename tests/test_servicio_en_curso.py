@@ -9,6 +9,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from datetime import date, datetime, time
 
 import pytest
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -18,6 +19,7 @@ from app.core.catalogos import obtener_padron
 from app.models import DamnificadoCivil, DotacionSalida, EstadoOperativo, EstadoRuba, Incidente, SalidaUnidad
 from app.services import ruba_service
 from app.ui.damnificados_widgets import COL_C_NOMBRE
+from app.ui.history_window import COL_ACCIONES, COL_ESTADO, COL_SELECCION
 from app.ui.servicio_en_curso import formatear_transcurrido
 from tests.ayudas import despachar, elegir_categoria
 
@@ -165,17 +167,19 @@ def test_en_curso_no_se_sincroniza_ni_cuenta_como_pendiente(ventana, padron):
     with pytest.raises(ValueError, match="EN CURSO"):
         ruba_service.sincronizar_incidente(incidente_id)
 
-    encolados = []
-    ventana._encolar_sincronizacion = lambda *a, **k: encolados.append(a)
+    lotes = []
+    ventana._cargar_lote_ruba = lambda ids: lotes.append(ids)
     ventana._sincronizar_todos_pendientes()
-    assert encolados == []
+    assert lotes == [[]]  # el EN CURSO no entra en el lote de pendientes
 
     ventana._pagina_historial.refrescar()
     tabla = ventana._pagina_historial.tabla
-    assert tabla.item(0, 5).text() == "⏱️ En curso"
-    textos = [b.text() for b in tabla.cellWidget(0, 6).findChildren(type(ventana.boton_limpiar))]
+    assert tabla.item(0, COL_ESTADO).text() == "⏱️ En curso"
+    assert not tabla.item(0, COL_SELECCION).flags() & Qt.ItemFlag.ItemIsEnabled  # no se puede tildar
+    textos = [b.text() for b in tabla.cellWidget(0, COL_ACCIONES).findChildren(type(ventana.boton_limpiar))]
     assert "✏️ Continuar" in textos
-    boton_ruba = next(b for b in tabla.cellWidget(0, 6).findChildren(type(ventana.boton_limpiar)) if "RUBA" in b.text())
+    boton_ruba = next(b for b in tabla.cellWidget(0, COL_ACCIONES).findChildren(type(ventana.boton_limpiar))
+                      if "RUBA" in b.text())
     assert not boton_ruba.isEnabled()
 
 

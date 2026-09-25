@@ -74,7 +74,8 @@ def test_ventana_conserva_object_names_y_valida_en_linea(qapp, base_temporal, mo
     ventana = mw.MainWindow()
     assert ventana.boton_limpiar.objectName() == "botonLimpiar"
     assert ventana.boton_guardar_local.objectName() == "botonPrimarioAzul"
-    assert ventana.boton_guardar_ruba.objectName() == "botonPrimarioRojo"
+    assert not hasattr(ventana, "boton_guardar_ruba")  # la carga a RUBA se hace desde el Historial
+    assert ventana._pagina_historial.boton_cargar_lote.objectName() == "botonPrimarioRojo"
 
     ventana.entry_calle.clear()
     ventana._validar()
@@ -94,14 +95,29 @@ def test_ventana_conserva_object_names_y_valida_en_linea(qapp, base_temporal, mo
     ventana.close()
 
 
-def test_reintento_desde_historial_usa_la_cola(qapp, base_temporal, monkeypatch):
+def test_reintento_desde_historial_usa_el_lote(qapp, base_temporal, monkeypatch):
+    from types import SimpleNamespace
+
+    from PySide6.QtCore import QThread
+
     from app.ui import main_window as mw
 
     ventana = mw.MainWindow()
-    encolados = []
-    monkeypatch.setattr(ventana, "_encolar_sincronizacion", lambda i, n, d=None: encolados.append((i, n, d)))
+    lanzados = []
+
+    def lanzar_lote(ids, conectar=None):
+        lanzados.append(ids)
+        return QThread(), SimpleNamespace(incidente_ids=ids)  # sin arrancar: solo el cableado
+
+    monkeypatch.setattr(mw, "lanzar_lote", lanzar_lote)
     ventana._pagina_historial._reintentar_ruba(7, "007/2026")
-    assert len(encolados) == 1 and encolados[0][:2] == (7, "007/2026")
-    assert encolados[0][2] is not None  # con diálogo de progreso
-    encolados[0][2].close()
+    assert lanzados == [[7]]
+    assert ventana.carga_ruba_en_curso() and ventana._incidente_en_sincronizacion(7)
+    dialogo = ventana._lote_ruba[2]
+    assert dialogo.isModal()
+    ventana._pagina_historial._reintentar_ruba(8, "008/2026")  # con un lote corriendo no se lanza otro
+    assert lanzados == [[7]]
+    dialogo.on_terminado(0, 0, 0, 0)
+    dialogo.close()
+    ventana._olvidar_lote_ruba()
     ventana.close()

@@ -33,7 +33,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
-from playwright.sync_api import Browser, BrowserContext, Error as PlaywrightError, Page, sync_playwright
+from playwright.sync_api import BrowserContext, Error as PlaywrightError, Page, sync_playwright
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from app.core.catalogos import leer_mapping
@@ -153,6 +153,32 @@ def _limpiar_para_archivo(texto: str) -> str:
     return re.sub(r"[^\w.-]+", "_", texto).strip("_") or "servicio"
 
 
+@contextmanager
+def navegador_compartido(
+    *, headless: bool = True, cdp_url: Optional[str] = None, ruta_sesion: Optional[Path] = None,
+) -> Iterator[tuple]:
+    """Abre Playwright + Chromium una sola vez y entrega (contexto, propio).
+    `propio=False` si se conectó por CDP a un Chrome del usuario: en ese caso
+    no se cierra el navegador (solo nuestras pestañas). Todo en el mismo
+    hilo: la API sync de Playwright no se puede compartir entre hilos."""
+    configurar_entorno_playwright()
+    with sync_playwright() as p:
+        if cdp_url:
+            browser = p.chromium.connect_over_cdp(cdp_url)
+            contexto = browser.contexts[0] if browser.contexts else browser.new_context(viewport=VIEWPORT)
+            yield contexto, False
+            return
+        browser = p.chromium.launch(headless=headless)
+        estado = str(ruta_sesion) if ruta_sesion is not None and ruta_sesion.exists() else None
+        try:
+            yield browser.new_context(viewport=VIEWPORT, storage_state=estado), True
+        finally:
+            try:
+                browser.close()
+            except PlaywrightError:
+                pass
+
+
 class RubaServiceAutomation:
     """Carga un servicio completo en RUBA.
 
@@ -211,42 +237,45 @@ class RubaServiceAutomation:
     # ------------------------------------------------------------------
 
     def ejecutar(self) -> ResultadoRuba:
-        configurar_entorno_playwright()
-        with sync_playwright() as p:
-            browser, contexto, propio = self._abrir_navegador(p)
-            self.page = contexto.new_page()
-            self.page.set_default_timeout(self.timeout_ms)
-            self.page.set_default_navigation_timeout(self.timeout_navegacion_ms)
-            try:
-                with self._paso(PasoRuba.SESION):
-                    self._asegurar_sesion(contexto, guardar=propio)
-                with self._paso(PasoRuba.INICIALIZACION):
-                    self._inicializar()
-                with self._paso(PasoRuba.GENERAL):
-                    self._cargar_general()
-                with self._paso(PasoRuba.DAMNIFICADOS):
-                    self._cargar_damnificados()
-                with self._paso(PasoRuba.PARTICIPACION):
-                    self._cargar_participacion()
-                with self._paso(PasoRuba.BOMBEROS):
-                    self._cargar_bomberos()
-                with self._paso(PasoRuba.VEHICULOS):
-                    self._cargar_vehiculos_y_guardar()
-                return ResultadoRuba(self.ruba_id_remoto, self.page.url, list(self.advertencias))
-            finally:
-                if propio:
-                    browser.close()
-                else:
-                    self.page.close()  # Chrome del usuario: solo cerramos nuestra pestaña
+        """Un servicio suelto: abre el navegador, carga y lo cierra."""
+        with self.abrir_navegador() as (contexto, propio):
+            return self.ejecutar_en_contexto(contexto, guardar_sesion=propio)
 
-    def _abrir_navegador(self, p) -> tuple[Browser, BrowserContext, bool]:
-        if self.cdp_url:
-            browser = p.chromium.connect_over_cdp(self.cdp_url)
-            contexto = browser.contexts[0] if browser.contexts else browser.new_context(viewport=VIEWPORT)
-            return browser, contexto, False
-        browser = p.chromium.launch(headless=self.headless)
-        estado = str(self.ruta_sesion) if self.ruta_sesion.exists() else None
-        return browser, browser.new_context(viewport=VIEWPORT, storage_state=estado), True
+    def abrir_navegador(self):
+        """Context manager -> (BrowserContext, propio) con la configuración de
+        ESTA automatización (headless, sesión guardada, CDP). Sirve para
+        reutilizar un mismo navegador en una carga en lote (ruba_service)."""
+        return navegador_compartido(headless=self.headless, cdp_url=self.cdp_url, ruta_sesion=self.ruta_sesion)
+
+    def ejecutar_en_contexto(self, contexto: BrowserContext, guardar_sesion: bool = True) -> ResultadoRuba:
+        """Carga el servicio en una pestaña NUEVA de un navegador ya abierto y
+        la cierra al terminar (el navegador sigue vivo para el próximo parte).
+        Si el contexto ya tiene la sesión de RUBA, el paso Sesión no vuelve a
+        loguear. `guardar_sesion`: persistir el storage_state tras un login."""
+        self.page = contexto.new_page()
+        self.page.set_default_timeout(self.timeout_ms)
+        self.page.set_default_navigation_timeout(self.timeout_navegacion_ms)
+        try:
+            with self._paso(PasoRuba.SESION):
+                self._asegurar_sesion(contexto, guardar=guardar_sesion)
+            with self._paso(PasoRuba.INICIALIZACION):
+                self._inicializar()
+            with self._paso(PasoRuba.GENERAL):
+                self._cargar_general()
+            with self._paso(PasoRuba.DAMNIFICADOS):
+                self._cargar_damnificados()
+            with self._paso(PasoRuba.PARTICIPACION):
+                self._cargar_participacion()
+            with self._paso(PasoRuba.BOMBEROS):
+                self._cargar_bomberos()
+            with self._paso(PasoRuba.VEHICULOS):
+                self._cargar_vehiculos_y_guardar()
+            return ResultadoRuba(self.ruba_id_remoto, self.page.url, list(self.advertencias))
+        finally:
+            try:
+                self.page.close()
+            except PlaywrightError:
+                pass  # el navegador ya se cayó: lo detecta el que lo abrió
 
     @contextmanager
     def _paso(self, paso: PasoRuba) -> Iterator[None]:

@@ -272,6 +272,9 @@ class Incidente(Base):
     estado_ruba: Mapped[str] = mapped_column(String(20), default=EstadoRuba.PENDIENTE.value, nullable=False)
     ruba_id_remoto: Mapped[Optional[str]] = mapped_column(String(60), nullable=True)
     ruba_error_log: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Cuándo quedó cargado en RUBA (estado_ruba = SINCRONIZADO). Desde ese
+    # momento el parte está cerrado: no se edita ni se elimina localmente.
+    ruba_sincronizado_en: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
     creado_en: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, nullable=False)
     actualizado_en: Mapped[datetime] = mapped_column(

@@ -235,8 +235,8 @@ class ControladorActualizaciones(QObject):
 
     def _motivo_para_esperar(self) -> Optional[str]:
         v = self.ventana
-        if v._hilos_sync or v._cola_sync:
-            return "Hay una carga en RUBA en curso o en espera."
+        if v.carga_ruba_en_curso():
+            return "Hay una carga en RUBA en curso."
         if v._incidente_en_edicion is not None or v._formulario_con_datos_sin_guardar():
             return "Hay un parte abierto en el formulario sin guardar."
         return None

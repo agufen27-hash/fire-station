@@ -86,11 +86,6 @@ CATEGORIAS_RUBA: dict[int, list[tuple[str, str]]] = {
     6: [("32", "Servicios Especiales")],
 }
 
-MOVILES_INICIALES: list[str] = [
-    "B-1", "B-2", "Cisterna 1", "Rescate 1", "Forestal 1", "Ambulancia 1",
-]
-
-
 def _sembrar_tipos_y_categorias(session: Session) -> None:
     for tipo_id, nombre in TIPOS_INCIDENTE.items():
         session.add(TipoIncidente(id=tipo_id, nombre=nombre))
@@ -126,10 +121,13 @@ def _sincronizar_categorias_desde_mapping(session: Session) -> None:
                 session.add(CategoriaIncidente(tipo_incidente_id=tipo.id_ruba, codigo_ruba=str(codigo), nombre=nombre))
 
 
-def _sincronizar_moviles_desde_mapping(session: Session) -> None:
-    """Da de alta (o vincula por nombre) los móviles oficiales de
-    `vehiculos_cuartel` con su `id_ruba`. Idempotente; no borra ni
-    desactiva los móviles cargados a mano."""
+def cargar_moviles_desde_mapping(session: Session) -> None:
+    """Da de alta (o vincula por nombre) los móviles de `vehiculos_cuartel`
+    (config/ruba_mapping.json) con su `id_ruba`. Idempotente.
+
+    YA NO se llama en init_db(): recrearlos en cada arranque hacía imposible
+    eliminar una unidad. Queda solo como carga explícita (p. ej. las pruebas
+    automáticas, que arman una base vacía)."""
     from app.core.catalogos import cargar_moviles  # import diferido: evita ciclo en el arranque
 
     try:
@@ -194,6 +192,69 @@ def _sincronizar_personal_desde_padron(session: Session, padron=None) -> int:
     return altas
 
 
+# ---------------------------------------------------------------------------
+# Unidades: uso en partes, baja lógica y eliminación
+# ---------------------------------------------------------------------------
+
+def usos_movil(session: Session, movil_id: int) -> int:
+    """Cuántos registros de partes referencian la unidad (salidas y
+    dotaciones). Con alguno, borrarla rompería esos partes."""
+    from app.models import DotacionSalida, SalidaUnidad
+
+    return (session.query(SalidaUnidad).filter(SalidaUnidad.movil_id == movil_id).count()
+            + session.query(DotacionSalida).filter(DotacionSalida.movil_id == movil_id).count())
+
+
+def dar_de_baja_movil(movil_id: int) -> bool:
+    """Baja lógica: queda en la base (los partes históricos la siguen
+    mostrando) pero deja de ofrecerse para nuevas salidas."""
+    from app.services.ruba_importer import ESTADO_MOVIL_BAJA
+
+    with get_session() as session:
+        movil = session.get(Movil, movil_id)
+        if movil is None:
+            return False
+        movil.activo = False
+        movil.estado = ESTADO_MOVIL_BAJA
+        return True
+
+
+def eliminar_movil(movil_id: int) -> int:
+    """DELETE físico, solo si ningún parte usa la unidad. Devuelve 0 si se
+    borró (o ya no existía) y, si no, la cantidad de registros que la usan
+    (no se toca nada). Como init_db() ya no siembra móviles, no reaparece."""
+    with get_session() as session:
+        movil = session.get(Movil, movil_id)
+        if movil is None:
+            return 0
+        usos = usos_movil(session, movil_id)
+        if usos:
+            return usos
+        session.delete(movil)
+        return 0
+
+
+def moviles_para_despacho(incluir_id_ruba: tuple = ()):
+    """Unidades que se ofrecen en las dotaciones del parte: las de la base
+    que están activas y tienen Id de RUBA (sin él no se pueden cargar en
+    RUBA), más las de `incluir_id_ruba` aunque estén de baja (para poder
+    reabrir un parte viejo). Lista de catalogos.Movil, como antes."""
+    from app.core.catalogos import Movil as MovilRuba
+
+    with get_session() as session:
+        consulta = session.query(Movil).filter(Movil.id_ruba.isnot(None))
+        moviles = [m for m in consulta if m.activo or m.id_ruba in set(incluir_id_ruba)]
+        resultado = [
+            MovilRuba(
+                id_ruba=m.id_ruba,
+                numero=(m.numero_movil or m.nombre_identificador) + ("" if m.activo else " (fuera de servicio)"),
+                marca=m.marca, modelo=m.modelo, descripcion=m.nombre_identificador,
+            )
+            for m in moviles
+        ]
+    return sorted(resultado, key=lambda m: (m.numero.endswith("(fuera de servicio)"), m.numero))
+
+
 def importar_vehiculos_excel(ruta: Path):
     """Upsert de `moviles` desde el 'Reporte de vehiculos' de RUBA elegido
     por el usuario (clave: 'Nº Móvil'), en una transacción. Devuelve un
@@ -240,11 +301,6 @@ def _sembrar_personal(session: Session) -> None:
         session.add(Personal(**datos, jerarquia="Bombero", activo=True))
 
 
-def _sembrar_moviles(session: Session) -> None:
-    for nombre in MOVILES_INICIALES:
-        session.add(Movil(nombre_identificador=nombre, activo=True))
-
-
 # Columnas de cartografía táctica agregadas en Fase 5 (ver
 # app/ui/widgets/map_widget.py): `Base.metadata.create_all()` solo crea tablas que
 # todavía no existen, nunca agrega columnas nuevas a una tabla existente --
@@ -254,6 +310,7 @@ def _sembrar_moviles(session: Session) -> None:
 # valores nuevos quedan NULL) siempre que la columna sea nullable, como es
 # el caso acá.
 COLUMNAS_NUEVAS_INCIDENTES = {
+    "ruba_sincronizado_en": "DATETIME",  # carga en lote a RUBA desde el Historial
     "latitud": "REAL",
     "longitud": "REAL",
     "superficie_ha": "REAL",
@@ -359,9 +416,10 @@ def init_db() -> None:
         _sincronizar_categorias_desde_mapping(session)
         if session.query(Personal).count() == 0:
             _sembrar_personal(session)
-        if session.query(Movil).count() == 0:
-            _sembrar_moviles(session)
-        _sincronizar_moviles_desde_mapping(session)
+        # Móviles: NO se siembran ni se sincronizan desde ruba_mapping.json.
+        # El parque se administra solo desde la base (alta a mano o
+        # importación del 'Reporte de vehiculos'), así una unidad eliminada
+        # no reaparece al reiniciar.
         if session.query(Contacto).count() == 0:
             _sembrar_contactos(session)
         _sincronizar_personal_desde_padron(session)

@@ -53,10 +53,10 @@ from PySide6.QtWidgets import (
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 
-from app.core.catalogos import obtener_catalogos_ruba, obtener_padron
+from app.core.catalogos import obtener_padron
 from app import __version__
 from app.paths import ICONO_APP, LOGO_INSTITUCIONAL, ruta_recurso_existente
-from app.db import DATA_DIR, get_session, siguiente_numero_parte
+from app.db import DATA_DIR, get_session, moviles_para_despacho, siguiente_numero_parte
 from app.models import (
     MEDIOS_CONTACTO,
     MEDIOS_TELEFONICOS,
@@ -92,10 +92,9 @@ from app.services.ruba_payload import (
     construir_payload,
     numero_parte_ruba,
     persona_desde_personal,
-    validar_payload,
 )
 from app.services.ruba_helpers import cargar_credenciales
-from app.services.ruba_service import RubaSyncWorker, lanzar_sincronizacion
+from app.services.ruba_service import RubaLoteWorker, lanzar_lote
 from app.ui.history_window import MOTIVO_PARTE_CERRADO, HistoryWindow
 from app.services import cartografia
 from app.ui.widgets.map_widget import MapWidget, OperationsMapWindow
@@ -106,7 +105,7 @@ from app.ui.participacion_widgets import HorarioServicio, SelectorBombero
 from app.ui.bomberos_view import importar_bomberos_desde_excel, recargar_padron
 from app.ui.personnel_window import LegajoPrivadoWidget
 from app.ui import theme
-from app.ui.ruba_progreso_dialog import DialogoProgresoRuba
+from app.ui.ruba_progreso_dialog import DialogoLoteRuba
 from app.ui.servicio_en_curso import TarjetaServicioEnCurso, resumen_de
 from app.ui.siniestro_widgets import FORM_ACCIDENTE, PanelDatosEspecificos
 from app.ui.unidades_view import PanelUnidades
@@ -156,7 +155,6 @@ NOMBRES_SECCION = {
 }
 
 
-TOOLTIP_GUARDAR_RUBA = "Guarda en la base local, abre las planillas PCS/PCD2 y sincroniza con RUBA en segundo plano."
 
 
 def _sincronizar_estado_movil(movil: Movil) -> None:
@@ -184,14 +182,11 @@ class MainWindow(QMainWindow):
         self.resize(ANCHO_VENTANA, ALTO_VENTANA)
         self.setMinimumSize(1000, 640)
 
-        # Referencias a los hilos de sincronización con RUBA en curso: hay
-        # que mantenerlas vivas mientras el hilo corre, o Qt puede destruir
-        # el QThread en medio de la sincronización y crashear la app.
-        self._hilos_sync: List[Tuple[QThread, RubaSyncWorker]] = []
-        # Las cargas en RUBA corren de a una (una sola sesión de navegador):
-        # cola de (incidente_id, numero_parte, diálogo de progreso o None).
-        self._cola_sync: List[Tuple[int, str, Optional[DialogoProgresoRuba]]] = []
-        self._dialogos_sync: Dict[int, DialogoProgresoRuba] = {}
+        # Carga en lote a RUBA en curso (hilo, worker, diálogo): hay que
+        # mantener vivas las referencias mientras el hilo corre, o Qt puede
+        # destruir el QThread en medio de la carga y crashear la app. Hay un
+        # solo lote a la vez (una sola sesión de navegador).
+        self._lote_ruba: Optional[Tuple[QThread, RubaLoteWorker, DialogoLoteRuba]] = None
         self._hilo_conectividad: Optional[Tuple[QThread, ConectividadWorker]] = None
         self._cantidad_pendientes_inicio = 0
         # Servicio EN_CURSO reabierto en el formulario (None = alta nueva).
@@ -255,7 +250,7 @@ class MainWindow(QMainWindow):
         self._pagina_dashboard = self._crear_pagina_dashboard()
         self._pagina_formulario = self._crear_pagina_formulario()
         self._pagina_historial = HistoryWindow(self)
-        self._pagina_historial.reintento_solicitado.connect(self._reintentar_desde_historial)
+        self._pagina_historial.carga_lote_solicitada.connect(self._cargar_lote_ruba)
         self._pagina_historial.continuar_solicitado.connect(self.continuar_servicio_en_curso)
         self._pagina_historial.editar_solicitado.connect(self.editar_servicio)
         self._pagina_historial.eliminar_solicitado.connect(self.eliminar_servicio)
@@ -856,11 +851,18 @@ class MainWindow(QMainWindow):
         except Exception as e:  # noqa: BLE001 - un Excel roto nunca debe impedir que la app arranque
             self._padron = []
             self._avisos_catalogos.append(f"No se pudo leer el padrón de bomberos ({e}).")
+        # Móviles de las dotaciones: los de la BASE (activos y con Id de RUBA),
+        # ya no los de ruba_mapping.json -- así una unidad eliminada o dada de
+        # baja no se sigue ofreciendo (ni rompe el guardado del parte).
         try:
-            self._moviles_ruba = obtener_catalogos_ruba().moviles
-        except (OSError, ValueError) as e:
+            self._moviles_ruba = moviles_para_despacho()
+        except Exception as e:  # noqa: BLE001 - la app arranca igual
             self._moviles_ruba = []
-            self._avisos_catalogos.append(f"No se pudo leer config/ruba_mapping.json ({e}).")
+            self._avisos_catalogos.append(f"No se pudieron leer las unidades de la base ({e}).")
+        if not self._moviles_ruba:
+            self._avisos_catalogos.append(
+                "No hay unidades activas con Id de RUBA: importalas desde Personal y Unidades "
+                "→ 📥 Importar Unidades desde Excel (RUBA), o cargá el Id RUBA en cada unidad.")
 
     # -- 3. Damnificados, seguro y reseña ------------------------------------------
 
@@ -989,24 +991,20 @@ class MainWindow(QMainWindow):
 
         self.boton_guardar_local = QPushButton("💾 Guardar e Imprimir Planillas", self)
         self.boton_guardar_local.setObjectName("botonPrimarioAzul")
-        self.boton_guardar_local.setToolTip("Guarda en la base local y abre las planillas PCS/PCD2. No envía a RUBA.")
-        self.boton_guardar_local.clicked.connect(lambda: self._guardar_y_generar_planillas(sincronizar_ruba=False))
+        self.boton_guardar_local.setToolTip(
+            "Guarda en la base local (queda PENDIENTE de RUBA) y abre las planillas PCS/PCD2. "
+            "La carga en RUBA se hace desde el Historial de Salidas (🚀 Cargar Seleccionados a RUBA)."
+        )
+        self.boton_guardar_local.clicked.connect(self._guardar_y_generar_planillas)
 
-        self.boton_guardar_ruba = QPushButton("🚀 Guardar y Cargar a RUBA", self)
-        self.boton_guardar_ruba.setObjectName("botonPrimarioRojo")
-        self.boton_guardar_ruba.setToolTip(TOOLTIP_GUARDAR_RUBA)
-        self.boton_guardar_ruba.clicked.connect(lambda: self._guardar_y_generar_planillas(sincronizar_ruba=True))
-
-        for boton in (self.boton_limpiar, self.boton_borrador, self.boton_guardar_local, self.boton_guardar_ruba):
+        for boton in (self.boton_limpiar, self.boton_borrador, self.boton_guardar_local):
             boton.setCursor(Qt.CursorShape.PointingHandCursor)
-        theme.aplicar_sombra(self.boton_guardar_ruba, "rojo")
 
         layout.setSpacing(12)
         layout.setContentsMargins(0, 4, 0, 0)
         layout.addWidget(self.boton_limpiar, 1)
         layout.addWidget(self.boton_borrador, 2)
         layout.addWidget(self.boton_guardar_local, 2)
-        layout.addWidget(self.boton_guardar_ruba, 2)
         return layout
 
     # -- Carga de catálogos ---------------------------------------------------
@@ -1123,6 +1121,7 @@ class MainWindow(QMainWindow):
         rehacen sus unidades y damnificados."""
         en_curso = estado == EstadoOperativo.EN_CURSO.value
         errores = self._validar_borrador() if en_curso else self._validar()
+        errores += self._moviles_inexistentes()
         if errores:
             QMessageBox.warning(self, "Revisá el formulario", "\n".join(f"• {e}" for e in errores))
             return None
@@ -1178,6 +1177,10 @@ class MainWindow(QMainWindow):
             if incidente is not None:
                 for campo, valor in campos.items():
                     setattr(incidente, campo, valor)
+                # Corregido tras un error: vuelve a PENDIENTE para cargarlo desde el
+                # Historial (conserva ruba_id_remoto: el reintento retoma ese incidente).
+                if incidente.estado_ruba != EstadoRuba.SINCRONIZADO.value:
+                    incidente.estado_ruba = EstadoRuba.PENDIENTE.value
                 incidente.actualizado_en = datetime.now()
                 # Unidades, dotación y damnificados se rehacen desde el formulario.
                 for relacion in (incidente.dotacion, incidente.salidas_unidad, incidente.damnificados_civiles,
@@ -1186,7 +1189,8 @@ class MainWindow(QMainWindow):
                     relacion.clear()
                 session.flush()
             else:
-                incidente = Incidente(numero_parte=self.label_numero_parte.text(), **campos)
+                incidente = Incidente(numero_parte=self.label_numero_parte.text(),
+                                      estado_ruba=EstadoRuba.PENDIENTE.value, **campos)
                 session.add(incidente)
                 session.flush()  # asigna incidente.id
 
@@ -1201,6 +1205,28 @@ class MainWindow(QMainWindow):
             numero_parte = incidente.numero_parte
 
         return incidente_id, numero_parte
+
+    def _moviles_inexistentes(self) -> List[str]:
+        """Dotaciones cuyo móvil ya no está en la base (eliminado mientras el
+        formulario estaba abierto): se avisa en vez de fallar al guardar."""
+        with get_session() as session:
+            existentes = {i for (i,) in session.query(Movil.id_ruba).filter(Movil.id_ruba.isnot(None))}
+        return [
+            f"Dotación N° {d['numero']}: la unidad elegida (Id RUBA {d['movil_id_ruba']}) ya no existe; elegí otra."
+            for d in self.panel_dotaciones.datos()
+            if d["movil_id_ruba"] is not None and d["movil_id_ruba"] not in existentes
+        ]
+
+    def _refrescar_moviles_despacho(self) -> None:
+        """Tras importar / editar / eliminar / dar de baja unidades."""
+        panel = getattr(self, "panel_dotaciones", None)
+        if panel is None:
+            return
+        try:
+            self._moviles_ruba = moviles_para_despacho()
+        except Exception:  # noqa: BLE001 - se queda con la lista anterior
+            return
+        panel.actualizar_moviles(self._moviles_ruba)
 
     def _mapas_id_ruba(self, session) -> Tuple[Dict[int, int], Dict[int, int]]:
         moviles = {m.id_ruba: m.id for m in session.query(Movil).filter(Movil.id_ruba.isnot(None))}
@@ -1366,27 +1392,11 @@ class MainWindow(QMainWindow):
         shutil.copy(persona.ruta_firma, destino)
         return str(destino)
 
-    def _guardar_y_generar_planillas(self, sincronizar_ruba: bool) -> None:
-        """Los dos botones de cierre del formulario. Siempre: validar, guardar
-        en la base local y generar/abrir las planillas PCS y PCD2 (PDF si hay
-        Excel en la máquina). Con `sincronizar_ruba` además se encola la carga
-        en RUBA (QThread) con un diálogo de progreso no modal."""
-        if sincronizar_ruba and self._incidente_en_edicion is not None and self._edicion_de_sincronizado:
-            QMessageBox.warning(
-                self, "Ya está cargado en RUBA",
-                "Este servicio ya se sincronizó con RUBA: volver a cargarlo duplicaría la participación en "
-                "el portal. Usá \"💾 Guardar e Imprimir Planillas\" para guardar la corrección localmente y "
-                "corregí el dato también en RUBA, a mano.",
-            )
-            return
-        if sincronizar_ruba:
-            # Antes de guardar: lo que RUBA rechazaría seguro (móvil sin chofer,
-            # encargado, N° de parte...). _validar() cubre el resto.
-            errores = self._validar() or validar_payload(self.obtener_payload_servicio())
-            if errores:
-                QMessageBox.warning(self, "Revisá el formulario", "\n".join(f"• {e}" for e in errores))
-                return
-
+    def _guardar_y_generar_planillas(self) -> None:
+        """"💾 Guardar e Imprimir Planillas": validar, guardar en la base local
+        (estado RUBA = PENDIENTE) y generar/abrir las planillas PCS y PCD2 (PDF
+        si hay Excel en la máquina). La carga en RUBA ya no se hace desde el
+        formulario: se hace en lote desde el Historial de Salidas."""
         resultado = self._persistir_incidente()
         if resultado is None:
             return
@@ -1399,13 +1409,9 @@ class MainWindow(QMainWindow):
         if problemas:
             resumen += "\n\nProblemas al generar planillas:\n" + "\n".join(problemas)
 
-        if sincronizar_ruba:
-            dialogo = DialogoProgresoRuba(numero_parte, self)
-            dialogo.set_resumen_local(resumen)
-            dialogo.show()  # no modal: el operador puede seguir cargando otro servicio
-            self._encolar_sincronizacion(incidente_id, numero_parte, dialogo)
-        else:
-            (QMessageBox.warning if problemas else QMessageBox.information)(self, "Siniestro guardado", resumen)
+        resumen += ("\n\nQuedó PENDIENTE de carga en RUBA: cargalo desde el Historial de Salidas "
+                    "(🚀 Cargar Seleccionados a RUBA).")
+        (QMessageBox.warning if problemas else QMessageBox.information)(self, "Siniestro guardado", resumen)
 
         self._limpiar_formulario()
         self._actualizar_dashboard()
@@ -1436,8 +1442,12 @@ class MainWindow(QMainWindow):
 
     def _incidente_en_sincronizacion(self, incidente_id: int) -> bool:
         """True si ese servicio se está cargando en RUBA o espera en la cola."""
-        return (any(w.incidente_id == incidente_id for _, w in self._hilos_sync)
-                or any(i == incidente_id for i, _, _ in self._cola_sync))
+        return self._lote_ruba is not None and incidente_id in self._lote_ruba[1].incidente_ids
+
+    def carga_ruba_en_curso(self) -> bool:
+        """True mientras corre un lote de carga a RUBA (lo consulta, p. ej., el
+        auto-updater antes de cerrar la app para instalar)."""
+        return self._lote_ruba is not None
 
     def _formulario_con_datos_sin_guardar(self) -> bool:
         """Heurística: el formulario tiene un servicio NUEVO a medio cargar."""
@@ -1494,11 +1504,6 @@ class MainWindow(QMainWindow):
         self._incidente_en_edicion = incidente_id
         self._edicion_de_cerrado = True
         self._edicion_de_sincronizado = sincronizado
-        self.boton_guardar_ruba.setEnabled(not sincronizado)
-        self.boton_guardar_ruba.setToolTip(
-            "Ya sincronizado con RUBA: guardá la corrección con 💾 y corregila a mano en el portal."
-            if sincronizado else "Guarda la corrección y reintenta la carga en RUBA (retoma el mismo incidente)."
-        )
         self._ir_a_pagina(IDX_FORMULARIO)
         self._actualizar_chips()
         theme.set_tono(self.statusBar(), "neutro")
@@ -1724,8 +1729,6 @@ class MainWindow(QMainWindow):
         self._incidente_en_edicion = None  # lo próximo que se guarde es un servicio nuevo
         self._edicion_de_cerrado = False
         self._edicion_de_sincronizado = False
-        self.boton_guardar_ruba.setEnabled(True)
-        self.boton_guardar_ruba.setToolTip(TOOLTIP_GUARDAR_RUBA)
         with get_session() as session:
             self.label_numero_parte.setText(siguiente_numero_parte(session))
 
@@ -1779,96 +1782,58 @@ class MainWindow(QMainWindow):
 
     # -- Sincronización con RUBA en segundo plano (Fase 3) ----------------------
 
-    def _reintentar_desde_historial(self, incidente_id: int, numero_parte: str) -> None:
-        dialogo = DialogoProgresoRuba(numero_parte, self)
-        dialogo.set_resumen_local("Reintento de carga de un servicio ya guardado.")
-        dialogo.show()
-        self._encolar_sincronizacion(incidente_id, numero_parte, dialogo)
-
-    def _encolar_sincronizacion(
-        self, incidente_id: int, numero_parte: str, dialogo: Optional[DialogoProgresoRuba] = None,
-    ) -> None:
-        """Las cargas en RUBA se hacen de a una (comparten la sesión guardada
-        del portal): si ya hay una corriendo, esta espera su turno."""
-        self._cola_sync.append((incidente_id, numero_parte, dialogo))
-        if dialogo is not None and self._hilos_sync:
-            dialogo.on_progreso("", "inicio", 0, "En espera: hay otra carga en RUBA en curso…")
-        self._lanzar_siguiente_sincronizacion()
-
-    def _lanzar_siguiente_sincronizacion(self) -> None:
-        if self._hilos_sync or not self._cola_sync:
+    def _cargar_lote_ruba(self, incidente_ids: List[int]) -> None:
+        """Carga secuencial en RUBA (Historial -> 🚀, ↻ RUBA de una fila, o el
+        aviso de pendientes al arrancar). Un QThread con UN navegador para
+        todo el lote; diálogo modal con progreso "k de N" y Cancelar."""
+        if not incidente_ids:
             return
-        incidente_id, numero_parte, dialogo = self._cola_sync.pop(0)
-        self._lanzar_sincronizacion_ruba(incidente_id, numero_parte, dialogo)
+        if self._lote_ruba is not None:
+            QMessageBox.information(self, "Carga en RUBA en curso",
+                                    "Ya hay una carga en RUBA en curso. Esperá a que termine.")
+            return
+        dialogo = DialogoLoteRuba(len(incidente_ids), self)
 
-    def _lanzar_sincronizacion_ruba(
-        self, incidente_id: int, numero_parte: str, dialogo: Optional[DialogoProgresoRuba] = None,
-    ) -> None:
-        """Arranca la carga en un QThread headless. No bloquea: la ventana
-        sigue respondiendo mientras corre en background."""
+        def conectar(worker: RubaLoteWorker) -> None:
+            # Slots de QObjects del hilo de la UI (nunca lambdas sueltas).
+            dialogo.conectar(worker)
+            worker.item_ok.connect(self._on_lote_item_ok)
+            worker.item_error.connect(self._on_lote_item_error)
+            worker.terminado.connect(self._on_lote_terminado)
+
+        hilo, worker = lanzar_lote(list(incidente_ids), conectar)
+        self._lote_ruba = (hilo, worker, dialogo)
+        hilo.finished.connect(self._olvidar_lote_ruba)
+        self._pagina_historial.set_carga_en_curso(True)
         theme.set_tono(self.statusBar(), "neutro")
-        self.statusBar().showMessage(f"Sincronizando siniestro N° {numero_parte} con RUBA…")
-        self._set_chip_ruba("cargando…", "info", f"Siniestro N° {numero_parte}")
+        self.statusBar().showMessage(f"Cargando {len(incidente_ids)} parte(s) en RUBA…")
+        self._set_chip_ruba("cargando…", "info", f"{len(incidente_ids)} parte(s) en cola")
+        dialogo.show()  # modal (ApplicationModal) sin bloquear el event loop: la carga sigue en su hilo
 
-        hilo, worker = lanzar_sincronizacion(incidente_id, numero_parte)
-        self._hilos_sync.append((hilo, worker))
-
-        if dialogo is not None:
-            self._dialogos_sync[incidente_id] = dialogo
-        # Solo métodos de MainWindow (QObject del hilo de la UI): Qt encola la
-        # llamada en el hilo de la UI. Una lambda suelta correría en el hilo
-        # del worker y tocaría widgets desde ahí (crash).
-        worker.sincronizado.connect(self._on_sync_exitosa)
-        worker.fallo.connect(self._on_sync_fallida)
-        worker.progreso.connect(self._on_sync_progreso)
-        hilo.finished.connect(lambda: self._olvidar_hilo_sync(hilo, worker))
-
-    def _olvidar_hilo_sync(self, hilo: QThread, worker: RubaSyncWorker) -> None:
-        self._hilos_sync = [(h, w) for h, w in self._hilos_sync if h is not hilo]
-        self._dialogos_sync.pop(worker.incidente_id, None)
-        self._actualizar_dashboard()
+    def _on_lote_item_ok(self, incidente_id: int, numero_parte: str, ruba_id_remoto: str, url_final: str) -> None:
+        self.statusBar().showMessage(f"Siniestro N° {numero_parte} cargado en RUBA (ID {ruba_id_remoto or '—'}).")
         self._pagina_historial.refrescar()
-        self._lanzar_siguiente_sincronizacion()
 
-    def _dialogo_sync(self, incidente_id: int) -> Optional[DialogoProgresoRuba]:
-        """El diálogo de progreso de esa carga, si el operador no lo cerró."""
-        dialogo = self._dialogos_sync.get(incidente_id)
-        try:
-            return dialogo if dialogo is not None and dialogo.isVisible() else None
-        except RuntimeError:  # cerrado con WA_DeleteOnClose: el objeto C++ ya no existe
-            self._dialogos_sync.pop(incidente_id, None)
-            return None
+    def _on_lote_item_error(self, incidente_id: int, numero_parte: str, mensaje_error: str, captura: str) -> None:
+        # El detalle completo ya quedó en incidentes.ruba_error_log (y la captura
+        # en logs/screenshots/); acá solo se deja constancia en consola.
+        print(f"[RUBA] Falló la carga del siniestro {numero_parte}: {mensaje_error} {captura}")
+        self._pagina_historial.refrescar()
 
-    def _on_sync_progreso(self, incidente_id: int, paso: str, estado: str, porcentaje: int, mensaje: str) -> None:
-        self.statusBar().showMessage(f"RUBA · {porcentaje}% · {mensaje}")
-        self._set_chip_ruba(f"cargando {porcentaje}%", "info")
-        dialogo = self._dialogo_sync(incidente_id)
-        if dialogo is not None:
-            dialogo.on_progreso(paso, estado, porcentaje, mensaje)
+    def _on_lote_terminado(self, ok: int, errores: int, omitidos: int, sin_procesar: int) -> None:
+        tono = "error" if errores else ("alerta" if sin_procesar else "ok")
+        theme.set_tono(self.statusBar(), tono)
+        texto = f"RUBA: {ok} cargado(s), {errores} con error, {omitidos} omitido(s)"
+        if sin_procesar:
+            texto += f", {sin_procesar} sin procesar (cancelado)"
+        self.statusBar().showMessage(texto + ".", 15000)
+        self._set_chip_ruba("error de carga" if errores else "sincronizado", "error" if errores else "ok", texto)
 
-    def _on_sync_exitosa(self, incidente_id: int, numero_parte: str, ruba_id_remoto: str, url_final: str) -> None:
-        dialogo = self._dialogo_sync(incidente_id)
-        if dialogo is not None:
-            dialogo.on_exito(ruba_id_remoto, url_final)
-        theme.set_tono(self.statusBar(), "ok")
-        self._set_chip_ruba("sincronizado", "ok", f"Último: N° {numero_parte} (ID {ruba_id_remoto or '—'})")
-        self.statusBar().showMessage(
-            f"Siniestro N° {numero_parte} cargado en RUBA (ID {ruba_id_remoto or '—'}).", 10000
-        )
-
-    def _on_sync_fallida(self, incidente_id: int, numero_parte: str, mensaje_error: str, captura: str) -> None:
-        dialogo = self._dialogo_sync(incidente_id)
-        if dialogo is not None:
-            dialogo.on_fallo(mensaje_error, captura)
-        theme.set_tono(self.statusBar(), "error")
-        self._set_chip_ruba("error de carga", "error", mensaje_error)
-        self.statusBar().showMessage(
-            f"Siniestro N° {numero_parte} guardado localmente (RUBA pendiente de sincronización).",
-            10000,
-        )
-        # El detalle completo ya quedó en incidentes.ruba_error_log (y la
-        # captura en logs/screenshots/); acá solo se loguea en consola.
-        print(f"[RUBA] Sincronización fallida para el siniestro {numero_parte}: {mensaje_error} {captura}")
+    def _olvidar_lote_ruba(self) -> None:
+        self._lote_ruba = None
+        self._pagina_historial.set_carga_en_curso(False)
+        self._pagina_historial.refrescar()
+        self._actualizar_dashboard()
 
     # -- Página: Personal y Unidades (CRUD completo: alta, edición, baja y eliminación) --
 
@@ -1899,6 +1864,7 @@ class MainWindow(QMainWindow):
 
         # Tabla de unidades + importador del 'Reporte de vehiculos' (app/ui/unidades_view.py).
         self._panel_unidades = PanelUnidades(self._acciones_movil, pagina)
+        self._panel_unidades.unidades_cambiadas.connect(self._refrescar_moviles_despacho)
         caja_moviles = self._panel_unidades
 
         caja_personal = QGroupBox("Personal")
@@ -1939,6 +1905,7 @@ class MainWindow(QMainWindow):
 
     def _cargar_pagina_dotaciones(self) -> None:
         self._panel_unidades.recargar()
+        self._refrescar_moviles_despacho()
         with get_session() as session:
             personal = session.query(Personal).order_by(Personal.apellido, Personal.nombre).all()
             datos_personal = [(p.id, p.nombre_completo(), p.jerarquia or "—", p.activo) for p in personal]
@@ -1964,7 +1931,7 @@ class MainWindow(QMainWindow):
             "Editar", lambda _=False, mid=movil_id: self._dialogo_unidad(mid),
             "Dar de baja" if activo else "Reactivar",
             lambda _=False, mid=movil_id: self._alternar_movil(mid),
-            lambda _=False, mid=movil_id: self._eliminar_movil(mid),
+            lambda _=False, mid=movil_id: self._panel_unidades.eliminar(mid),
         )
 
     def _importar_padron_bomberos(self) -> None:
@@ -2030,30 +1997,6 @@ class MainWindow(QMainWindow):
             return
         with get_session() as session:
             session.delete(session.get(Personal, personal_id))
-        self._cargar_pagina_dotaciones()
-
-    def _eliminar_movil(self, movil_id: int) -> None:
-        with get_session() as session:
-            movil = session.get(Movil, movil_id)
-            if movil is None:
-                return
-            nombre, id_ruba = movil.nombre_identificador, movil.id_ruba
-            usos = (session.query(SalidaUnidad).filter(SalidaUnidad.movil_id == movil_id).count()
-                    + session.query(DotacionSalida).filter(DotacionSalida.movil_id == movil_id).count())
-        if usos:
-            QMessageBox.warning(
-                self, "No se puede eliminar",
-                f"La unidad {nombre} figura en {usos} registro(s) de servicios.\n"
-                "Para conservar el historial usá \"Dar de baja\".",
-            )
-            return
-        aviso_padron = ("\n\nOjo: es un vehículo oficial de RUBA (ruba_mapping.json), así que se volverá "
-                        "a crear al reiniciar la app." if id_ruba is not None else "")
-        if not self._confirmar_eliminacion("Eliminar unidad",
-                                           f"¿Eliminar definitivamente la unidad {nombre}?{aviso_padron}"):
-            return
-        with get_session() as session:
-            session.delete(session.get(Movil, movil_id))
         self._cargar_pagina_dotaciones()
 
     @staticmethod
@@ -2525,7 +2468,7 @@ class MainWindow(QMainWindow):
         nombre = self._combo_tema.currentData()
         theme.aplicar_tema(QApplication.instance(), nombre)
         theme.guardar_tema(nombre)
-        theme.aplicar_sombra(self.boton_guardar_ruba, "rojo")
+        theme.aplicar_sombra(self._pagina_historial.boton_cargar_lote, "rojo")
         self.statusBar().showMessage(f"Tema {self._combo_tema.currentText().split(' —')[0].lower()} aplicado.", 4000)
 
     def _ruta_config_json(self) -> Path:
@@ -2639,7 +2582,5 @@ class MainWindow(QMainWindow):
                 .filter(Incidente.estado_operativo == EstadoOperativo.CERRADO.value)
                 .all()
             )
-            datos = [(inc.id, inc.numero_parte) for inc in pendientes]
-
-        for incidente_id, numero_parte in datos:
-            self._encolar_sincronizacion(incidente_id, numero_parte)
+            ids = [inc.id for inc in pendientes]
+        self._cargar_lote_ruba(ids)

@@ -1,9 +1,15 @@
 """
 Historial de Salidas: lista todos los incidentes guardados, con filtros
 rápidos y acciones por fila (editar, eliminar, reimprimir planillas,
-reintentar la sincronización con RUBA, ver el log de error), también desde
-el menú contextual (clic derecho). Se embebe como página del dashboard en
+reintentar la carga en RUBA, ver el log de error), también desde el menú
+contextual (clic derecho). Se embebe como página del dashboard en
 `main_window.py` ("📋 Historial de Salidas" en la sidebar).
+
+Carga a RUBA en lote: la primera columna es un checkbox por parte (con
+"Seleccionar todos") y "🚀 Cargar Seleccionados a RUBA (X)" pide a
+MainWindow que los procese en secuencia (app/services/ruba_service.py,
+RubaLoteWorker). Los partes ya cargados en RUBA y los EN CURSO no se pueden
+tildar: evita duplicarlos en el portal.
 
 Regla con RUBA (`permisos_servicio`): un parte ya SINCRONIZADO está cerrado
 -- no se edita ni se elimina, porque existe en el portal nacional (se puede
@@ -15,12 +21,13 @@ crear: justamente hay que poder corregirlos y reintentar. Editar y eliminar los 
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List, Optional, Set
 
 from PySide6.QtCore import QPoint, Qt, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QComboBox,
     QDialog,
     QHBoxLayout,
@@ -51,7 +58,10 @@ ESTADO_FILTRO_PENDIENTES = "Pendientes / Error"
 
 TIPO_FILTRO_TODOS = "Todos"
 
-COL_NUMERO_PARTE, COL_FECHA, COL_TIPO, COL_MOVIL, COL_DIRECCION, COL_ESTADO, COL_ACCIONES = range(7)
+COL_SELECCION, COL_NUMERO_PARTE, COL_FECHA, COL_TIPO, COL_MOVIL, COL_DIRECCION, COL_ESTADO, COL_ACCIONES = range(8)
+ENCABEZADOS = ["", "N° Parte", "Fecha", "Tipo y Categoría", "Móvil Principal", "Dirección", "Estado RUBA", "Acciones"]
+
+TEXTO_BOTON_LOTE = "🚀 Cargar Seleccionados a RUBA ({})"
 
 MOTIVO_PARTE_CERRADO = (
     "Parte cerrado: ya está cargado en RUBA (portal nacional), no se puede editar ni eliminar "
@@ -72,13 +82,15 @@ class HistoryWindow(QWidget):
     ventana/diálogo aparte, sino un QWidget que main_window.py agrega
     directamente al QStackedWidget del dashboard."""
 
-    reintento_solicitado = Signal(int, str)  # incidente_id, numero_parte
+    carga_lote_solicitada = Signal(list)     # [incidente_id, ...] a cargar en RUBA, en secuencia
     continuar_solicitado = Signal(int)       # incidente_id de un servicio en curso
     editar_solicitado = Signal(int)          # incidente_id (cualquier estado)
     eliminar_solicitado = Signal(int)        # incidente_id (MainWindow confirma y borra)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
+        self._seleccionados: Set[int] = set()   # sobrevive a refrescar() y a los filtros
+        self._carga_en_curso = False
 
         self._construir_ui()
         self._cargar_tipos_filtro()
@@ -92,12 +104,12 @@ class HistoryWindow(QWidget):
         layout.setSpacing(12)
 
         layout.addLayout(self._crear_filtros())
+        layout.addLayout(self._crear_barra_lote())
 
         self.tabla = QTableWidget(self)
-        self.tabla.setColumnCount(7)
-        self.tabla.setHorizontalHeaderLabels(
-            ["N° Parte", "Fecha", "Tipo y Categoría", "Móvil Principal", "Dirección", "Estado RUBA", "Acciones"]
-        )
+        self.tabla.setColumnCount(len(ENCABEZADOS))
+        self.tabla.setHorizontalHeaderLabels(ENCABEZADOS)
+        self.tabla.horizontalHeaderItem(COL_SELECCION).setToolTip("Tildá los partes a cargar en RUBA")
         self.tabla.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.tabla.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.tabla.verticalHeader().setVisible(False)
@@ -105,12 +117,13 @@ class HistoryWindow(QWidget):
         header.setSectionResizeMode(COL_TIPO, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(COL_DIRECCION, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(COL_ACCIONES, QHeaderView.ResizeMode.ResizeToContents)
-        for columna in (COL_NUMERO_PARTE, COL_FECHA, COL_MOVIL, COL_ESTADO):
+        for columna in (COL_SELECCION, COL_NUMERO_PARTE, COL_FECHA, COL_MOVIL, COL_ESTADO):
             header.setSectionResizeMode(columna, QHeaderView.ResizeMode.ResizeToContents)
         theme.estilizar_tabla(self.tabla, alto_fila=44)
         self.tabla.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tabla.customContextMenuRequested.connect(self._mostrar_menu_contextual)
         self.tabla.doubleClicked.connect(self._on_doble_clic)
+        self.tabla.itemChanged.connect(self._on_item_cambiado)
         layout.addWidget(self.tabla, 1)
 
         self.label_estado = QLabel("")
@@ -142,6 +155,23 @@ class HistoryWindow(QWidget):
         boton_actualizar.clicked.connect(self.refrescar)
         fila.addWidget(boton_actualizar)
 
+        return fila
+
+    def _crear_barra_lote(self) -> QHBoxLayout:
+        fila = QHBoxLayout()
+        fila.setSpacing(10)
+        self.check_todos = QCheckBox("Seleccionar todos (pendientes / con error)", self)
+        self.check_todos.setToolTip("Tilda o destilda todos los partes visibles que se pueden cargar en RUBA")
+        self.check_todos.clicked.connect(self._seleccionar_todos)
+        fila.addWidget(self.check_todos)
+        fila.addStretch(1)
+        self.boton_cargar_lote = QPushButton(TEXTO_BOTON_LOTE.format(0), self)
+        self.boton_cargar_lote.setObjectName("botonPrimarioRojo")
+        self.boton_cargar_lote.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.boton_cargar_lote.setToolTip("Carga en RUBA los partes tildados, de a uno y en orden de fecha")
+        self.boton_cargar_lote.clicked.connect(self._cargar_seleccionados)
+        theme.aplicar_sombra(self.boton_cargar_lote, "rojo")
+        fila.addWidget(self.boton_cargar_lote)
         return fila
 
     def _cargar_tipos_filtro(self) -> None:
@@ -222,13 +252,26 @@ class HistoryWindow(QWidget):
             "direccion": inc.calle_altura or "—",
             "estado_ruba": inc.estado_ruba,
             "ruba_error_log": inc.ruba_error_log,
+            "ruba_id_remoto": inc.ruba_id_remoto,
+            "ruba_sincronizado_en": inc.ruba_sincronizado_en,
             "en_curso": inc.en_curso,
         }
 
+    @staticmethod
+    def seleccionable(datos: dict) -> bool:
+        """Solo lo que todavía no está en RUBA y ya se cerró."""
+        return datos["estado_ruba"] != EstadoRuba.SINCRONIZADO.value and not datos["en_curso"]
+
     def _poblar_tabla(self, filas: List[dict]) -> None:
+        self.tabla.blockSignals(True)
         self.tabla.setRowCount(0)
         self.tabla.setRowCount(len(filas))
+        # Lo tildado que ya no se puede cargar (se sincronizó, se borró) se olvida.
+        existentes = {d["id"]: d for d in filas}
+        self._seleccionados = {i for i in self._seleccionados
+                               if i not in existentes or self.seleccionable(existentes[i])}
         for fila_idx, datos in enumerate(filas):
+            self.tabla.setItem(fila_idx, COL_SELECCION, self._crear_item_seleccion(datos))
             item_numero = QTableWidgetItem(datos["numero_parte"])
             item_numero.setData(Qt.ItemDataRole.UserRole, datos)  # para el menú contextual
             self.tabla.setItem(fila_idx, COL_NUMERO_PARTE, item_numero)
@@ -240,30 +283,122 @@ class HistoryWindow(QWidget):
             if datos["en_curso"]:
                 item_estado = QTableWidgetItem("⏱️ En curso")
                 item_estado.setForeground(QColor(theme.color("rojo_hover")))
+                item_estado.setToolTip("Cerralo (con los horarios de regreso) para poder cargarlo en RUBA")
             else:
                 item_estado = QTableWidgetItem(self._texto_estado(datos["estado_ruba"]))
                 item_estado.setForeground(self._color_estado(datos["estado_ruba"]))
+                item_estado.setToolTip(self._tooltip_estado(datos))
             self.tabla.setItem(fila_idx, COL_ESTADO, item_estado)
 
             self.tabla.setCellWidget(fila_idx, COL_ACCIONES, self._crear_widget_acciones(datos))
 
         self.tabla.resizeRowsToContents()
+        self.tabla.blockSignals(False)
+        self._actualizar_boton_lote()
+
+    def _crear_item_seleccion(self, datos: dict) -> QTableWidgetItem:
+        item = QTableWidgetItem()
+        item.setData(Qt.ItemDataRole.UserRole, datos["id"])
+        if self.seleccionable(datos):
+            item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+            marcado = datos["id"] in self._seleccionados
+            item.setCheckState(Qt.CheckState.Checked if marcado else Qt.CheckState.Unchecked)
+            item.setToolTip("Tildar para cargarlo en RUBA")
+        else:
+            # Bloqueado: sin ItemIsEnabled el checkbox se ve gris y no se puede tildar.
+            item.setFlags(Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Unchecked)
+            item.setToolTip("🔒 Ya está cargado en RUBA" if not datos["en_curso"]
+                            else "Servicio en curso: cerralo antes de cargarlo en RUBA")
+        return item
+
+    # -- Selección y carga en lote ------------------------------------------------
+
+    def _on_item_cambiado(self, item: QTableWidgetItem) -> None:
+        if item.column() != COL_SELECCION:
+            return
+        incidente_id = item.data(Qt.ItemDataRole.UserRole)
+        if item.checkState() == Qt.CheckState.Checked:
+            self._seleccionados.add(incidente_id)
+        else:
+            self._seleccionados.discard(incidente_id)
+        self._actualizar_boton_lote()
+
+    def _items_seleccionables(self) -> List[QTableWidgetItem]:
+        items = (self.tabla.item(fila, COL_SELECCION) for fila in range(self.tabla.rowCount()))
+        return [i for i in items if i is not None and i.flags() & Qt.ItemFlag.ItemIsEnabled]
+
+    def _seleccionar_todos(self, marcado: bool) -> None:
+        estado = Qt.CheckState.Checked if marcado else Qt.CheckState.Unchecked
+        self.tabla.blockSignals(True)
+        for item in self._items_seleccionables():
+            item.setCheckState(estado)
+            (self._seleccionados.add if marcado else self._seleccionados.discard)(item.data(Qt.ItemDataRole.UserRole))
+        self.tabla.blockSignals(False)
+        self._actualizar_boton_lote()
+
+    def _actualizar_boton_lote(self) -> None:
+        self.boton_cargar_lote.setText(TEXTO_BOTON_LOTE.format(len(self._seleccionados)))
+        self.boton_cargar_lote.setEnabled(not self._carga_en_curso)
+        visibles = self._items_seleccionables()
+        self.check_todos.blockSignals(True)
+        self.check_todos.setChecked(bool(visibles) and all(
+            i.checkState() == Qt.CheckState.Checked for i in visibles))
+        self.check_todos.setEnabled(bool(visibles))
+        self.check_todos.blockSignals(False)
+
+    def seleccionados(self) -> List[int]:
+        return sorted(self._seleccionados)
+
+    def set_carga_en_curso(self, en_curso: bool) -> None:
+        """MainWindow: mientras corre un lote no se puede lanzar otro."""
+        self._carga_en_curso = en_curso
+        self.boton_cargar_lote.setToolTip(
+            "Hay una carga en RUBA en curso: esperá a que termine." if en_curso
+            else "Carga en RUBA los partes tildados, de a uno y en orden de fecha")
+        self._actualizar_boton_lote()
+
+    def _cargar_seleccionados(self) -> None:
+        if not self._seleccionados:
+            QMessageBox.warning(
+                self, "No hay partes seleccionados",
+                "Tildá en la primera columna los partes que querés cargar en RUBA "
+                "(o usá \"Seleccionar todos\").",
+            )
+            return
+        # La selección NO se limpia: al refrescar, los que quedaron "Cargado en
+        # RUBA" se destildan solos y los que fallaron siguen tildados para reintentar.
+        self.carga_lote_solicitada.emit(self.seleccionados())
 
     @staticmethod
     def _texto_estado(estado: str) -> str:
         return {
-            EstadoRuba.SINCRONIZADO.value: "Sincronizado",
-            EstadoRuba.PENDIENTE.value: "Pendiente",
-            EstadoRuba.ERROR.value: "Error",
+            EstadoRuba.SINCRONIZADO.value: "✅ Cargado en RUBA",
+            EstadoRuba.PENDIENTE.value: "🕒 Pendiente",
+            EstadoRuba.ERROR.value: "❌ Error",
         }.get(estado, estado)
 
     @staticmethod
     def _color_estado(estado: str) -> QColor:
         return QColor(theme.color({
             EstadoRuba.SINCRONIZADO.value: "verde_texto",
-            EstadoRuba.PENDIENTE.value: "texto_secundario",
-            EstadoRuba.ERROR.value: "ambar",
+            EstadoRuba.PENDIENTE.value: "ambar",
+            EstadoRuba.ERROR.value: "rojo",
         }.get(estado, "texto_secundario")))
+
+    @staticmethod
+    def _tooltip_estado(datos: dict) -> str:
+        estado = datos["estado_ruba"]
+        if estado == EstadoRuba.SINCRONIZADO.value:
+            cuando = datos.get("ruba_sincronizado_en")
+            return ("Cargado en RUBA" + (f" el {cuando:%d/%m/%Y %H:%M}" if cuando else "")
+                    + (f" (ID {datos['ruba_id_remoto']})" if datos.get("ruba_id_remoto") else "")
+                    + ". Parte cerrado: no se edita ni se elimina.")
+        if estado == EstadoRuba.ERROR.value:
+            log_error = (datos.get("ruba_error_log") or "").strip()
+            return "Falló la carga en RUBA:\n" + (log_error.splitlines()[0] if log_error else "(sin detalle)") \
+                + "\n\nBotón ⚠ Log: detalle completo."
+        return "Pendiente de carga en RUBA: tildalo y usá 🚀 Cargar Seleccionados."
 
     # -- Acciones por fila ------------------------------------------------------
 
@@ -314,8 +449,8 @@ class HistoryWindow(QWidget):
         fila.addWidget(boton_pdf)
 
         boton_reintentar = QPushButton("↻ RUBA", contenedor)
-        boton_reintentar.setToolTip("Reintentar la carga en RUBA")
-        boton_reintentar.setEnabled(datos["estado_ruba"] != EstadoRuba.SINCRONIZADO.value and not datos["en_curso"])
+        boton_reintentar.setToolTip("Cargar solo este parte en RUBA")
+        boton_reintentar.setEnabled(self.seleccionable(datos) and not self._carga_en_curso)
         boton_reintentar.clicked.connect(lambda: self._reintentar_ruba(incidente_id, numero_parte))
         fila.addWidget(boton_reintentar)
 
@@ -404,10 +539,9 @@ class HistoryWindow(QWidget):
         self.label_estado.setText(f"Se generó el Informe Técnico del siniestro N° {numero_parte}: {ruta}")
 
     def _reintentar_ruba(self, incidente_id: int, numero_parte: str) -> None:
-        """La ventana principal encola la carga (una a la vez) y muestra el
-        diálogo de progreso; al terminar refresca esta tabla."""
-        self.label_estado.setText(f"Reintento del siniestro N° {numero_parte} encolado para RUBA…")
-        self.reintento_solicitado.emit(incidente_id, numero_parte)
+        """Un lote de un solo parte: mismo motor y mismo diálogo de progreso."""
+        self.label_estado.setText(f"Carga del siniestro N° {numero_parte} en RUBA…")
+        self.carga_lote_solicitada.emit([incidente_id])
 
     def _ver_log_error(self, numero_parte: str, log_error: Optional[str]) -> None:
         dialogo = QDialog(self)

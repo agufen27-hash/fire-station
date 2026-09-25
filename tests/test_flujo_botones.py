@@ -1,6 +1,6 @@
-"""Botones inferiores del formulario, de punta a punta: guardado local +
-planillas, carga en RUBA en un QThread (contra el RUBA falso) con su diálogo
-de progreso, y Limpiar Formulario. Base SQLite temporal."""
+"""Botones inferiores del formulario (guardado local + planillas, Limpiar)
+y carga EN LOTE a RUBA desde el Historial: QThread contra el RUBA falso, con
+su diálogo modal de progreso. Base SQLite temporal."""
 
 import os
 
@@ -19,7 +19,7 @@ from app.core.catalogos import obtener_padron
 from app.models import EstadoRuba, Incidente
 from app.services import ruba_automation as ra
 from app.services import ruba_service
-from app.ui.ruba_progreso_dialog import DialogoProgresoRuba
+from app.ui.ruba_progreso_dialog import DialogoLoteRuba
 from tests.ayudas import cargar_servicio_basico
 from tests.fake_ruba import FakeRuba
 
@@ -87,64 +87,95 @@ def _esperar(condicion, segundos=90):
 
 
 def _dialogo(ventana):
-    return next(w for w in ventana.findChildren(DialogoProgresoRuba))
+    return next(w for w in ventana.findChildren(DialogoLoteRuba))
 
 
-def test_guardar_y_cargar_a_ruba_con_dialogo_de_progreso(entorno, padron):
-    ventana, avisos, _ = entorno
-    _cargar(ventana, padron)
+def _guardar_local(ventana, padron, calle="Belgrano 58"):
+    """Guarda un parte con 💾 y devuelve su id (queda PENDIENTE de RUBA)."""
+    _cargar(ventana, padron, calle=calle)
     numero = ventana.label_numero_parte.text()
+    ventana.boton_guardar_local.click()
+    with db.get_session() as session:
+        return session.query(Incidente).filter_by(numero_parte=numero).one().id
 
-    ventana.boton_guardar_ruba.click()
+
+def test_formulario_sin_boton_ruba_y_guardado_queda_pendiente(entorno, padron):
+    ventana, avisos, _ = entorno
+    assert not hasattr(ventana, "boton_guardar_ruba")
+    incidente_id = _guardar_local(ventana, padron)
+    with db.get_session() as session:
+        assert session.get(Incidente, incidente_id).estado_ruba == EstadoRuba.PENDIENTE.value
+    assert "Historial" in avisos[-1][1]  # el aviso indica dónde se carga a RUBA
+
+
+def test_lote_carga_en_ruba_con_una_sola_sesion(entorno, padron):
+    ventana, _, sitio = entorno
+    ids = [_guardar_local(ventana, padron), _guardar_local(ventana, padron, calle="San Martín 100")]
+
+    ventana._cargar_lote_ruba(ids)
     dialogo = _dialogo(ventana)
-    assert dialogo.isVisible() and not dialogo.isModal()
-    assert "guardado en el histórico local" in dialogo.label_resumen_local.text()
-    assert avisos == []  # sin cuadros modales en el camino a RUBA
+    assert dialogo.isModal() and ventana.carga_ruba_en_curso()
+    assert not ventana._pagina_historial.boton_cargar_lote.isEnabled()  # no se lanza otro lote
 
     # La UI sigue viva mientras el QThread trabaja.
-    assert _esperar(lambda: dialogo.estado_final is not None), "la carga no terminó"
-    assert dialogo.estado_final == "ok", dialogo.label_mensaje.text()
-    assert dialogo.entry_id.text() == "555"
-    assert "/estructura/incidente/555" in dialogo.label_url.text()
-    assert dialogo.barra.value() == 100
-    assert all(icono.text() in ("✅", "⏭") for icono in dialogo._iconos.values())
-
-    assert _esperar(lambda: not ventana._hilos_sync, 10)
+    assert _esperar(lambda: dialogo.estado_final is not None, 60), "el lote no terminó"
+    assert dialogo.estado_final == "ok", dialogo.label_resumen.text()
+    assert dialogo.barra.value() == 2
+    assert sitio.logins == 1  # mismo navegador y misma sesión para todo el lote
+    assert _esperar(lambda: not ventana.carga_ruba_en_curso(), 10)
     with db.get_session() as session:
-        incidente = session.query(Incidente).filter_by(numero_parte=numero).one()
-        assert incidente.estado_ruba == EstadoRuba.SINCRONIZADO.value
-        assert incidente.ruba_id_remoto == "555"
-    assert ventana.panel_dotaciones.unidades() == []  # el formulario quedó limpio para el próximo servicio
+        for incidente_id in ids:
+            incidente = session.get(Incidente, incidente_id)
+            assert incidente.estado_ruba == EstadoRuba.SINCRONIZADO.value
+            assert incidente.ruba_id_remoto and incidente.ruba_sincronizado_en is not None
+    assert ventana._pagina_historial.boton_cargar_lote.isEnabled()
 
 
-def test_falla_en_ruba_muestra_error_y_captura(entorno, padron):
-    ventana, _, sitio = entorno
-    sitio.categorias = {"3": []}  # RUBA "ya no ofrece" la categoría: falla la inicialización
-    _cargar(ventana, padron)
-    numero = ventana.label_numero_parte.text()
-    ventana.boton_guardar_ruba.click()
+def test_lote_sigue_despues_de_un_parte_con_error(entorno, padron, monkeypatch):
+    ventana, _, _ = entorno
+    malo = _guardar_local(ventana, padron)
+    bueno = _guardar_local(ventana, padron, calle="San Martín 100")
+    preparar_original = ruba_service.preparar_payload
+
+    def preparar(incidente_id):
+        if incidente_id == malo:
+            raise ValueError("El incidente no está listo para RUBA: dato de prueba faltante.")
+        return preparar_original(incidente_id)
+
+    monkeypatch.setattr(ruba_service, "preparar_payload", preparar)
+    ventana._cargar_lote_ruba([malo, bueno])
     dialogo = _dialogo(ventana)
-
-    assert _esperar(lambda: dialogo.estado_final is not None)
-    assert dialogo.estado_final == "error"
-    assert "[Inicialización]" in dialogo.label_mensaje.text()
-    assert not dialogo.boton_captura.isHidden()
-    assert dialogo._iconos["INICIALIZACION"].text() == "❌"
-    assert _esperar(lambda: not ventana._hilos_sync, 10)
+    assert _esperar(lambda: dialogo.estado_final is not None, 60)
+    assert dialogo.estado_final == "con_errores"
+    assert _esperar(lambda: not ventana.carga_ruba_en_curso(), 10)
     with db.get_session() as session:
-        incidente = session.query(Incidente).filter_by(numero_parte=numero).one()
-        assert incidente.estado_ruba == EstadoRuba.ERROR.value and "Inicialización" in incidente.ruba_error_log
+        assert session.get(Incidente, malo).estado_ruba == EstadoRuba.ERROR.value
+        assert "dato de prueba" in session.get(Incidente, malo).ruba_error_log
+        assert session.get(Incidente, bueno).estado_ruba == EstadoRuba.SINCRONIZADO.value
 
 
-def test_validacion_previa_no_guarda_nada(entorno, padron):
-    ventana, avisos, _ = entorno
-    _cargar(ventana, padron)
-    ventana.panel_dotaciones.unidades()[0].selector_jefe.clear()  # sin Jefe (= sin Encargado)
-    ventana.boton_guardar_ruba.click()
-    assert avisos and avisos[-1][0] == "warning" and "Jefe de Dotación" in avisos[-1][1]
-    assert not ventana.findChildren(DialogoProgresoRuba)
-    with db.get_session() as session:
-        assert session.query(Incidente).count() == 0
+def test_worker_omite_cargados_y_respeta_cancelar(entorno, padron, monkeypatch):
+    ventana, _, _ = entorno
+    ids = [_guardar_local(ventana, padron), _guardar_local(ventana, padron, calle="San Martín 100"),
+           _guardar_local(ventana, padron, calle="Mitre 7")]
+    ruba_service._marcar_sincronizado(ids[0], "999")  # ya estaba en RUBA: no se vuelve a cargar
+
+    cargados = []
+    worker = ruba_service.RubaLoteWorker(ids)
+
+    def sincronizar(incidente_id, on_progreso=None, navegador=None):
+        cargados.append(incidente_id)
+        worker.cancelar()  # se pide cancelar durante el primer parte: termina ese y corta
+        return {"ruba_id_remoto": "1", "url_final": "", "advertencias": []}
+
+    monkeypatch.setattr(ruba_service, "sincronizar_incidente", sincronizar)
+    omitidos, resultado = [], []
+    worker.item_omitido.connect(lambda i, n, motivo: omitidos.append(motivo))
+    worker.terminado.connect(lambda *r: resultado.append(r))
+    worker.run()  # en este hilo: sin QThread para el test
+    assert omitidos == ["ya estaba cargado en RUBA"]
+    assert cargados == [ids[1]]
+    assert resultado == [(1, 0, 1, 1)]  # ok, errores, omitidos, sin procesar
 
 
 def test_guardar_e_imprimir_y_limpiar(entorno, padron):
@@ -155,7 +186,7 @@ def test_guardar_e_imprimir_y_limpiar(entorno, padron):
     with db.get_session() as session:
         incidente = session.query(Incidente).one()
         assert incidente.estado_ruba == EstadoRuba.PENDIENTE.value  # no se envió a RUBA
-    assert not ventana.findChildren(DialogoProgresoRuba)
+    assert not ventana.findChildren(DialogoLoteRuba)
 
     _cargar(ventana, padron, calle="San Martín 100")
     ventana.panel_damnificados.tarjeta_civiles.set_activa(True)

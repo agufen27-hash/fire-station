@@ -18,6 +18,24 @@ def _sin_clima_automatico(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _moviles_oficiales_en_bases_de_prueba(monkeypatch):
+    """init_db() ya no siembra móviles (en producción el parque se importa
+    del 'Reporte de vehiculos'). Las pruebas arman bases vacías y despachan
+    con los Ids de RUBA de ruba_mapping.json (4326 = Rojo 18...): se cargan
+    explícitamente después de cada init_db() de prueba."""
+    from app import db
+
+    init_original = db.init_db
+
+    def init_con_moviles() -> None:
+        init_original()
+        with db.get_session() as session:
+            db.cargar_moviles_desde_mapping(session)
+
+    monkeypatch.setattr(db, "init_db", init_con_moviles)
+
+
+@pytest.fixture(autouse=True)
 def _cerrar_ventanas_sobrantes():
     """Destruye las ventanas que un test deja vivas: si se acumulan, cada
     cambio de tema posterior tiene que repulir cientos de widgets."""
