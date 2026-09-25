@@ -112,7 +112,15 @@ def descargar_archivo(url: str, destino: "Path", timeout: float,
 def obtener_json_verificado(url: str, timeout: float, headers: Optional[Dict[str, str]] = None) -> Any:
     """Como `obtener_json` pero sin el reintento sin verificar: para datos
     que deciden qué se instala (manifiesto de actualización)."""
+    return obtener_json_verificado_con_estado(url, timeout, headers)[1]
+
+
+def obtener_json_verificado_con_estado(url: str, timeout: float,
+                                       headers: Optional[Dict[str, str]] = None) -> "tuple[int, Any]":
+    """Como `obtener_json_verificado`, devolviendo también el código HTTP
+    final (para diagnóstico). Un 4xx/5xx levanta urllib.error.HTTPError,
+    que trae el código en `.code`."""
     cabeceras = {"User-Agent": USER_AGENT_POR_DEFECTO, "Accept": "application/json", **(headers or {})}
     pedido = urllib.request.Request(url, headers=cabeceras)
     with _abrir_verificado(pedido, timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+        return resp.status, json.loads(resp.read().decode("utf-8"))

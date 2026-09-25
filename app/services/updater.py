@@ -48,7 +48,7 @@ from PySide6.QtCore import QObject, QThread, Signal
 
 from app import __version__
 from app.paths import get_resource_path, get_writable_dir, is_frozen
-from app.services.red import descargar_archivo, obtener_json_verificado
+from app.services.red import descargar_archivo, obtener_json_verificado_con_estado
 
 log = logging.getLogger(__name__)
 
@@ -144,10 +144,49 @@ def _cabeceras_github(token: str, binario: bool = False) -> dict:
     return cabeceras
 
 
+NOMBRE_LOG = "actualizaciones.log"
+
+
+def ruta_log() -> Path:
+    return get_writable_dir("logs") / NOMBRE_LOG
+
+
+def _asegurar_log_archivo() -> None:
+    """La app no configura `logging` en ningún lado y el .exe no tiene
+    consola: sin esto los diagnósticos del updater se perdían. Se agrega
+    (una sola vez) un archivo rotativo logs/actualizaciones.log."""
+    if getattr(log, "_con_archivo", False):
+        return
+    log._con_archivo = True  # aunque falle abajo: no reintentar en cada mensaje
+    try:
+        from logging.handlers import RotatingFileHandler
+
+        manejador = RotatingFileHandler(ruta_log(), maxBytes=512 * 1024, backupCount=2, encoding="utf-8")
+        manejador.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        log.addHandler(manejador)
+        log.setLevel(logging.INFO)
+    except OSError as e:
+        print(f"[Actualizaciones] No se pudo abrir {NOMBRE_LOG}: {e}")
+
+
 def _informar(mensaje: str, nivel: int = logging.INFO) -> None:
-    """Al log y a la consola (en el .exe sin consola, print no hace nada)."""
+    """A logs/actualizaciones.log y a la consola (en el .exe sin consola,
+    print no hace nada)."""
+    _asegurar_log_archivo()
     log.log(nivel, mensaje)
     print(mensaje)
+
+
+def _mensaje_github(e: urllib.error.HTTPError) -> str:
+    """El campo "message" del cuerpo de error de la API ("Bad credentials",
+    "Not Found"...). Se lee una sola vez y se cachea en la excepción."""
+    if not hasattr(e, "_mensaje_github"):
+        try:
+            cuerpo = json.loads(e.read().decode("utf-8", "replace") or "{}")
+            e._mensaje_github = str(cuerpo.get("message") or "") if isinstance(cuerpo, dict) else ""
+        except Exception:  # noqa: BLE001 - cuerpo vacío o no JSON
+            e._mensaje_github = ""
+    return e._mensaje_github
 
 
 def _error_http_github(e: urllib.error.HTTPError, con_token: bool) -> ActualizacionError:
@@ -166,7 +205,29 @@ def _error_http_github(e: urllib.error.HTTPError, con_token: bool) -> Actualizac
                   "en data/config.json.")
     else:
         motivo = f"error HTTP {e.code} de GitHub: {e.reason}"
-    return ActualizacionError(f"No se pudo consultar actualizaciones: {motivo}")
+    detalle = _mensaje_github(e)
+    if detalle:
+        motivo += f' [GitHub: "{detalle}"]'
+    return ActualizacionError(f"No se pudo consultar actualizaciones: {motivo}\nURL: {e.url or e.geturl()}")
+
+
+def _consultar_github(url: str, token: str, binario: bool = False) -> dict:
+    """GET a la API de GitHub con log de diagnóstico: URL, si viaja el
+    header Authorization (nunca el token), y el código HTTP devuelto."""
+    cabeceras = _cabeceras_github(token, binario)
+    _informar(f"[Actualizaciones] GET {url} | Authorization: "
+              f"{'Bearer ***' + token[-4:] if token else 'NO enviado'} | Accept: {cabeceras['Accept']}")
+    try:
+        estado, datos = obtener_json_verificado_con_estado(url, TIMEOUT_CONSULTA_SEG, cabeceras)
+    except urllib.error.HTTPError as e:
+        detalle = _mensaje_github(e)
+        _informar(f"[Actualizaciones] Respuesta HTTP {e.code} ({e.reason})"
+                  + (f' - GitHub: "{detalle}"' if detalle else ""), logging.WARNING)
+        raise _error_http_github(e, bool(token)) from e
+    _informar(f"[Actualizaciones] Respuesta HTTP {estado}")
+    if not isinstance(datos, dict):
+        raise ActualizacionError(f"Respuesta inesperada de GitHub en {url} (no es un objeto JSON).")
+    return datos
 
 
 def carpeta_instalacion() -> Path:
@@ -185,20 +246,19 @@ def buscar_en_releases() -> Optional[InfoActualizacion]:
     Con `github_token` en data/config.json se autentica (repo privado) y los
     assets se bajan por la API (`asset.url`), que es lo único que acepta token."""
     token = github_token()
-    _informar(f"[Actualizaciones] Consultando {REPO_GITHUB} (v{__version__} instalada, "
-              f"{'con' if token else 'sin'} github_token)...")
-    try:
-        release = obtener_json_verificado(URL_ULTIMO_RELEASE, TIMEOUT_CONSULTA_SEG, _cabeceras_github(token))
-        version = str(release.get("tag_name") or "").lstrip("v")
-        if not es_mas_nueva(version):
-            return None
-        assets = {a.get("name"): a for a in release.get("assets") or []}
-        if NOMBRE_MANIFIESTO not in assets:
-            raise ActualizacionError(f"El release v{version} no trae '{NOMBRE_MANIFIESTO}' (¿publicado a mano?).")
-        manifiesto = obtener_json_verificado(_url_asset(assets[NOMBRE_MANIFIESTO], token), TIMEOUT_CONSULTA_SEG,
-                                             _cabeceras_github(token, binario=True))
-    except urllib.error.HTTPError as e:
-        raise _error_http_github(e, bool(token)) from e
+    _informar(f"[Actualizaciones] Versión local detectada: v{__version__} | repo: {REPO_GITHUB} | "
+              f"github_token en config.json: {'sí' if token else 'no'}")
+    release = _consultar_github(URL_ULTIMO_RELEASE, token)
+    version = str(release.get("tag_name") or "").lstrip("v")
+    _informar(f"[Actualizaciones] Versión remota (último release): v{version or '?'} "
+              f"(tag '{release.get('tag_name')}') vs local v{__version__}")
+    if not es_mas_nueva(version):
+        return None
+    assets = {a.get("name"): a for a in release.get("assets") or []}
+    _informar(f"[Actualizaciones] Assets del release: {', '.join(n for n in assets if n) or '(ninguno)'}")
+    if NOMBRE_MANIFIESTO not in assets:
+        raise ActualizacionError(f"El release v{version} no trae '{NOMBRE_MANIFIESTO}' (¿publicado a mano?).")
+    manifiesto = _consultar_github(_url_asset(assets[NOMBRE_MANIFIESTO], token), token, binario=True)
     if str(manifiesto.get("version")) != version:
         raise ActualizacionError(f"update.json dice v{manifiesto.get('version')} pero el release es v{version}.")
     paquete = assets.get(manifiesto.get("paquete"))
@@ -229,6 +289,8 @@ def _git(*args: str, cwd: Path, timeout: float = 30) -> str:
 def buscar_en_git(raiz: Optional[Path] = None) -> Optional[InfoActualizacion]:
     """Desarrollo: commits en origin/main que este checkout no tiene."""
     raiz = raiz or get_resource_path(".")
+    _informar(f"[Actualizaciones] Modo desarrollo (código fuente): versión local v{__version__}; "
+              f"se compara HEAD con origin/main vía git en {raiz} (no se consulta la API de GitHub).")
     _git("fetch", "--quiet", "origin", "main", cwd=raiz)
     nuevos = int(_git("rev-list", "--count", "HEAD..origin/main", cwd=raiz) or 0)
     if not nuevos:
@@ -309,11 +371,15 @@ def descargar_y_preparar(info: InfoActualizacion, instalacion: Optional[Path] = 
     zip_local = staging / info.nombre_paquete
     if not (zip_local.is_file() and _sha256(zip_local) == info.sha256):
         token = github_token() if info.origen == "release" else ""
+        _informar(f"[Actualizaciones] Descargando {info.nombre_paquete} desde {info.url_paquete} | "
+                  f"Authorization: {'Bearer ***' + token[-4:] if token else 'NO enviado'}")
         try:
             descargar_archivo(info.url_paquete, zip_local, TIMEOUT_DESCARGA_SEG, on_progreso,
                               headers=_cabeceras_github(token, binario=True))
         except urllib.error.HTTPError as e:
+            _informar(f"[Actualizaciones] Descarga: respuesta HTTP {e.code} ({e.reason})", logging.WARNING)
             raise _error_http_github(e, bool(token)) from e
+        _informar(f"[Actualizaciones] Descarga completa: {zip_local}")
     if _sha256(zip_local) != info.sha256:
         zip_local.unlink(missing_ok=True)
         raise ActualizacionError("El paquete descargado está dañado (SHA-256 no coincide). Se reintentará.")
@@ -410,6 +476,10 @@ class BuscarActualizacionWorker(QObject):
     def run(self) -> None:
         try:
             self.resultado.emit(buscar_actualizacion())
+        except ActualizacionError as e:
+            self.fallo.emit(str(e))
+        except subprocess.CalledProcessError as e:
+            self.fallo.emit(f"git {' '.join(e.cmd[1:])} falló (código {e.returncode}): {(e.stderr or '').strip()}")
         except Exception as e:  # noqa: BLE001 - sin internet / repo privado / sin git: no molesta al operador
             self.fallo.emit(f"{type(e).__name__}: {e}")
         finally:

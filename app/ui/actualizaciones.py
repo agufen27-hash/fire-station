@@ -20,8 +20,8 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
-from PySide6.QtCore import QObject, Qt, QTimer
-from PySide6.QtWidgets import QMessageBox, QProgressDialog
+from PySide6.QtCore import QObject, Qt, QTimer, Signal
+from PySide6.QtWidgets import QApplication, QMessageBox, QProgressDialog
 
 from app import __version__
 from app.paths import is_frozen
@@ -37,6 +37,8 @@ DEMORA_PRIMERA_BUSQUEDA_MS = 8000  # que la ventana termine de abrir antes de sa
 
 
 class ControladorActualizaciones(QObject):
+    busqueda_en_curso = Signal(bool)  # para deshabilitar el botón mientras busca
+
     def __init__(self, ventana: "MainWindow") -> None:
         super().__init__(ventana)
         self.ventana = ventana
@@ -47,6 +49,8 @@ class ControladorActualizaciones(QObject):
         self._hilos = []          # referencias vivas a los QThread en curso
         self._progreso: Optional[QProgressDialog] = None
         self._instalar_al_terminar_descarga = False
+        self._buscando = False
+        self._cursor_ocupado_activo = False
 
     # -- Búsqueda ---------------------------------------------------------------
 
@@ -56,10 +60,76 @@ class ControladorActualizaciones(QObject):
         QTimer.singleShot(DEMORA_PRIMERA_BUSQUEDA_MS, self.buscar)
 
     def buscar(self) -> None:
+        """Búsqueda automática (al arrancar): silenciosa si no hay nada o si falla."""
+        if self._buscando:
+            return
+        self._buscando = True
         worker = updater.BuscarActualizacionWorker()
         worker.resultado.connect(self._on_resultado)
         worker.fallo.connect(lambda e: log.info("Búsqueda de actualizaciones sin resultado: %s", e))
+        worker.terminado.connect(self._fin_busqueda)
         self._mantener(updater.lanzar_en_hilo(worker), worker)
+
+    def buscar_manual(self) -> None:
+        """"Buscar actualizaciones ahora": cursor ocupado + barra de estado
+        mientras busca, y SIEMPRE un resultado visible (nueva / al día / error)."""
+        if self._buscando:
+            self._mensaje("Ya se están buscando actualizaciones…", "info")
+            return
+        self._buscando = True
+        self.busqueda_en_curso.emit(True)
+        QApplication.setOverrideCursor(Qt.CursorShape.BusyCursor)
+        self._cursor_ocupado_activo = True
+        self._mensaje("🔄 Buscando actualizaciones…", "info")
+        worker = updater.BuscarActualizacionWorker()
+        worker.resultado.connect(self._on_resultado_manual)
+        worker.fallo.connect(self._on_fallo_manual)
+        worker.terminado.connect(self._fin_busqueda_manual)
+        self._mantener(updater.lanzar_en_hilo(worker), worker)
+
+    def _fin_busqueda(self) -> None:
+        self._buscando = False
+
+    def _fin_busqueda_manual(self) -> None:
+        self._buscando = False
+        self.busqueda_en_curso.emit(False)
+        # El resultado ya se mostró: restaurar solo si quedó nuestro cursor
+        # (los diálogos de resultado lo restauran antes de abrirse).
+        self._restaurar_cursor()
+
+    def _restaurar_cursor(self) -> None:
+        if self._cursor_ocupado_activo:
+            QApplication.restoreOverrideCursor()
+            self._cursor_ocupado_activo = False
+
+    def _on_resultado_manual(self, info: Optional[updater.InfoActualizacion]) -> None:
+        self._restaurar_cursor()
+        self.ventana.statusBar().clearMessage()
+        if info is None:
+            QMessageBox.information(self.ventana, "Estás al día",
+                                    f"Tenés la última versión instalada: v{__version__}")
+            return
+        self.info = info
+        if info.origen == "git":
+            QMessageBox.information(
+                self.ventana, "Hay cambios nuevos",
+                f"Hay {info.commits_nuevos} commit(s) nuevo(s) en origin/main (tenés v{__version__}).\n\n"
+                f"{info.notas}\n\nEn desarrollo se actualiza con 'git pull'.",
+            )
+            return
+        self._preguntar(info)
+
+    def _on_fallo_manual(self, error: str) -> None:
+        self._restaurar_cursor()
+        self._mensaje("No se pudo verificar si hay actualizaciones.", "alerta")
+        caja = QMessageBox(self.ventana)
+        caja.setIcon(QMessageBox.Icon.Warning)
+        caja.setWindowTitle("No se pudo buscar actualizaciones")
+        caja.setText(f"Versión instalada: v{__version__}\n\n{error}")
+        caja.setInformativeText(f"El diagnóstico completo (URL, header Authorization, código HTTP) quedó en:\n"
+                                f"{updater.ruta_log()}")
+        caja.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        caja.exec()
 
     def _mantener(self, hilo, worker) -> None:
         par = (hilo, worker)

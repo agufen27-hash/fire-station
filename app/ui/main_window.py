@@ -53,10 +53,10 @@ from PySide6.QtWidgets import (
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 
-from app.core.catalogos import importar_padron, obtener_catalogos_ruba, obtener_padron
+from app.core.catalogos import obtener_catalogos_ruba, obtener_padron
 from app import __version__
 from app.paths import ICONO_APP, LOGO_INSTITUCIONAL, ruta_recurso_existente
-from app.db import DATA_DIR, get_session, sincronizar_padron_importado, siguiente_numero_parte
+from app.db import DATA_DIR, get_session, siguiente_numero_parte
 from app.models import (
     MEDIOS_CONTACTO,
     MEDIOS_TELEFONICOS,
@@ -103,11 +103,14 @@ from app.ui.damnificados_widgets import PanelDamnificados
 from app.services.personal_info import mandos_del_padron
 from app.ui.dotaciones_widgets import PanelDotaciones, PanelPersonalBase, personas_repetidas
 from app.ui.participacion_widgets import HorarioServicio, SelectorBombero
+from app.ui.bomberos_view import importar_bomberos_desde_excel, recargar_padron
 from app.ui.personnel_window import LegajoPrivadoWidget
 from app.ui import theme
 from app.ui.ruba_progreso_dialog import DialogoProgresoRuba
 from app.ui.servicio_en_curso import TarjetaServicioEnCurso, resumen_de
 from app.ui.siniestro_widgets import FORM_ACCIDENTE, PanelDatosEspecificos
+from app.ui.unidades_view import PanelUnidades
+from app.services.ruba_importer import ESTADO_MOVIL_EN_SERVICIO, ESTADO_MOVIL_FUERA_DE_SERVICIO
 from app.ui.widgets import DateField, TarjetaKPI, TimeField
 from app.ui.widgets.phonebook_widget import PhonebookWidget
 from app.ui.widgets.weather_widget import WeatherWidget
@@ -154,6 +157,18 @@ NOMBRES_SECCION = {
 
 
 TOOLTIP_GUARDAR_RUBA = "Guarda en la base local, abre las planillas PCS/PCD2 y sincroniza con RUBA en segundo plano."
+
+
+def _sincronizar_estado_movil(movil: Movil) -> None:
+    """Tras dar de baja / reactivar a mano una unidad importada de RUBA, que
+    el estado mostrado no contradiga a `activo` (las cargadas a mano, sin
+    estado de RUBA, lo siguen sin tener)."""
+    if movil.estado is None:
+        return
+    if movil.activo:
+        movil.estado = ESTADO_MOVIL_EN_SERVICIO
+    elif movil.estado == ESTADO_MOVIL_EN_SERVICIO:
+        movil.estado = ESTADO_MOVIL_FUERA_DE_SERVICIO
 
 
 class MainWindow(QMainWindow):
@@ -1870,7 +1885,7 @@ class MainWindow(QMainWindow):
         boton_nueva_unidad = QPushButton("+ Nueva Unidad", pagina)
         boton_nueva_unidad.setObjectName("botonAhora")
         boton_nueva_unidad.clicked.connect(lambda: self._dialogo_unidad())
-        boton_importar_padron = QPushButton("📥 Importar padrón (Excel)", pagina)
+        boton_importar_padron = QPushButton("📥 Importar Bomberos desde Excel (RUBA)", pagina)
         boton_importar_padron.setToolTip("Elegí el 'Reporte de bomberos' exportado de RUBA (.xlsx) desde cualquier carpeta")
         boton_importar_padron.clicked.connect(self._importar_padron_bomberos)
         fila_botones.addWidget(boton_nuevo_bombero)
@@ -1882,17 +1897,9 @@ class MainWindow(QMainWindow):
         contenido = QHBoxLayout()
         contenido.setSpacing(16)
 
-        caja_moviles = QGroupBox("Unidades")
-        layout_moviles = QVBoxLayout(caja_moviles)
-        self._tabla_moviles = QTableWidget(caja_moviles)
-        self._tabla_moviles.setColumnCount(3)
-        self._tabla_moviles.setHorizontalHeaderLabels(["Unidad", "Estado", "Acciones"])
-        self._tabla_moviles.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self._tabla_moviles.verticalHeader().setVisible(False)
-        self._tabla_moviles.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self._tabla_moviles.setColumnWidth(2, 270)
-        theme.estilizar_tabla(self._tabla_moviles)
-        layout_moviles.addWidget(self._tabla_moviles)
+        # Tabla de unidades + importador del 'Reporte de vehiculos' (app/ui/unidades_view.py).
+        self._panel_unidades = PanelUnidades(self._acciones_movil, pagina)
+        caja_moviles = self._panel_unidades
 
         caja_personal = QGroupBox("Personal")
         layout_personal = QVBoxLayout(caja_personal)
@@ -1931,26 +1938,10 @@ class MainWindow(QMainWindow):
         return contenedor
 
     def _cargar_pagina_dotaciones(self) -> None:
+        self._panel_unidades.recargar()
         with get_session() as session:
-            moviles = session.query(Movil).order_by(Movil.nombre_identificador).all()
-            datos_moviles = [(m.id, m.nombre_identificador, m.activo) for m in moviles]
             personal = session.query(Personal).order_by(Personal.apellido, Personal.nombre).all()
             datos_personal = [(p.id, p.nombre_completo(), p.jerarquia or "—", p.activo) for p in personal]
-
-        self._tabla_moviles.setRowCount(len(datos_moviles))
-        for fila, (movil_id, nombre, activo) in enumerate(datos_moviles):
-            self._tabla_moviles.setItem(fila, 0, QTableWidgetItem(nombre))
-            item_estado = QTableWidgetItem("Operativo" if activo else "Fuera de servicio")
-            item_estado.setForeground(QColor(theme.color("verde_texto" if activo else "ambar")))
-            self._tabla_moviles.setItem(fila, 1, item_estado)
-            widget = self._crear_widget_acciones_tabla(
-                "Editar", lambda _=False, mid=movil_id: self._dialogo_unidad(mid),
-                "Dar de baja" if activo else "Reactivar",
-                lambda _=False, mid=movil_id: self._alternar_movil(mid),
-                lambda _=False, mid=movil_id: self._eliminar_movil(mid),
-            )
-            self._tabla_moviles.setCellWidget(fila, 2, widget)
-        self._tabla_moviles.resizeRowsToContents()
 
         self._tabla_personal_dotacion.setRowCount(len(datos_personal))
         for fila, (personal_id, nombre, jerarquia, activo) in enumerate(datos_personal):
@@ -1968,39 +1959,31 @@ class MainWindow(QMainWindow):
             self._tabla_personal_dotacion.setCellWidget(fila, 3, widget)
         self._tabla_personal_dotacion.resizeRowsToContents()
 
-    def _importar_padron_bomberos(self) -> None:
-        """El usuario elige el Excel (cualquier ubicación); se valida, se copia
-        a data/ y se sincroniza la base. Si algo falla no se toca nada."""
-        ruta_texto, _ = QFileDialog.getOpenFileName(
-            self, "Importar padrón de bomberos (Reporte de bomberos de RUBA)", "",
-            "Excel (*.xlsx *.xlsm)",
+    def _acciones_movil(self, movil_id: int, activo: bool) -> QWidget:
+        return self._crear_widget_acciones_tabla(
+            "Editar", lambda _=False, mid=movil_id: self._dialogo_unidad(mid),
+            "Dar de baja" if activo else "Reactivar",
+            lambda _=False, mid=movil_id: self._alternar_movil(mid),
+            lambda _=False, mid=movil_id: self._eliminar_movil(mid),
         )
-        if not ruta_texto:
-            return
-        try:
-            padron = importar_padron(Path(ruta_texto))
-            altas = sincronizar_padron_importado(padron)
-        except (OSError, ValueError) as e:
-            QMessageBox.warning(self, "No se pudo importar el padrón", str(e))
-            return
-        except Exception as e:  # noqa: BLE001 - base u openpyxl: se informa sin cerrar la app
-            QMessageBox.critical(self, "No se pudo importar el padrón", f"{type(e).__name__}: {e}")
-            return
 
-        self._padron = padron.bomberos
-        self._avisos_catalogos = [a for a in self._avisos_catalogos if "padrón" not in a.lower()]
-        self._actualizar_chips()
+    def _importar_padron_bomberos(self) -> None:
+        """Diálogo + importación en app/ui/bomberos_view.py; acá solo se
+        refrescan la tabla de personal y el chip del padrón."""
+        if not importar_bomberos_desde_excel(self):
+            return
+        padron = recargar_padron()
+        if padron is not None:
+            self._padron = padron
+            self._avisos_catalogos = [a for a in self._avisos_catalogos if "padrón" not in a.lower()]
+            self._actualizar_chips()
         self._cargar_pagina_dotaciones()
-        QMessageBox.information(
-            self, "Padrón importado",
-            f"{len(padron)} bomberos activos en el padrón; {altas} alta(s) nueva(s) en la base.\n\n"
-            "Los selectores del formulario de parte toman el padrón nuevo al reiniciar la app.",
-        )
 
     def _alternar_movil(self, movil_id: int) -> None:
         with get_session() as session:
             movil = session.get(Movil, movil_id)
             movil.activo = not movil.activo
+            _sincronizar_estado_movil(movil)
         self._cargar_pagina_dotaciones()
 
     def _alternar_personal(self, personal_id: int) -> None:
@@ -2123,7 +2106,7 @@ class MainWindow(QMainWindow):
             campo_antiguedad.set_value(datos_previos["antiguedad_fecha"])
 
         combo_estado = QComboBox(dialogo)
-        combo_estado.addItems(["Activo", "Licencia", "Baja"])
+        combo_estado.addItems(["Activo", "Licencia", "Reserva", "Baja"])
         combo_estado.setCurrentText(datos_previos["estado"] if datos_previos else "Activo")
 
         form.addRow(theme.etiqueta_requerida("ID RUBA"), entry_id_ruba)
@@ -2247,6 +2230,7 @@ class MainWindow(QMainWindow):
             movil.id_ruba = id_ruba
             movil.nombre_identificador = nombre
             movil.activo = check_activo.isChecked()
+            _sincronizar_estado_movil(movil)
             if movil_id is None:
                 session.add(movil)
             try:
@@ -2406,6 +2390,15 @@ class MainWindow(QMainWindow):
         self._combo_tema.currentIndexChanged.connect(self._on_tema_cambiado)
         form_apariencia.addRow("Tema", self._combo_tema)
 
+        caja_acerca = QGroupBox("Acerca de / Actualizaciones")
+        form_acerca = QFormLayout(caja_acerca)
+        form_acerca.addRow("Versión instalada", QLabel(f"v{__version__}", caja_acerca))
+        self._boton_buscar_actualizaciones = QPushButton("🔄 Buscar actualizaciones ahora", caja_acerca)
+        self._boton_buscar_actualizaciones.setToolTip(
+            "Consulta el último release en GitHub (en desarrollo: origin/main vía git)")
+        self._boton_buscar_actualizaciones.clicked.connect(self._buscar_actualizaciones_ahora)
+        form_acerca.addRow(self._boton_buscar_actualizaciones)
+
         boton_guardar_config = QPushButton("Guardar Configuración", contenido)
         boton_guardar_config.setObjectName("botonGuardar")
         boton_guardar_config.clicked.connect(self._guardar_configuracion)
@@ -2415,10 +2408,28 @@ class MainWindow(QMainWindow):
         layout.addWidget(caja_rutas)
         layout.addWidget(caja_mapa)
         layout.addWidget(caja_apariencia)
+        layout.addWidget(caja_acerca)
         layout.addWidget(boton_guardar_config, 0, Qt.AlignmentFlag.AlignLeft)
         layout.addStretch(1)
 
         return pagina
+
+    def _buscar_actualizaciones_ahora(self) -> None:
+        """Búsqueda manual: funciona aunque el modo sea "desactivado" o la
+        ventana se haya creado sin controlador (tests / arranque sin run.py)."""
+        if self.controlador_actualizaciones is None:
+            from app.ui.actualizaciones import ControladorActualizaciones
+
+            self.controlador_actualizaciones = ControladorActualizaciones(self)
+        controlador = self.controlador_actualizaciones
+        if not getattr(self, "_boton_actualizaciones_conectado", False):
+            boton = self._boton_buscar_actualizaciones
+            controlador.busqueda_en_curso.connect(
+                lambda activa: (boton.setEnabled(not activa),
+                                boton.setText("⏳ Buscando actualizaciones…" if activa
+                                              else "🔄 Buscar actualizaciones ahora")))
+            self._boton_actualizaciones_conectado = True
+        controlador.buscar_manual()
 
     def _crear_caja_config_mapa(self) -> QGroupBox:
         """Mapa Operativo: imagen base (carta topográfica/satelital) y los

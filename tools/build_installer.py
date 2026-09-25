@@ -36,6 +36,23 @@ def version_actual() -> str:
     return m.group(1)
 
 
+_RE_VERSION_ISS = re.compile(r'^(\s*#define MyAppVersion ")([^"]*)(")', re.MULTILINE)
+
+
+def sincronizar_version_iss(version: str) -> None:
+    """Deja el valor por defecto de MyAppVersion del .iss igual a
+    app/__init__.py: el build ya lo pasa con /DMyAppVersion, pero así un
+    ISCC corrido a mano tampoco genera un instalador con versión vieja."""
+    texto = ISS.read_text(encoding="utf-8-sig")
+    m = _RE_VERSION_ISS.search(texto)
+    if not m:
+        sys.exit(f"No se encontró '#define MyAppVersion \"...\"' en {ISS.name}.")
+    if m.group(2) == version:
+        return
+    ISS.write_text(_RE_VERSION_ISS.sub(rf"\g<1>{version}\g<3>", texto, count=1), encoding="utf-8-sig")
+    print(f"{ISS.name}: MyAppVersion por defecto {m.group(2)} -> {version}")
+
+
 def _desde_registro() -> Optional[Path]:
     """InstallLocation de Inno Setup 6 (instalación por usuario o para todos)."""
     try:
@@ -98,7 +115,8 @@ def main() -> None:
         )
 
     version = version_actual()
-    comando = [str(iscc), f"/DMyAppVersion={version}", str(ISS)]
+    sincronizar_version_iss(version)
+    comando =[str(iscc), f"/DMyAppVersion={version}", str(ISS)]
     if args.verificar:
         comando.insert(1, "/O-")  # compila el script completo pero sin generar el instalador
     else:

@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 from contextlib import contextmanager
 from datetime import date
+from pathlib import Path
 from typing import Iterator, Optional
 
 from sqlalchemy import create_engine, inspect, text
@@ -193,11 +194,22 @@ def _sincronizar_personal_desde_padron(session: Session, padron=None) -> int:
     return altas
 
 
-def sincronizar_padron_importado(padron) -> int:
-    """Tras importar un Excel desde la UI: da de alta/vincula su personal
-    en la base. Devuelve la cantidad de altas nuevas."""
-    with get_session() as session:
-        return _sincronizar_personal_desde_padron(session, padron)
+def importar_vehiculos_excel(ruta: Path):
+    """Upsert de `moviles` desde el 'Reporte de vehiculos' de RUBA elegido
+    por el usuario (clave: 'Nº Móvil'), en una transacción. Devuelve un
+    ruba_importer.ResumenImportacion. Ver app/services/ruba_importer.py."""
+    from app.services.ruba_importer import importar_vehiculos_desde_excel
+
+    return importar_vehiculos_desde_excel(Path(ruta))
+
+
+def importar_bomberos_excel(ruta: Path):
+    """Upsert de `personal` desde el 'Reporte de bomberos' de RUBA (clave:
+    Id de RUBA, luego DNI) + copia local del padrón. Devuelve
+    (ResumenImportacion, activos_en_padron | None)."""
+    from app.services.ruba_importer import importar_bomberos_desde_excel
+
+    return importar_bomberos_desde_excel(Path(ruta))
 
 
 # Guía telefónica: SOLO números oficiales de emergencia, de alcance nacional o
@@ -289,6 +301,13 @@ COLUMNAS_NUEVAS_PERSONAL = {
 
 COLUMNAS_NUEVAS_MOVILES = {
     "id_ruba": "INTEGER",
+    # Importador del 'Reporte de vehiculos' de RUBA (app/services/ruba_importer.py).
+    "numero_movil": "VARCHAR(30)",
+    "tipo": "VARCHAR(80)",
+    "marca": "VARCHAR(60)",
+    "modelo": "VARCHAR(80)",
+    "anio": "INTEGER",
+    "estado": "VARCHAR(20)",
 }
 
 # Fase 12: lesión de cada civil damnificado.

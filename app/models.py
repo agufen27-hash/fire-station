@@ -166,6 +166,18 @@ class Movil(Base):
     # Fase 11: value del <option> del vehículo en RUBA (`vehiculos_cuartel`
     # de config/ruba_mapping.json). NULL para móviles cargados a mano.
     id_ruba: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+    # Datos del 'Reporte de vehiculos' de RUBA (app/services/ruba_importer.py).
+    # numero_movil = 'Nº Móvil' limpio: es la clave de la importación. NULL
+    # en unidades cargadas a mano que todavía no se cruzaron con el reporte.
+    numero_movil: Mapped[Optional[str]] = mapped_column(String(30), nullable=True, index=True)
+    tipo: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
+    marca: Mapped[Optional[str]] = mapped_column(String(60), nullable=True)
+    modelo: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
+    anio: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # "En Servicio" / "Fuera de Servicio" / "Baja" según RUBA; `activo` se
+    # mantiene sincronizado (solo "En Servicio" es activo) porque todo el
+    # código existente filtra por `activo`.
+    estado: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
 
     def __repr__(self) -> str:  # pragma: no cover
         return f"<Movil id={self.id} {self.nombre_identificador!r}>"

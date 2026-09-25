@@ -127,10 +127,15 @@ def leer_padron_personal(ruta: Optional[Path] = None) -> List[Bombero]:
             return []
         indices = {_clave_busqueda(str(h)): i for i, h in enumerate(encabezado) if h is not None}
 
-        requeridas = ["ID", "APELLIDO", "NOMBRE", "DNI", "LEGAJO", "CARGO", "FORMACION"]
+        # Legajo / Cargo son opcionales; la formación puede venir como
+        # 'Formación' (export actual) o 'Jerarquía' (otros exports de RUBA).
+        requeridas = ["ID", "APELLIDO", "NOMBRE", "DNI"]
         faltantes = [c for c in requeridas if c not in indices]
+        if "FORMACION" not in indices and "JERARQUIA" not in indices:
+            faltantes.append("FORMACION o JERARQUIA")
         if faltantes:
             raise ValueError(f"{ruta.name}: faltan las columnas {faltantes}.")
+        columna_formacion = "FORMACION" if "FORMACION" in indices else "JERARQUIA"
 
         def celda(fila: tuple, columna: str) -> Any:
             i = indices.get(columna)
@@ -145,7 +150,7 @@ def leer_padron_personal(ruta: Optional[Path] = None) -> List[Bombero]:
             if not activo or estado != "ACTIVO":
                 continue
 
-            formacion = _texto(celda(fila, "FORMACION")) or ""
+            formacion = _texto(celda(fila, columna_formacion)) or ""
             try:
                 id_ruba = int(celda(fila, "ID"))
             except (TypeError, ValueError):
