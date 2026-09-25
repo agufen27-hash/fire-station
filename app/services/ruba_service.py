@@ -40,11 +40,6 @@ from app.services.ruba_payload import payload_desde_incidente, validar_payload
 
 log = logging.getLogger(__name__)
 
-# RUBA exige compañía y póliza (label "required"); sin seguro se declara así,
-# con el mismo valor que usaba la carga anterior.
-SEGURO_POR_DEFECTO: Dict[str, str] = {"compania_seguro": "Sin datos", "numero_poliza": "00000000"}
-
-
 CAMPOS_DENUNCIANTE = (
     ("nombre", "nombre_solicitante"), ("apellido", "apellido_solicitante"),
     ("dni", "dni_solicitante"), ("telefono", "telefono_solicitante"),
@@ -69,9 +64,9 @@ def _completar_denunciante(payload: Dict[str, Any]) -> None:
         for campo, clave in CAMPOS_DENUNCIANTE:
             if not general.get(clave):
                 general[clave] = por_defecto[campo]
-    for clave, valor in SEGURO_POR_DEFECTO.items():
-        if not general.get(clave):
-            general[clave] = valor
+    # El seguro NO se completa acá: si el parte no tiene, la automatización ni
+    # busca el bloque en RUBA (ruba_automation._cargar_seguro); solo si el
+    # formulario de ese tipo lo muestra como obligatorio pone "Sin datos".
 
 
 def _ruba_id_guardado(incidente_id: int) -> Optional[str]:

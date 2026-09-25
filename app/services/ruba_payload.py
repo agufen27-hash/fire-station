@@ -301,6 +301,9 @@ def construir_payload(d: DatosServicio) -> Dict[str, Any]:
             "civiles_desaparecidos": d.civiles_desaparecidos,
             "compania_seguro": d.seguro_compania,
             "numero_poliza": d.seguro_poliza,
+            # True solo si el parte trae compañía o póliza reales: decide si la
+            # automatización busca el bloque "Datos del Seguro" en RUBA.
+            "tiene_seguro": bool((d.seguro_compania or "").strip() or (d.seguro_poliza or "").strip()),
             "condicionales": _condicionales(d.datos_especificos, d.tipo_id, d.categoria_codigo),
         },
         "damnificados": {

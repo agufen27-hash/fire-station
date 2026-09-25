@@ -143,6 +143,14 @@ _JS_SETEAR_PICKER = r"""
 }
 """
 
+# Campos accesorios: nunca se espera el timeout general (30 s) por ellos.
+TIMEOUT_OPCIONAL_MS = 1500
+TIMEOUT_SEGURO_MS = 2000
+# Solo si RUBA muestra "Datos del Seguro" como OBLIGATORIO (formulario de
+# Incendios: inputs required, sin checkbox) y el parte no tiene seguro: lo
+# que RUBA ya aceptó en cargas reales (captura del 24/09).
+SEGURO_SIN_DATOS = {"compania_seguro": "Sin datos", "numero_poliza": "00000000"}
+
 _JS_OPCIONES = "(el) => Array.from(el.options || []).map(o => ({value: o.value, text: o.textContent.trim()}))"
 
 
@@ -509,11 +517,11 @@ class RubaServiceAutomation:
         self._confirmar_punto_en_mapa(sel)
         self._asegurar_punto_fijado(sel, datos)
 
-        for clave in (
-            "nombre_solicitante", "apellido_solicitante", "telefono_solicitante", "dni_solicitante",
-            "descripcion", "compania_seguro", "numero_poliza",
-        ):
+        for clave in ("nombre_solicitante", "apellido_solicitante", "descripcion"):
             self._llenar(sel[clave], datos.get(clave))
+        for clave in ("telefono_solicitante", "dni_solicitante"):  # accesorios: sin esperas largas
+            self._llenar_opcional(sel[clave], datos.get(clave))
+        self._cargar_seguro(sel, datos)
         self._cargar_personas_damnificadas(sel, datos)
 
         self._cargar_condicionales(datos.get("condicionales"))
@@ -533,6 +541,47 @@ class RubaServiceAutomation:
             sel["btn_guardar_continuar"],
             destinos=(self.sel["damnificados"]["url_patron"], self.sel["participacion"]["url_patron"]),
         )
+
+    def _cargar_seguro(self, sel: Dict[str, Any], datos: Dict[str, Any]) -> None:
+        """"Datos del Seguro", condicionado al parte local.
+
+        - Parte SIN seguro: no se toca ningún checkbox ni se espera nada. Solo
+          si el formulario de este tipo YA tiene el bloque en pantalla como
+          obligatorio (Incendios) se escribe "Sin datos" para que el guardado
+          no rebote; si no existe (otros tipos) se sigue de largo al instante.
+        - Parte CON seguro: se tilda el checkbox si el mapping define uno
+          (`check_seguro`), se espera el campo como máximo 2 s y se completan
+          compañía y póliza. Si RUBA no muestra el bloque, advertencia."""
+        sel_compania, sel_poliza = sel["compania_seguro"], sel["numero_poliza"]
+        if not datos.get("tiene_seguro"):
+            compania = self.page.locator(sel_compania).first
+            if compania.count() == 0:  # sin esperar: el formulario no tiene seguro
+                log.info("Paso 3: parte sin seguro y formulario sin 'Datos del Seguro': se omite.")
+                return
+            if not (compania.is_visible() and compania.get_attribute("required") is not None):
+                log.info("Paso 3: parte sin seguro; 'Datos del Seguro' no es obligatorio acá: no se toca.")
+                return
+            for clave, selector in (("compania_seguro", sel_compania), ("numero_poliza", sel_poliza)):
+                self._llenar_opcional(selector, SEGURO_SIN_DATOS[clave], timeout_ms=0)
+            return
+
+        check = sel.get("check_seguro")
+        if check and self.page.locator(check).count():
+            self._tildar(check, True)
+        # UNA sola espera corta para todo el bloque (máx. 2 s): que aparezca y, si
+        # lo revela un checkbox, que quede visible antes de escribir.
+        try:
+            self.page.locator(sel_compania).first.wait_for(state="visible", timeout=TIMEOUT_SEGURO_MS)
+        except PlaywrightError:
+            pass  # oculto o ausente: _llenar_opcional decide sin volver a esperar
+        cargado = False
+        for clave, selector in (("compania_seguro", sel_compania), ("numero_poliza", sel_poliza)):
+            cargado = self._llenar_opcional(selector, datos.get(clave), timeout_ms=0) or cargado
+        if not cargado:
+            self.advertencias.append(
+                "El parte tiene seguro pero RUBA no mostró 'Datos del Seguro' para este tipo de incidente: "
+                "compañía y póliza no se cargaron."
+            )
 
     def _cargar_localidad(self, selector: str, texto: str) -> None:
         """Localidad es un par Symfony: <input type=hidden id=..._localidad>
@@ -744,8 +793,10 @@ class RubaServiceAutomation:
             asegurado = bool(v.get("asegurado"))
             self._tildar(campo("asegurado"), asegurado)
             if asegurado:
-                self._llenar(campo("aseguradora"), v.get("aseguradora"))
-                self._llenar(campo("poliza"), v.get("poliza"))
+                for clave in ("aseguradora", "poliza"):
+                    if v.get(clave) and not self._llenar_opcional(campo(clave), v.get(clave),
+                                                                  timeout_ms=TIMEOUT_SEGURO_MS):
+                        self.advertencias.append(f"Vehículo {n}: RUBA no mostró el campo '{clave}' del seguro.")
 
             liberados = liberar_required_vacios(self.page, fila)
             if liberados:
@@ -889,6 +940,34 @@ class RubaServiceAutomation:
             loc.dispatch_event("change")
         elif not self.page.evaluate(_JS_SETEAR_VALOR, [selector, texto]):
             raise RubaAutomationError(self._paso_en_curso(), f"No existe el campo {selector}.")
+
+    def _llenar_opcional(self, selector: str, valor: Any, timeout_ms: int = TIMEOUT_OPCIONAL_MS) -> bool:
+        """Como `_llenar`, para campos ACCESORIOS: si el campo no aparece en
+        `timeout_ms` (nunca el timeout general de 30 s) se sigue sin error.
+        Devuelve True si se escribió algo."""
+        if valor is None or valor == "":
+            return False
+        loc = self.page.locator(selector).first
+        if loc.count() == 0:
+            if timeout_ms <= 0:
+                return False
+            try:
+                loc.wait_for(state="attached", timeout=timeout_ms)
+            except PlaywrightError:
+                log.info("Campo accesorio ausente, se omite: %s", selector)
+                return False
+        texto = str(valor)
+        if _es_picker(selector):
+            self._setear_picker(selector, texto)
+            return True
+        try:
+            if loc.is_visible() and loc.is_editable():
+                loc.fill(texto, timeout=max(timeout_ms, TIMEOUT_OPCIONAL_MS))
+                loc.dispatch_event("change")
+                return True
+        except PlaywrightError as e:
+            log.info("No se pudo escribir %s (%s): se intenta por JS.", selector, e)
+        return bool(self.page.evaluate(_JS_SETEAR_VALOR, [selector, texto]))
 
     def _setear_picker(self, selector: str, valor: str) -> None:
         """Bootstrap date/timepicker: readonly y con plugin -- el valor se

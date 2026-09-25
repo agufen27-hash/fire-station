@@ -12,7 +12,7 @@
 ; arranque; reinstalar, actualizar o desinstalar las deja como están.
 
 #ifndef MyAppVersion
-  #define MyAppVersion "1.0.4"
+  #define MyAppVersion "1.0.5"
 #endif
 #define MyAppName "Fire Station - Cuartel Adelia María"
 #define MyAppShortName "Fire Station"
