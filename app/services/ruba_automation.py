@@ -147,6 +147,8 @@ _JS_SETEAR_PICKER = r"""
 # Campos accesorios: nunca se espera el timeout general (30 s) por ellos.
 TIMEOUT_OPCIONAL_MS = 1500
 TIMEOUT_SEGURO_MS = 2000
+# select_option / check sobre filas dinámicas de vehículos: nunca 30 s.
+TIMEOUT_FILA_MS = 3000
 # Solo si RUBA muestra "Datos del Seguro" como OBLIGATORIO (formulario de
 # Incendios: inputs required, sin checkbox) y el parte no tiene seguro: lo
 # que RUBA ya aceptó en cargas reales (captura del 24/09).
@@ -767,6 +769,7 @@ class RubaServiceAutomation:
         if not self._existe(sel["boton_agregar"]):
             raise RubaAutomationError(PasoRuba.GENERAL, "RUBA no muestra el botón para agregar vehículos del accidente.")
 
+        filas_cargadas: List[str] = []   # una por vehículo del parte, nunca más
         for n, v in enumerate(vehiculos, start=1):
             anteriores = indices_coleccion(self.page, prefijo)
             self.page.locator(sel["boton_agregar"]).first.click()
@@ -775,6 +778,7 @@ class RubaServiceAutomation:
             except PlaywrightError as e:
                 raise RubaAutomationError(PasoRuba.GENERAL, f"RUBA no generó la fila del vehículo {n}: {e}") from e
             fila = f"{prefijo}_{indice}_"
+            filas_cargadas.append(fila)
             campo = lambda clave: f"#{fila}{campos[clave]}"  # noqa: E731
             self.page.locator(campo("dominio")).first.wait_for(state="attached")
 
@@ -805,18 +809,21 @@ class RubaServiceAutomation:
             liberados = liberar_required_vacios(self.page, fila)
             if liberados:
                 log.info("Vehículo %s: sin dato en %s (required liberado)", n, ", ".join(liberados))
-        self._completar_selects_vehiculos()
+        self._completar_selects_vehiculos(filas_cargadas)
 
     # -- Selects de cada vehículo del Accidente (tipo / asegurado / airbag) ---------------
 
-    SEL_VEHICULOS_ACCIDENTE = "select[name*='[datosVehiculosAccidentes]'][name$='[{campo}]']"
+    # `:not([name*='__name__'])`: Symfony deja en el DOM un prototype OCULTO de la
+    # fila (id ..._datosVehiculosAccidentes___name___tipo, name [__name__][tipo])
+    # que matchea el mismo selector; tocarlo = esperar 30 s a que sea visible.
+    SEL_VEHICULOS_ACCIDENTE = "select[name*='[datosVehiculosAccidentes]'][name$='[{campo}]']:not([name*='__name__'])"
 
     def _seleccionar_tipo_vehiculo(self, selector: str, valor: Optional[str], n: int) -> None:
         """select_option(value=...) con el value ya mapeado en el payload
         (ruba_payload.tipo_vehiculo_ruba). Nunca queda en "Seleccionar"."""
         loc = self.page.locator(selector).first
-        if not loc.count():
-            return  # formulario sin tipo: lo cubre la pasada final por name
+        if not loc.count() or not loc.is_visible():
+            return  # formulario sin tipo (o fila no visible): lo cubre la pasada final
         valor = valor or TIPO_VEHICULO_DEFAULT
         disponibles = [o["value"] for o in loc.evaluate(_JS_OPCIONES)]
         if valor not in disponibles:
@@ -824,12 +831,12 @@ class RubaServiceAutomation:
             valor = TIPO_VEHICULO_DEFAULT if TIPO_VEHICULO_DEFAULT in disponibles else next(
                 (v for v in disponibles if v), "")
         if valor:
-            loc.select_option(value=valor)
+            loc.select_option(value=valor, timeout=TIMEOUT_FILA_MS)
 
     def _setear_asegurado(self, selector: str, asegurado: bool) -> None:
         """"Asegurado" puede ser checkbox o <select> (Si / No / Sin datos)."""
         loc = self.page.locator(selector).first
-        if not loc.count():
+        if not loc.count() or not loc.is_visible():
             return
         if loc.evaluate("(e) => e.tagName") == "SELECT":
             preferidos = ("si",) if asegurado else ("no", "sin datos")
@@ -840,9 +847,12 @@ class RubaServiceAutomation:
     def _elegir_opcion(self, selector: str, preferidos: tuple, solo_si_vacio: bool = False) -> Optional[str]:
         """Elige en un <select> la primera opción cuyo texto coincide con
         `preferidos` (sin acentos ni mayúsculas); si ninguna coincide, la
-        primera opción NO vacía. Devuelve el value elegido (None si no tocó)."""
+        primera opción NO vacía. Devuelve el value elegido (None si no tocó).
+        Un select invisible (p. ej. el prototype de Symfony) no se toca."""
         loc = self.page.locator(selector).first
-        if solo_si_vacio and (loc.input_value() or "").strip():
+        if not loc.count() or not loc.is_visible():
+            return None
+        if solo_si_vacio and (loc.input_value(timeout=TIMEOUT_FILA_MS) or "").strip():
             return None
         opciones = [o for o in loc.evaluate(_JS_OPCIONES) if (o["value"] or "").strip()]
         if not opciones:
@@ -856,30 +866,43 @@ class RubaServiceAutomation:
                 break
         else:
             elegida = opciones[0]["value"]
-        loc.select_option(value=elegida)
+        loc.select_option(value=elegida, timeout=TIMEOUT_FILA_MS)
         return elegida
 
     def _elegir_si_vacio(self, selector: str, preferidos: tuple) -> Optional[str]:
         return self._elegir_opcion(selector, preferidos, solo_si_vacio=True)
 
-    def _completar_selects_vehiculos(self) -> None:
-        """Red de seguridad sobre TODAS las filas (select_loc.nth(i)): ningún
-        tipo / asegurado / airbag de un vehículo del Accidente se envía vacío."""
+    def _completar_selects_vehiculos(self, filas_cargadas: List[str]) -> None:
+        """Red de seguridad: ningún tipo / asegurado / airbag de los vehículos
+        que se acaban de cargar queda vacío. Solo recorre selects VISIBLES,
+        sin el prototype `__name__`, de las filas creadas para este parte:
+        con 1 vehículo se revisa 1 fila y nunca se accede a un índice mayor."""
+        if not filas_cargadas:
+            return
         por_defecto = (("tipo", None), ("asegurado", ("no", "sin datos")), ("airbag", ("no posee", "sin datos", "no")))
         for campo, preferidos in por_defecto:
-            selects = self.page.locator(self.SEL_VEHICULOS_ACCIDENTE.format(campo=campo))
-            for i in range(selects.count()):
-                select = selects.nth(i)
-                if (select.input_value() or "").strip():
+            candidatos = self.page.locator(self.SEL_VEHICULOS_ACCIDENTE.format(campo=campo)).all()
+            visibles = [s for s in candidatos if self._visible_y_de(s, filas_cargadas)]
+            for select in visibles[: len(filas_cargadas)]:
+                if (select.input_value(timeout=TIMEOUT_FILA_MS) or "").strip():
                     continue
-                nombre = select.get_attribute("name") or f"{campo} #{i + 1}"
+                identificador = select.get_attribute("id") or select.get_attribute("name") or campo
                 if campo == "tipo":
-                    select.select_option(value=TIPO_VEHICULO_DEFAULT)
-                    elegido = TIPO_VEHICULO_DEFAULT
+                    select.select_option(value=TIPO_VEHICULO_DEFAULT, timeout=TIMEOUT_FILA_MS)
+                    elegido: Optional[str] = TIPO_VEHICULO_DEFAULT
                 else:
-                    selector = f"select[name='{nombre}']"
-                    elegido = self._elegir_opcion(selector, preferidos)
-                log.info("Vehículo del accidente: %s vacío -> %s", nombre, elegido)
+                    elegido = self._elegir_opcion(f"[id='{identificador}']", preferidos)
+                log.info("Vehículo del accidente: %s vacío -> %s", identificador, elegido)
+
+    @staticmethod
+    def _visible_y_de(select, filas: List[str]) -> bool:
+        """El select es visible y pertenece a una de las filas cargadas (su id
+        empieza con '{prefijo}_{indice}_'): el prototype nunca califica."""
+        try:
+            identificador = select.get_attribute("id", timeout=TIMEOUT_FILA_MS) or ""
+            return identificador.startswith(tuple(filas)) and select.is_visible()
+        except PlaywrightError:
+            return False
 
     def _cargar_damnificados(self) -> None:
         sel = self.sel["damnificados"]
