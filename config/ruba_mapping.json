@@ -332,6 +332,8 @@
       "_nota": "Cada vehiculo agregado genera #{prefijo_id}_{indice}_{campo}; campos = sufijo del id de cada input.",
       "campos": {
         "marca": "marca",
+        "tipo": "tipo",
+        "airbag": "airbag",
         "dominio": "dominio",
         "modelo": "modelo",
         "anio": "anio",

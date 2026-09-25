@@ -39,6 +39,7 @@ from playwright.sync_api import BrowserContext, Error as PlaywrightError, Page, 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from app.core.catalogos import leer_mapping
+from app.services.ruba_payload import TIPO_VEHICULO_DEFAULT
 from app.paths import configurar_entorno_playwright, get_writable_dir, is_frozen
 from app.services.ruba_helpers import (
     SELECTORES_CLAVE,
@@ -787,11 +788,14 @@ class RubaServiceAutomation:
                     self._seleccionar(campo("marca"), otra)
                     self.advertencias.append(f"Vehículo {n}: la marca '{v.get('marca_nombre')}' no existe en RUBA; "
                                              "se cargó como 'Otra'.")
+            self._seleccionar_tipo_vehiculo(campo("tipo"), v.get("tipo"), n)
             for clave in ("dominio", "modelo", "anio"):
                 self._llenar(campo(clave), v.get(clave))
 
             asegurado = bool(v.get("asegurado"))
-            self._tildar(campo("asegurado"), asegurado)
+            self._setear_asegurado(campo("asegurado"), asegurado)
+            if campos.get("airbag") and self.page.locator(campo("airbag")).count():
+                self._elegir_si_vacio(campo("airbag"), ("no posee", "sin datos", "no"))
             if asegurado:
                 for clave in ("aseguradora", "poliza"):
                     if v.get(clave) and not self._llenar_opcional(campo(clave), v.get(clave),
@@ -801,6 +805,81 @@ class RubaServiceAutomation:
             liberados = liberar_required_vacios(self.page, fila)
             if liberados:
                 log.info("Vehículo %s: sin dato en %s (required liberado)", n, ", ".join(liberados))
+        self._completar_selects_vehiculos()
+
+    # -- Selects de cada vehículo del Accidente (tipo / asegurado / airbag) ---------------
+
+    SEL_VEHICULOS_ACCIDENTE = "select[name*='[datosVehiculosAccidentes]'][name$='[{campo}]']"
+
+    def _seleccionar_tipo_vehiculo(self, selector: str, valor: Optional[str], n: int) -> None:
+        """select_option(value=...) con el value ya mapeado en el payload
+        (ruba_payload.tipo_vehiculo_ruba). Nunca queda en "Seleccionar"."""
+        loc = self.page.locator(selector).first
+        if not loc.count():
+            return  # formulario sin tipo: lo cubre la pasada final por name
+        valor = valor or TIPO_VEHICULO_DEFAULT
+        disponibles = [o["value"] for o in loc.evaluate(_JS_OPCIONES)]
+        if valor not in disponibles:
+            self.advertencias.append(f"Vehículo {n}: RUBA no ofrece el tipo {valor}; se cargó 'Transito > Autos'.")
+            valor = TIPO_VEHICULO_DEFAULT if TIPO_VEHICULO_DEFAULT in disponibles else next(
+                (v for v in disponibles if v), "")
+        if valor:
+            loc.select_option(value=valor)
+
+    def _setear_asegurado(self, selector: str, asegurado: bool) -> None:
+        """"Asegurado" puede ser checkbox o <select> (Si / No / Sin datos)."""
+        loc = self.page.locator(selector).first
+        if not loc.count():
+            return
+        if loc.evaluate("(e) => e.tagName") == "SELECT":
+            preferidos = ("si",) if asegurado else ("no", "sin datos")
+            self._elegir_opcion(selector, preferidos)
+        else:
+            self._tildar(selector, asegurado)
+
+    def _elegir_opcion(self, selector: str, preferidos: tuple, solo_si_vacio: bool = False) -> Optional[str]:
+        """Elige en un <select> la primera opción cuyo texto coincide con
+        `preferidos` (sin acentos ni mayúsculas); si ninguna coincide, la
+        primera opción NO vacía. Devuelve el value elegido (None si no tocó)."""
+        loc = self.page.locator(selector).first
+        if solo_si_vacio and (loc.input_value() or "").strip():
+            return None
+        opciones = [o for o in loc.evaluate(_JS_OPCIONES) if (o["value"] or "").strip()]
+        if not opciones:
+            return None
+        textos = {o["value"]: _normalizar(o["text"]) for o in opciones}
+        for preferido in preferidos:
+            objetivo = _normalizar(preferido)
+            elegida = next((v for v, t in textos.items() if t == objetivo), None) or next(
+                (v for v, t in textos.items() if t.startswith(objetivo)), None)
+            if elegida:
+                break
+        else:
+            elegida = opciones[0]["value"]
+        loc.select_option(value=elegida)
+        return elegida
+
+    def _elegir_si_vacio(self, selector: str, preferidos: tuple) -> Optional[str]:
+        return self._elegir_opcion(selector, preferidos, solo_si_vacio=True)
+
+    def _completar_selects_vehiculos(self) -> None:
+        """Red de seguridad sobre TODAS las filas (select_loc.nth(i)): ningún
+        tipo / asegurado / airbag de un vehículo del Accidente se envía vacío."""
+        por_defecto = (("tipo", None), ("asegurado", ("no", "sin datos")), ("airbag", ("no posee", "sin datos", "no")))
+        for campo, preferidos in por_defecto:
+            selects = self.page.locator(self.SEL_VEHICULOS_ACCIDENTE.format(campo=campo))
+            for i in range(selects.count()):
+                select = selects.nth(i)
+                if (select.input_value() or "").strip():
+                    continue
+                nombre = select.get_attribute("name") or f"{campo} #{i + 1}"
+                if campo == "tipo":
+                    select.select_option(value=TIPO_VEHICULO_DEFAULT)
+                    elegido = TIPO_VEHICULO_DEFAULT
+                else:
+                    selector = f"select[name='{nombre}']"
+                    elegido = self._elegir_opcion(selector, preferidos)
+                log.info("Vehículo del accidente: %s vacío -> %s", nombre, elegido)
 
     def _cargar_damnificados(self) -> None:
         sel = self.sel["damnificados"]

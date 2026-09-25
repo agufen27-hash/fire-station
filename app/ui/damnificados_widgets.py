@@ -364,8 +364,13 @@ class GrillaBomberosDamnificados(QWidget):
 # d) Vehículos involucrados (solo Accidentes)
 # ---------------------------------------------------------------------------
 
-(COL_V_MARCA, COL_V_DOMINIO, COL_V_MODELO, COL_V_ANIO, COL_V_ASEGURADO,
- COL_V_ASEGURADORA, COL_V_POLIZA, COL_V_QUITAR) = range(8)
+(COL_V_MARCA, COL_V_TIPO, COL_V_DOMINIO, COL_V_MODELO, COL_V_ANIO, COL_V_ASEGURADO,
+ COL_V_ASEGURADORA, COL_V_POLIZA, COL_V_QUITAR) = range(9)
+
+# Tipos que ofrece RUBA ("Transito > ..."); ruba_payload.tipo_vehiculo_ruba los
+# traduce al value del <option>. El primero es el valor por defecto.
+TIPOS_VEHICULO = ["Auto", "Camioneta / Pick-up", "Camión", "Moto", "Bicicleta", "Colectivo / Ómnibus",
+                  "Micro", "Cuatriciclo", "Otro"]
 
 
 def marcas_vehiculo(mapping: Dict[str, Any]) -> Dict[str, str]:
@@ -381,9 +386,10 @@ class GrillaVehiculosAccidente(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
         self.tabla = _tabla(
-            self, ["Marca", "Dominio", "Modelo", "Año", "Asegurado", "Aseguradora", "Póliza", ""],
+            self, ["Marca", "Tipo", "Dominio", "Modelo", "Año", "Asegurado", "Aseguradora", "Póliza", ""],
             estirar=(COL_V_MODELO, COL_V_ASEGURADORA, COL_V_POLIZA),
-            anchos={COL_V_MARCA: 160, COL_V_DOMINIO: 110, COL_V_ANIO: 70, COL_V_ASEGURADO: 90, COL_V_QUITAR: 44},
+            anchos={COL_V_MARCA: 160, COL_V_TIPO: 150, COL_V_DOMINIO: 110, COL_V_ANIO: 70,
+                    COL_V_ASEGURADO: 90, COL_V_QUITAR: 44},
         )
         layout.addWidget(self.tabla)
         self.boton_agregar = QPushButton("+ Agregar vehículo", self)
@@ -400,6 +406,10 @@ class GrillaVehiculosAccidente(QWidget):
         for nombre, id_ruba in self._marcas.items():
             marca.addItem(nombre, id_ruba)
         self.tabla.setCellWidget(fila, COL_V_MARCA, marca)
+        tipo = QComboBox(self.tabla)
+        tipo.addItems(TIPOS_VEHICULO)
+        tipo.setToolTip("Tipo de vehículo para RUBA (Transito > ...)")
+        self.tabla.setCellWidget(fila, COL_V_TIPO, tipo)
         for col, placeholder, largo in (
             (COL_V_DOMINIO, "AB123CD", 10), (COL_V_MODELO, "Ej: Cronos 1.3", 60), (COL_V_ANIO, "2019", 4),
             (COL_V_ASEGURADORA, "Compañía", 80), (COL_V_POLIZA, "N° de póliza", 40),
@@ -437,6 +447,8 @@ class GrillaVehiculosAccidente(QWidget):
     def cargar_fila(self, fila: int, vehiculo: Dict[str, Any]) -> None:
         marca = self.tabla.cellWidget(fila, COL_V_MARCA)
         marca.setCurrentIndex(max(marca.findText(vehiculo.get("marca") or ""), 0))
+        tipo = self.tabla.cellWidget(fila, COL_V_TIPO)
+        tipo.setCurrentIndex(max(tipo.findText(vehiculo.get("tipo") or ""), 0))  # partes viejos: Auto
         for col, clave in ((COL_V_DOMINIO, "dominio"), (COL_V_MODELO, "modelo"), (COL_V_ANIO, "anio"),
                            (COL_V_ASEGURADORA, "aseguradora"), (COL_V_POLIZA, "poliza")):
             self.tabla.cellWidget(fila, col).setText(str(vehiculo.get(clave) or ""))
@@ -452,6 +464,7 @@ class GrillaVehiculosAccidente(QWidget):
             asegurado = self.tabla.cellWidget(f, COL_V_ASEGURADO).isChecked()
             resultado.append({
                 "marca": marca.currentText() if marca.currentData() is not None else None,
+                "tipo": self.tabla.cellWidget(f, COL_V_TIPO).currentText(),
                 "dominio": (texto(COL_V_DOMINIO) or "").replace(" ", "").upper() or None,
                 "modelo": texto(COL_V_MODELO),
                 "anio": texto(COL_V_ANIO),

@@ -47,6 +47,7 @@ Encargado; como Apresto (tarea '2') todo el personal en base.
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import date, time
 from typing import Any, Dict, List, Optional
@@ -225,6 +226,44 @@ def _persona(p: Optional[PersonaRuba]) -> Optional[Dict[str, Any]]:
 # Construcción
 # ---------------------------------------------------------------------------
 
+# Select "tipo" de cada vehículo del Accidente en RUBA
+# (bomberos_estructurabundle_incidenteAccidenteType_datosVehiculosAccidentes_N_tipo,
+# HTML real del 25/09/2026). value -> texto del <option>.
+TIPOS_VEHICULO_RUBA: Dict[str, str] = {
+    "14": "Transito > Autos", "15": "Transito > Camionetas", "16": "Transito > Camiones",
+    "12": "Transito > Motos", "11": "Transito > Bicicletas", "17": "Transito > Colectivos",
+    "18": "Transito > Micros", "13": "Transito > Cuatriciclos", "20": "Transito > Otros",
+}
+# Nunca se manda la opción vacía "": sin tipo (o sin coincidencia) va como Autos.
+TIPO_VEHICULO_DEFAULT = "14"
+# Orden importa: "camioneta" antes que "camion", "autobus" antes que "auto".
+_REGLAS_TIPO_VEHICULO = (
+    (("camioneta", "pick-up", "pickup", "pick up", "utilitario"), "15"),
+    (("camion",), "16"),
+    (("colectivo", "omnibus", "autobus"), "17"),
+    (("micro",), "18"),
+    (("cuatriciclo",), "13"),
+    (("moto",), "12"),                  # moto, motocicleta, ciclomotor
+    (("bici",), "11"),                  # bici, bicicleta
+    (("auto", "automovil"), "14"),
+    (("otro",), "20"),                  # "Otro" elegido a propósito en el formulario
+)
+
+
+def tipo_vehiculo_ruba(texto: Any) -> str:
+    """Tipo de vehículo del parte local ("Moto", "camión", "Pick-up"...) ->
+    value del <option> de RUBA. Acepta también el value ya resuelto ("15").
+    Vacío o sin coincidencia -> "14" (Transito > Autos)."""
+    crudo = str(texto or "").strip()
+    if crudo in TIPOS_VEHICULO_RUBA:
+        return crudo
+    normalizado = "".join(c for c in unicodedata.normalize("NFKD", crudo.lower()) if not unicodedata.combining(c))
+    for claves, valor in _REGLAS_TIPO_VEHICULO:
+        if any(clave in normalizado for clave in claves):
+            return valor
+    return TIPO_VEHICULO_DEFAULT
+
+
 def _vehiculos_accidente(datos_especificos: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Vehículos damnificados de un Accidente (guardados en datos_especificos
     con la marca por nombre) con la marca ya traducida al ID de RUBA."""
@@ -235,6 +274,8 @@ def _vehiculos_accidente(datos_especificos: Optional[Dict[str, Any]]) -> List[Di
         {
             "marca": marcas.get(v.get("marca") or "", marcas.get("Otra")) if v.get("marca") else None,
             "marca_nombre": v.get("marca"),
+            "tipo": tipo_vehiculo_ruba(v.get("tipo")),
+            "tipo_nombre": v.get("tipo"),
             "dominio": v.get("dominio"),
             "modelo": v.get("modelo"),
             "anio": v.get("anio"),
