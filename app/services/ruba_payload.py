@@ -226,6 +226,33 @@ def _persona(p: Optional[PersonaRuba]) -> Optional[Dict[str, Any]]:
 # Construcción
 # ---------------------------------------------------------------------------
 
+# Select "genero" de cada fila de Heridos en RUBA (Heridos_N_genero, HTML real
+# del 25/09/2026): 1 Masculino, 2 Femenino, 3 Se desconoce. Nunca se manda "".
+GENEROS_RUBA: Dict[str, str] = {"1": "Masculino", "2": "Femenino", "3": "Se desconoce"}
+GENERO_DEFAULT = "3"
+_PALABRAS_MASCULINO = {"M", "MASCULINO", "MASC", "VARON", "HOMBRE"}
+_PALABRAS_FEMENINO = {"F", "FEMENINO", "FEM", "MUJER"}
+
+
+def genero_ruba(valor: Any) -> str:
+    """Género del parte local -> value del <option> de RUBA.
+
+    Se compara por PALABRAS completas (sin acentos), no por "contiene": con
+    "contiene M", "FEMENINO" sería masculino. Acepta el código ya resuelto
+    ("1"/"2"/"3", lo que guarda el combo del formulario). Vacío, "Se
+    desconoce", "Sin datos" o cualquier otra cosa -> "3" (Se desconoce)."""
+    crudo = str(valor or "").strip()
+    if crudo in GENEROS_RUBA:
+        return crudo
+    normalizado = "".join(c for c in unicodedata.normalize("NFKD", crudo.upper()) if not unicodedata.combining(c))
+    palabras = set(re.findall(r"[A-Z]+", normalizado))
+    if palabras & _PALABRAS_FEMENINO:
+        return "2"
+    if palabras & _PALABRAS_MASCULINO:
+        return "1"
+    return GENERO_DEFAULT
+
+
 # Select "tipo" de cada vehículo del Accidente en RUBA
 # (bomberos_estructurabundle_incidenteAccidenteType_datosVehiculosAccidentes_N_tipo,
 # HTML real del 25/09/2026). value -> texto del <option>.
@@ -310,7 +337,8 @@ def construir_payload(d: DatosServicio) -> Dict[str, Any]:
 
     def damnificados_de(condicion: str) -> List[Dict[str, Optional[str]]]:
         return [
-            {"nombre": x.get("nombre"), "apellido": x.get("apellido"), "dni": x.get("dni"), "genero": x.get("genero")}
+            {"nombre": x.get("nombre"), "apellido": x.get("apellido"), "dni": x.get("dni"),
+             "genero": genero_ruba(x.get("genero"))}
             for x in d.damnificados if x.get("condicion") == condicion
         ]
 

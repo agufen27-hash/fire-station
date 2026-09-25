@@ -275,6 +275,8 @@ class Incidente(Base):
     # Cuándo quedó cargado en RUBA (estado_ruba = SINCRONIZADO). Desde ese
     # momento el parte está cerrado: no se edita ni se elimina localmente.
     ruba_sincronizado_en: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # "📍 Marcar en Mapa": PNG del área centrada en el punto (data/mapas/parte_<N>_<AÑO>.png).
+    ruta_imagen_mapa: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
     creado_en: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, nullable=False)
     actualizado_en: Mapped[datetime] = mapped_column(

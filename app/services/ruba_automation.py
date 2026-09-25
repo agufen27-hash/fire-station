@@ -39,7 +39,7 @@ from playwright.sync_api import BrowserContext, Error as PlaywrightError, Page, 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from app.core.catalogos import leer_mapping
-from app.services.ruba_payload import TIPO_VEHICULO_DEFAULT
+from app.services.ruba_payload import GENERO_DEFAULT, TIPO_VEHICULO_DEFAULT, genero_ruba
 from app.paths import configurar_entorno_playwright, get_writable_dir, is_frozen
 from app.services.ruba_helpers import (
     SELECTORES_CLAVE,
@@ -920,13 +920,49 @@ class RubaServiceAutomation:
                 fila = {k: v.format(i=base + i) for k, v in sel["fila_herido"].items()}
                 for clave in ("nombre", "apellido", "dni"):
                     self._llenar(fila[clave], herido.get(clave))
-                if herido.get("genero"):
-                    self._seleccionar(fila["genero"], herido["genero"])
+                self._seleccionar_genero(fila["genero"], herido.get("genero"), i + 1)
+            self._completar_generos_vacios()
         if any(f.get("nombre") or f.get("apellido") for f in self.payload["damnificados"]["fallecidos"]):
             self.advertencias.append("Hay fallecidos individualizados pero el mapping no tiene selectores para ellos.")
         self._guardar_y_continuar(sel["btn_guardar_continuar"], destinos=(self.sel["participacion"]["url_patron"],))
         if not heridos:
             raise _PasoOmitido("Sin civiles heridos: se continuó sin cargar filas.")
+
+    # `:not([name*='__name__'])`: nunca el prototype oculto de Symfony.
+    SEL_GENEROS_HERIDOS = "select[name^='Heridos_'][name*='[genero]']:not([name*='__name__'])"
+
+    def _seleccionar_genero(self, selector: str, genero: Optional[str], n: int) -> None:
+        """Género de la fila de un herido: select_option(value) con el código
+        mapeado (1 / 2 / 3), timeout corto, nunca la opción vacía."""
+        loc = self.page.locator(f"{selector}:not([name*='__name__'])").first
+        if not loc.count() or not loc.is_visible():
+            self.advertencias.append(f"Herido {n}: RUBA no mostró el campo género; se completa al final si aparece.")
+            return
+        valor = genero_ruba(genero)
+        disponibles = [o["value"] for o in loc.evaluate(_JS_OPCIONES)]
+        if valor not in disponibles:
+            respaldo = GENERO_DEFAULT if GENERO_DEFAULT in disponibles else next((v for v in disponibles if v), None)
+            if respaldo is None:
+                self.advertencias.append(f"Herido {n}: el combo de género de RUBA no tiene opciones.")
+                return
+            self.advertencias.append(f"Herido {n}: RUBA no ofrece el género {valor}; se cargó {respaldo}.")
+            valor = respaldo
+        loc.select_option(value=valor, timeout=TIMEOUT_FILA_MS)
+
+    def _completar_generos_vacios(self) -> None:
+        """Red de seguridad: RUBA arma tantas filas como "Civiles heridos" diga
+        el contador, aunque el parte individualice menos. Todo género VISIBLE
+        que quedó en "Seleccionar" pasa a "Se desconoce" (es obligatorio)."""
+        for select in self.page.locator(self.SEL_GENEROS_HERIDOS).all():
+            try:
+                if not select.is_visible() or (select.input_value(timeout=TIMEOUT_FILA_MS) or "").strip():
+                    continue
+                disponibles = [o["value"] for o in select.evaluate(_JS_OPCIONES)]
+                if GENERO_DEFAULT in disponibles:
+                    select.select_option(value=GENERO_DEFAULT, timeout=TIMEOUT_FILA_MS)
+                    log.info("Heridos: %s vacío -> %s (Se desconoce)", select.get_attribute("name"), GENERO_DEFAULT)
+            except PlaywrightError as e:
+                log.info("Heridos: no se pudo completar un género vacío (%s)", e)
 
     def _cargar_participacion(self) -> None:
         datos = self.payload["participacion"]

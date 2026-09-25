@@ -105,6 +105,7 @@ from app.ui.participacion_widgets import HorarioServicio, SelectorBombero
 from app.ui.bomberos_view import importar_bomberos_desde_excel, recargar_padron
 from app.ui.personnel_window import LegajoPrivadoWidget
 from app.ui import theme
+from app.ui.map_dialog import DialogoMarcarMapa, parsear_par
 from app.ui.ruba_progreso_dialog import DialogoLoteRuba
 from app.ui.servicio_en_curso import TarjetaServicioEnCurso, resumen_de
 from app.ui.siniestro_widgets import FORM_ACCIDENTE, PanelDatosEspecificos
@@ -801,7 +802,19 @@ class MainWindow(QMainWindow):
         self.entry_referencia = QLineEdit(marco)
         self.entry_referencia.setPlaceholderText("Ej: -33.6315, -64.0212 · campo de Pérez, 2 km al norte de la ruta")
         self.entry_referencia.setMaxLength(200)
-        grid_ubicacion.addWidget(self.entry_referencia, 3, 0, 1, 3)
+        grid_ubicacion.addWidget(self.entry_referencia, 3, 0, 1, 2)
+        self.boton_marcar_mapa = QPushButton("📍 Marcar en Mapa", marco)
+        self.boton_marcar_mapa.setObjectName("botonAhora")
+        self.boton_marcar_mapa.setToolTip(
+            "Abre el mapa para fijar el punto (clic o coordenadas) y guarda la imagen para el parte")
+        self.boton_marcar_mapa.clicked.connect(self._abrir_marcar_en_mapa)
+        grid_ubicacion.addWidget(self.boton_marcar_mapa, 3, 2)
+        self.label_imagen_mapa = QLabel("", marco)
+        self.label_imagen_mapa.setProperty("muted", True)
+        self.label_imagen_mapa.setOpenExternalLinks(True)
+        self.label_imagen_mapa.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        self.label_imagen_mapa.setVisible(False)
+        grid_ubicacion.addWidget(self.label_imagen_mapa, 4, 0, 1, 3)
         layout.addLayout(grid_ubicacion)
 
         # El visor geográfico va AL FINAL de la sección: así no corta el
@@ -827,6 +840,52 @@ class MainWindow(QMainWindow):
         coordenadas = f"{lat:.5f}, {lng:.5f}"
         resto = self._PATRON_COORDS_INICIALES.sub("", self.entry_referencia.text().strip(), count=1)
         self.entry_referencia.setText(f"{coordenadas} · {resto}" if resto else coordenadas)
+        self._actualizar_label_imagen_mapa()
+
+    # -- "📍 Marcar en Mapa" ------------------------------------------------------------------
+
+    def _abrir_marcar_en_mapa(self) -> None:
+        """Abre el selector centrado en el punto ya cargado (mapa del formulario
+        o coordenadas escritas en "Referencia"); si no hay, en Adelia María."""
+        datos = self.mapa.obtener_datos()
+        lat, lon = datos["latitud"], datos["longitud"]
+        if lat is None or lon is None:
+            escrito = self._PATRON_COORDS_INICIALES.match(self.entry_referencia.text() or "")
+            par = parsear_par(escrito.group(0).rstrip(" ·,;-")) if escrito else None
+            if par is not None:
+                lat, lon = par
+        dialogo = DialogoMarcarMapa(
+            self.label_numero_parte.text(), lat, lon, datos["superficie_ha"], datos["geometria_geojson"],
+            fuente_direccion=lambda: (self.entry_calle.text(), self.entry_localidad.text()), parent=self,
+        )
+        if dialogo.exec() != QDialog.DialogCode.Accepted or dialogo.resultado is None:
+            return
+        r = dialogo.resultado
+        mapa = r["mapa"]
+        # El mapa del formulario toma el punto (y el polígono si se dibujó en el visor).
+        self.mapa.cargar_incidente(self.label_numero_parte.text(), r["latitud"], r["longitud"],
+                                   mapa["superficie_ha"], mapa["geometria_geojson"])
+        self._ruta_imagen_mapa = r["ruta_imagen"]
+        self._coords_imagen_mapa = (r["latitud"], r["longitud"])
+        self._on_coordenadas_mapa(r["latitud"], r["longitud"])  # "Coordenadas / Referencia" + etiqueta
+        theme.set_tono(self.statusBar(), "ok")
+        self.statusBar().showMessage(f"Imagen del mapa guardada: {r['ruta_imagen']}", 10000)
+
+    def _actualizar_label_imagen_mapa(self) -> None:
+        ruta = getattr(self, "_ruta_imagen_mapa", None)
+        if not ruta:
+            self.label_imagen_mapa.setVisible(False)
+            return
+        uri = Path(ruta).resolve().as_uri()
+        texto = f"🗺 Imagen del mapa: <a href='{uri}'>{Path(ruta).name}</a>"
+        punto = self.mapa.obtener_datos()
+        coords = getattr(self, "_coords_imagen_mapa", None)
+        if coords and (punto["latitud"], punto["longitud"]) != coords:
+            texto += " &nbsp;⚠ el punto cambió: volvé a \"📍 Marcar en Mapa\" para actualizar la imagen"
+        elif not Path(ruta).is_file():
+            texto += " &nbsp;⚠ el archivo ya no existe"
+        self.label_imagen_mapa.setText(texto)
+        self.label_imagen_mapa.setVisible(True)
 
     # -- 2. Datos específicos del siniestro (según Tipo/Subtipo) ------------------
 
@@ -1165,6 +1224,7 @@ class MainWindow(QMainWindow):
                 resena_operativa=self.texto_resena.toPlainText().strip() or None,
                 datos_especificos_json=json.dumps(datos_especificos, ensure_ascii=False) if datos_especificos else None,
                 **self.mapa.obtener_datos(),
+                ruta_imagen_mapa=getattr(self, "_ruta_imagen_mapa", None),
             )
             incidente = session.get(Incidente, self._incidente_en_edicion) if self._incidente_en_edicion else None
             if self._incidente_en_edicion is not None and incidente is None:
@@ -1604,6 +1664,7 @@ class MainWindow(QMainWindow):
                 "apresto": [b.personal.id_ruba for b in inc.personal_base if b.funcion == FuncionBase.APRESTO.value],
             },
             "mapa": (inc.latitud, inc.longitud, inc.superficie_ha, inc.geometria_geojson),
+            "ruta_imagen_mapa": inc.ruta_imagen_mapa,
             "datos_especificos": inc.datos_especificos,
             "seguro": (inc.seguro_compania, inc.seguro_poliza), "resena": inc.resena_operativa,
             "horario": HorarioServicio(inc.fecha_salida, inc.hora_salida, inc.fecha_llegada, inc.hora_regreso),
@@ -1675,6 +1736,9 @@ class MainWindow(QMainWindow):
         self.entry_referencia.setText(d["referencia_ubicacion"] or "")
         (self.radio_rural if d["zona"] == "Rural" else self.radio_urbana).setChecked(True)
         self.mapa.cargar_incidente(d["numero_parte"], *d["mapa"])
+        self._ruta_imagen_mapa = d.get("ruta_imagen_mapa")
+        self._coords_imagen_mapa = (d["mapa"][0], d["mapa"][1]) if self._ruta_imagen_mapa else None
+        self._actualizar_label_imagen_mapa()
 
         self.panel_damnificados.cargar(d["civiles"], d["bienes"], d["bomberos_damnificados"],
                                        (d["datos_especificos"] or {}).get("vehiculos"))
@@ -1774,6 +1838,9 @@ class MainWindow(QMainWindow):
         self.texto_resena.clear()
 
         self.mapa.limpiar()
+        self._ruta_imagen_mapa = None
+        self._coords_imagen_mapa = None
+        self._actualizar_label_imagen_mapa()
         for campo in (self.combo_tipo, self.combo_categoria, self.entry_calle):
             theme.marcar_invalido(campo, False)
         self._actualizar_chips()

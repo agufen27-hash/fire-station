@@ -311,6 +311,7 @@ def _sembrar_personal(session: Session) -> None:
 # el caso acá.
 COLUMNAS_NUEVAS_INCIDENTES = {
     "ruba_sincronizado_en": "DATETIME",  # carga en lote a RUBA desde el Historial
+    "ruta_imagen_mapa": "VARCHAR(255)",   # imagen de "📍 Marcar en Mapa"
     "latitud": "REAL",
     "longitud": "REAL",
     "superficie_ha": "REAL",

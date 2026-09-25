@@ -102,6 +102,9 @@ def _construir_html(incidente: Incidente) -> str:
     superficie = f"{incidente.superficie_ha:.2f} ha" if incidente.superficie_ha else None
     partes.append(_fila_tabla("Superficie afectada", superficie))
     partes.append("</table>")
+    if incidente.ruta_imagen_mapa and Path(incidente.ruta_imagen_mapa).is_file():
+        uri_mapa = Path(incidente.ruta_imagen_mapa).resolve().as_uri()
+        partes.append(f"<p style='margin-top:8px;'><img src='{uri_mapa}' width='600'></p>")
     if incidente.geometria_geojson:
         partes.append(
             "<p style='color:#64748b; font-size:11px;'>Se registró un polígono del área afectada -- "

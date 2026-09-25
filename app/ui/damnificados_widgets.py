@@ -154,6 +154,8 @@ class GrillaCiviles(QWidget):
     def __init__(self, mapping: Dict[str, Any], parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._opciones_genero = opciones_genero(mapping)
+        self._genero_default = str((mapping.get("selectores", {}).get("damnificados", {})
+                                    .get("genero_default")) or "") or None
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
@@ -191,7 +193,7 @@ class GrillaCiviles(QWidget):
             campo.setPlaceholderText(placeholder)
             self.tabla.setCellWidget(fila, col, campo)
         genero = QComboBox(self.tabla)
-        _poblar_combo(genero, self._opciones_genero, "damnificados.genero_opciones")
+        _poblar_combo(genero, self._opciones_genero, "damnificados.genero_opciones", self._genero_default)
         self.tabla.setCellWidget(fila, COL_C_GENERO, genero)
         lesion = QComboBox(self.tabla)
         lesion.addItems(list(LESIONES))

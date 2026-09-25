@@ -34,6 +34,7 @@ from PySide6.QtGui import (
     QBrush,
     QColor,
     QFont,
+    QImage,
     QImageReader,
     QPainter,
     QPainterPath,
@@ -956,6 +957,103 @@ class MapWidget(QWidget):
         `MainWindow._limpiar_formulario()`)."""
         self.cargar_incidente("", None, None, None, None)
 
+    # -- API del selector de punto (app/ui/map_dialog.py) ------------------------------
+
+    def punto(self) -> Optional[Tuple[float, float]]:
+        """(lat, lon) del Lugar del Siniestro, o None si no está marcado."""
+        if self._latitud is None or self._longitud is None:
+            return None
+        return self._latitud, self._longitud
+
+    def fijar_punto(self, lat: float, lon: float, emitir: bool = True) -> None:
+        """Coloca la chincheta en coordenadas escritas a mano y centra la
+        vista ahí. `emitir`: avisar como si el operador hubiera hecho clic."""
+        self._latitud, self._longitud = lat, lon
+        self._redibujar_siniestro()
+        self.centrar_en(lat, lon)
+        if emitir:
+            self.coordenadas_cambiadas.emit(lat, lon)
+
+    def centrar_en(self, lat: float, lon: float) -> None:
+        self.vista.centerOn(self._punto_escena(lat, lon))
+
+    def encuadrar(self, lat: float, lon: float, ancho_km: float = 3.0) -> None:
+        """Zoom de barrio (~`ancho_km` de ancho en pantalla) centrado en el
+        punto: la vista inicial del selector y la escala de la captura. Con
+        la imagen entera en pantalla no se podría ni centrar ni leer el lugar."""
+        grados_lon = ancho_km / (111.32 * max(math.cos(math.radians(lat)), 0.01))
+        x0, _ = self.coords_to_pixel(lat, lon - grados_lon / 2)
+        x1, _ = self.coords_to_pixel(lat, lon + grados_lon / 2)
+        ancho_px = abs(x1 - x0)
+        if ancho_px > 0:
+            escala = self.vista.viewport().width() / ancho_px
+            escala = min(max(escala, self.vista._escala_ajuste() * 0.5), ZOOM_MAXIMO)
+            self.vista.resetTransform()
+            self.vista.scale(escala, escala)
+        self.centrar_en(lat, lon)
+
+    def dentro_del_mapa(self, lat: float, lon: float) -> bool:
+        """True si el punto cae dentro de la imagen calibrada."""
+        return self.georreferencia.contiene(lat, lon)
+
+    def exportar_imagen(self, ruta: Path, ancho: int = 1600, alto: int = 1000, leyenda: str = "") -> Path:
+        """PNG/JPG del área del mapa CENTRADA en la chincheta, con la misma
+        escala que tiene la vista en pantalla (lo que el operador está viendo)
+        y una franja inferior con la leyenda y las coordenadas.
+
+        Se dibuja la ESCENA (no una captura de la ventana): no salen el
+        cursor, los carteles flotantes ni las barras, y la chincheta y el
+        cuartel mantienen su tamaño (ignoran el zoom)."""
+        if self._item_siniestro is None:
+            raise ValueError("No hay un punto marcado en el mapa.")
+        centro = self._item_siniestro.pos()
+        visible = self.vista.mapToScene(self.vista.viewport().rect()).boundingRect()
+        # Mismo zoom que en pantalla, recortado a la proporción de la imagen de salida.
+        alto_fuente = max(visible.height(), 1.0)
+        ancho_fuente = alto_fuente * ancho / alto
+        if ancho_fuente < visible.width():
+            ancho_fuente = visible.width()
+            alto_fuente = ancho_fuente * alto / ancho
+        fuente = QRectF(centro.x() - ancho_fuente / 2, centro.y() - alto_fuente / 2, ancho_fuente, alto_fuente)
+
+        banda = 56
+        imagen = QImage(ancho, alto + banda, QImage.Format.Format_ARGB32)
+        imagen.fill(QColor("#e5e9f0"))
+        pintor = QPainter(imagen)
+        try:
+            pintor.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform
+                                  | QPainter.RenderHint.TextAntialiasing)
+            self.escena.render(pintor, QRectF(0, 0, ancho, alto), fuente, Qt.AspectRatioMode.IgnoreAspectRatio)
+            # Retícula fina sobre el punto: se ubica aunque la chincheta tape el lugar.
+            pintor.setPen(QPen(QColor(255, 255, 255, 200), 3))
+            for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                pintor.drawLine(QPointF(ancho / 2 + dx * 14, alto / 2 + dy * 14),
+                                QPointF(ancho / 2 + dx * 40, alto / 2 + dy * 40))
+            pintor.setPen(QPen(COLOR_SINIESTRO, 1.5))
+            for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                pintor.drawLine(QPointF(ancho / 2 + dx * 14, alto / 2 + dy * 14),
+                                QPointF(ancho / 2 + dx * 40, alto / 2 + dy * 40))
+            # Franja con leyenda y coordenadas.
+            pintor.fillRect(QRectF(0, alto, ancho, banda), QColor("#1f2937"))
+            pintor.setPen(QColor("#ffffff"))
+            fuente_texto = QFont("Segoe UI")
+            fuente_texto.setPixelSize(22)
+            pintor.setFont(fuente_texto)
+            lat, lon = self._latitud, self._longitud
+            texto = f"📍 {lat:.6f}, {lon:.6f}   ({formatear_dms(lat, lon)})"
+            if leyenda:
+                texto = f"{leyenda}   ·   {texto}"
+            pintor.drawText(QRectF(18, alto, ancho - 36, banda),
+                            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, texto)
+        finally:
+            pintor.end()
+
+        ruta = Path(ruta)
+        ruta.parent.mkdir(parents=True, exist_ok=True)
+        if not imagen.save(str(ruta)):
+            raise OSError(f"No se pudo guardar la imagen del mapa en {ruta}")
+        return ruta
+
     def obtener_datos(self) -> dict:
         """Lo que hay que persistir en `incidentes` al guardar."""
         return {
@@ -969,6 +1067,20 @@ class MapWidget(QWidget):
 # ---------------------------------------------------------------------------
 # Geometría
 # ---------------------------------------------------------------------------
+
+def formatear_dms(lat: float, lon: float) -> str:
+    """-33.6315, -64.0152 -> 33°37'53.4"S 64°00'54.7"W (como lo lee un GPS)."""
+    def parte(valor: float, positivo: str, negativo: str) -> str:
+        absoluto = abs(valor)
+        grados = int(absoluto)
+        minutos_float = (absoluto - grados) * 60
+        minutos = int(minutos_float)
+        segundos = (minutos_float - minutos) * 60
+        if round(segundos, 1) >= 60:
+            segundos, minutos = 0.0, minutos + 1
+        return f"{grados}°{minutos:02d}'{segundos:04.1f}\"{positivo if valor >= 0 else negativo}"
+    return f"{parte(lat, 'N', 'S')} {parte(lon, 'E', 'W')}"
+
 
 def _anillo_de_geojson(geojson_texto: str) -> List[Tuple[float, float]]:
     """Anillo exterior (lon, lat) del primer polígono de un GeoJSON

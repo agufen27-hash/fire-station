@@ -274,6 +274,8 @@
         "dni": "#Heridos_{i}_dni",
         "genero": "#Heridos_{i}_genero"
       },
+      "genero_opciones": {"masculino": "1", "femenino": "2", "se_desconoce": "3"},
+      "genero_default": "3",
       "btn_guardar_continuar": "button[name='save_&_continue']"
     },
     "participacion": {
