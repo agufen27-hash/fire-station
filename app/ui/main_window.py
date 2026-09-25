@@ -54,6 +54,7 @@ from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 
 from app.core.catalogos import obtener_catalogos_ruba, obtener_padron
+from app import __version__
 from app.paths import ICONO_APP, LOGO_INSTITUCIONAL, ruta_recurso_existente
 from app.db import DATA_DIR, get_session, siguiente_numero_parte
 from app.models import (
@@ -95,7 +96,7 @@ from app.services.ruba_payload import (
 )
 from app.services.ruba_helpers import cargar_credenciales
 from app.services.ruba_service import RubaSyncWorker, lanzar_sincronizacion
-from app.ui.history_window import HistoryWindow
+from app.ui.history_window import MOTIVO_PARTE_CERRADO, HistoryWindow
 from app.services import cartografia
 from app.ui.widgets.map_widget import MapWidget, OperationsMapWindow
 from app.ui.damnificados_widgets import PanelDamnificados
@@ -156,12 +157,15 @@ TOOLTIP_GUARDAR_RUBA = "Guarda en la base local, abre las planillas PCS/PCD2 y s
 
 
 class MainWindow(QMainWindow):
+    # Lo asigna run.py (app/ui/actualizaciones.py); None en tests.
+    controlador_actualizaciones = None
+
     def __init__(self) -> None:
         super().__init__()
         icono = ruta_recurso_existente(ICONO_APP)
         if icono is not None:
             self.setWindowIcon(QIcon(str(icono)))
-        self.setWindowTitle('Fire Station — Bomberos Voluntarios "Osvaldo R. Rossi" (C 59 / R 3)')
+        self.setWindowTitle(f'Fire Station {__version__} — Bomberos Voluntarios "Osvaldo R. Rossi" (C 59 / R 3)')
         self.resize(ANCHO_VENTANA, ALTO_VENTANA)
         self.setMinimumSize(1000, 640)
 
@@ -1402,6 +1406,13 @@ class MainWindow(QMainWindow):
             f"Servicio N° {numero_parte} guardado EN CURSO. Retomalo desde Inicio para registrar el regreso.", 10000
         )
 
+    def closeEvent(self, event) -> None:  # noqa: N802 - override de Qt
+        """Si hay una actualización descargada y verificada, se instala al
+        cerrar (el instalador espera a que este proceso termine)."""
+        if self.controlador_actualizaciones is not None:
+            self.controlador_actualizaciones.al_cerrar()
+        super().closeEvent(event)
+
     # -- Editar / eliminar desde el Historial ----------------------------------
 
     def _incidente_en_sincronizacion(self, incidente_id: int) -> bool:
@@ -1455,15 +1466,8 @@ class MainWindow(QMainWindow):
             self.continuar_servicio_en_curso(incidente_id)
             return
         if sincronizado:
-            respuesta = QMessageBox.question(
-                self, "Servicio ya cargado en RUBA",
-                f"El Parte N° {numero_parte} ya está sincronizado con RUBA. Los cambios que hagas se guardan "
-                "solo en Fire Station (planillas e historial): en RUBA hay que corregirlos a mano.\n\n"
-                "¿Abrirlo para editar igual?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No,
-            )
-            if respuesta != QMessageBox.StandardButton.Yes:
-                return
+            QMessageBox.information(self, f"Parte N° {numero_parte} cerrado", MOTIVO_PARTE_CERRADO)
+            return
         if not self._confirmar_descartar_formulario(incidente_id):
             return
         self._limpiar_formulario()
@@ -2039,7 +2043,18 @@ class MainWindow(QMainWindow):
         campo.setPlaceholderText("Obligatorio: Id de RUBA (sin él no se sincroniza)")
         return campo
 
-    def _dialogo_bombero(self, personal_id: Optional[int] = None) -> None:
+    def _editar_datos_desde_legajo(self, personal_id: int) -> None:
+        """"Editar datos personales" en la Ficha de Legajo: mismo diálogo que
+        Personal y Unidades; al guardar se refrescan la ficha, la tabla de
+        personal y el buscador de legajos (por si cambió el nombre)."""
+        if self._dialogo_bombero(personal_id):
+            self._legajo_privado.mostrar(personal_id)
+            self._cargar_pagina_documentacion()
+            theme.set_tono(self.statusBar(), "ok")
+            self.statusBar().showMessage("Datos del legajo actualizados.", 6000)
+
+    def _dialogo_bombero(self, personal_id: Optional[int] = None) -> bool:
+        """Alta o edición de un bombero. True si se guardaron cambios."""
         datos_previos = None
         if personal_id is not None:
             with get_session() as session:
@@ -2096,23 +2111,23 @@ class MainWindow(QMainWindow):
         form.addRow(fila_botones)
 
         if dialogo.exec() != QDialog.DialogCode.Accepted:
-            return
+            return False
 
         nombre, apellido, dni = entry_nombre.text().strip(), entry_apellido.text().strip(), entry_dni.text().strip()
         if not entry_id_ruba.text().strip():
             QMessageBox.warning(self, "Falta el ID RUBA",
                                 "El ID RUBA es obligatorio: sin él el bombero no se puede sincronizar con RUBA.")
-            return
+            return False
         if not nombre or not apellido or not dni:
             QMessageBox.warning(self, "Datos incompletos", "Nombre, Apellido y DNI son obligatorios.")
-            return
+            return False
         id_ruba = int(entry_id_ruba.text())
         with get_session() as session:
             duplicado = session.query(Personal).filter(Personal.id_ruba == id_ruba, Personal.id != personal_id).first()
             if duplicado is not None:
                 QMessageBox.warning(self, "ID RUBA duplicado",
                                     f"El ID RUBA {id_ruba} ya es de {duplicado.nombre_completo()}.")
-                return
+                return False
 
         estado = combo_estado.currentText()
         with get_session() as session:
@@ -2138,9 +2153,10 @@ class MainWindow(QMainWindow):
                     self, "Datos duplicados",
                     "Ya existe un bombero cargado con ese DNI o ese N° de Legajo.",
                 )
-                return
+                return False
 
         self._cargar_pagina_dotaciones()
+        return True
 
     def _dialogo_unidad(self, movil_id: Optional[int] = None) -> None:
         datos_previos = None
@@ -2220,6 +2236,7 @@ class MainWindow(QMainWindow):
 
         self._legajo_privado = LegajoPrivadoWidget(pagina)
         self._legajo_privado.volver_solicitado.connect(lambda: self._stack_documentacion.setCurrentIndex(0))
+        self._legajo_privado.editar_datos_solicitado.connect(self._editar_datos_desde_legajo)
         self._stack_documentacion.addWidget(self._legajo_privado)
 
         return pagina

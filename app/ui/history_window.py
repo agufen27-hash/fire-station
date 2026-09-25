@@ -5,10 +5,11 @@ reintentar la sincronización con RUBA, ver el log de error), también desde
 el menú contextual (clic derecho). Se embebe como página del dashboard en
 `main_window.py` ("📋 Historial de Salidas" en la sidebar).
 
-Regla con RUBA (`permisos_servicio`): un parte ya SINCRONIZADO no se puede
-eliminar (existe en el portal nacional); editarlo se permite con aviso,
-porque los cambios quedan solo en la base local. Pendientes / con error /
-en curso se editan y eliminan libremente. Editar y eliminar los resuelve
+Regla con RUBA (`permisos_servicio`): un parte ya SINCRONIZADO está cerrado
+-- no se edita ni se elimina, porque existe en el portal nacional (se puede
+reimprimir). Pendientes / con error / en curso se editan y eliminan
+libremente, aunque una carga fallida haya dejado un ID de RUBA a medio
+crear: justamente hay que poder corregirlos y reintentar. Editar y eliminar los resuelve
 `MainWindow` (conoce el formulario abierto y la cola de sincronización).
 """
 
@@ -52,15 +53,16 @@ TIPO_FILTRO_TODOS = "Todos"
 
 COL_NUMERO_PARTE, COL_FECHA, COL_TIPO, COL_MOVIL, COL_DIRECCION, COL_ESTADO, COL_ACCIONES = range(7)
 
-MOTIVO_NO_ELIMINAR_SINCRONIZADO = (
-    "Ya está cargado en RUBA (portal nacional): no se puede eliminar desde Fire Station."
+MOTIVO_PARTE_CERRADO = (
+    "Parte cerrado: ya está cargado en RUBA (portal nacional), no se puede editar ni eliminar "
+    "desde Fire Station. Las planillas e informes se pueden reimprimir."
 )
 
 
 def permisos_servicio(estado_ruba: str) -> tuple:
-    """(puede_editar, puede_eliminar, motivo si no puede eliminar)."""
+    """(puede_editar, puede_eliminar, motivo del bloqueo o "")."""
     if estado_ruba == EstadoRuba.SINCRONIZADO.value:
-        return True, False, MOTIVO_NO_ELIMINAR_SINCRONIZADO
+        return False, False, MOTIVO_PARTE_CERRADO
     return True, True, ""
 
 
@@ -282,8 +284,8 @@ class HistoryWindow(QWidget):
             boton_continuar.clicked.connect(lambda: self.continuar_solicitado.emit(incidente_id))
             fila.addWidget(boton_continuar)
         else:
-            boton_editar = QPushButton("✏️ Editar", contenedor)
-            boton_editar.setToolTip("Cargar el servicio en el formulario para corregirlo")
+            boton_editar = QPushButton("✏️ Editar" if puede_editar else "🔒 Cerrado", contenedor)
+            boton_editar.setToolTip(motivo or "Cargar el servicio en el formulario para corregirlo")
             boton_editar.setEnabled(puede_editar)
             boton_editar.clicked.connect(lambda: self.editar_solicitado.emit(incidente_id))
             fila.addWidget(boton_editar)
@@ -343,14 +345,17 @@ class HistoryWindow(QWidget):
             accion_editar = menu.addAction("✏️ Continuar servicio en curso")
             accion_editar.triggered.connect(lambda: self.continuar_solicitado.emit(datos["id"]))
         else:
-            accion_editar = menu.addAction("✏️ Editar Servicio")
+            accion_editar = menu.addAction("✏️ Editar Servicio" if puede_editar
+                                           else "🔒 Editar Servicio (parte cerrado: está en RUBA)")
             accion_editar.triggered.connect(lambda: self.editar_solicitado.emit(datos["id"]))
         accion_editar.setEnabled(puede_editar)
+        if motivo:
+            accion_editar.setToolTip(motivo)
 
         accion_eliminar = menu.addAction("🗑️ Eliminar Servicio")
         accion_eliminar.setEnabled(puede_eliminar)
         if motivo:
-            accion_eliminar.setText("🗑️ Eliminar Servicio (ya sincronizado con RUBA)")
+            accion_eliminar.setText("🗑️ Eliminar Servicio (parte cerrado: está en RUBA)")
             accion_eliminar.setToolTip(motivo)
         accion_eliminar.triggered.connect(lambda: self.eliminar_solicitado.emit(datos["id"]))
         menu.setToolTipsVisible(True)
@@ -362,8 +367,12 @@ class HistoryWindow(QWidget):
             return
         if datos["en_curso"]:
             self.continuar_solicitado.emit(datos["id"])
-        else:
-            self.editar_solicitado.emit(datos["id"])
+            return
+        puede_editar, _, motivo = permisos_servicio(datos["estado_ruba"])
+        if not puede_editar:
+            QMessageBox.information(self, f"Parte N° {datos['numero_parte']} cerrado", motivo)
+            return
+        self.editar_solicitado.emit(datos["id"])
 
     def _reimprimir(self, incidente_id: int, numero_parte: str, generar_func, nombre_planilla: str) -> None:
         try:

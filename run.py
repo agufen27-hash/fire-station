@@ -12,6 +12,7 @@ from PySide6.QtWidgets import QApplication
 from app.db import init_db
 from app.paths import ICONO_APP, asegurar_config_inicial, configurar_entorno_playwright, ruta_recurso_existente
 from app.services.cartografia import asegurar_calibracion_en_config
+from app.ui.actualizaciones import iniciar_actualizaciones
 from app.ui.main_window import MainWindow
 from app.ui.theme import aplicar_tema
 
@@ -45,6 +46,7 @@ def main() -> None:
 
     ventana = MainWindow()
     ventana.show()
+    iniciar_actualizaciones(ventana)  # busca en segundo plano (GitHub Releases / git)
 
     sys.exit(app.exec())
 

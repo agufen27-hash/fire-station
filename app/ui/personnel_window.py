@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -72,6 +73,7 @@ class LegajoPrivadoWidget(QWidget):
     del bombero elegido (ver `main_window.py`)."""
 
     volver_solicitado = Signal()
+    editar_datos_solicitado = Signal(int)  # personal_id: MainWindow abre el diálogo de edición
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -80,13 +82,35 @@ class LegajoPrivadoWidget(QWidget):
         self._construir_ui()
 
     def _construir_ui(self) -> None:
-        layout = QVBoxLayout(self)
+        # Con scroll, como el resto de las páginas: sin él, en pantallas bajas
+        # (notebook, zoom de Windows al 125 %) Qt aplastaba la ficha y los
+        # textos -- "N° de Legajo" incluido -- quedaban cortados arriba y abajo.
+        exterior = QVBoxLayout(self)
+        exterior.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        exterior.addWidget(scroll)
+        contenido = QWidget(scroll)
+        scroll.setWidget(contenido)
+
+        layout = QVBoxLayout(contenido)
         layout.setContentsMargins(28, 24, 28, 28)
         layout.setSpacing(14)
 
+        fila_acciones = QHBoxLayout()
         boton_volver = QPushButton("← Volver", self)
         boton_volver.clicked.connect(self.volver_solicitado.emit)
-        layout.addWidget(boton_volver, 0, Qt.AlignmentFlag.AlignLeft)
+        fila_acciones.addWidget(boton_volver)
+        fila_acciones.addStretch(1)
+        boton_editar = QPushButton("✏️ Editar datos personales", self)
+        boton_editar.setObjectName("botonAhora")
+        boton_editar.setToolTip("DNI, teléfono, jerarquía, grupo sanguíneo, antigüedad y estado")
+        boton_editar.clicked.connect(
+            lambda: self._personal_id is not None and self.editar_datos_solicitado.emit(self._personal_id)
+        )
+        fila_acciones.addWidget(boton_editar)
+        layout.addLayout(fila_acciones)
 
         fila_superior = QHBoxLayout()
         fila_superior.setSpacing(16)
@@ -95,6 +119,10 @@ class LegajoPrivadoWidget(QWidget):
         form = QFormLayout(caja_ficha)
         self._label_legajo = QLabel(caja_ficha)
         self._label_legajo.setObjectName("pageTitle")
+        # Título grande (22 px): alto mínimo propio + aire arriba/abajo, para que
+        # "Legajo" (con la g y la j que bajan) nunca quede recortado.
+        self._label_legajo.setContentsMargins(0, 4, 0, 6)
+        self._label_legajo.setMinimumHeight(self._label_legajo.fontMetrics().height() + 14)
         self._label_nombre = QLabel(caja_ficha)
         self._label_dni = QLabel(caja_ficha)
         self._label_telefono = QLabel(caja_ficha)
@@ -145,6 +173,7 @@ class LegajoPrivadoWidget(QWidget):
         self._tabla_historial.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._tabla_historial.verticalHeader().setVisible(False)
         self._tabla_historial.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self._tabla_historial.setMinimumHeight(160)
         theme.estilizar_tabla(self._tabla_historial)
         layout_historial.addWidget(self._tabla_historial)
         self._label_totales_historial = QLabel(caja_historial)
@@ -160,6 +189,7 @@ class LegajoPrivadoWidget(QWidget):
         self._tabla_documentos.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._tabla_documentos.verticalHeader().setVisible(False)
         self._tabla_documentos.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self._tabla_documentos.setMinimumHeight(120)
         theme.estilizar_tabla(self._tabla_documentos)
         layout_documentos.addWidget(self._tabla_documentos)
         boton_agregar_doc = QPushButton("+ Agregar Documento", caja_documentos)
@@ -177,6 +207,8 @@ class LegajoPrivadoWidget(QWidget):
             self._numero_legajo = p.legajo_display()
             ruta_firma = p.ruta_firma
             self._label_legajo.setText(f"N° de Legajo: {self._numero_legajo}")
+            self._label_legajo.ensurePolished()  # fuente real del tema (22 px) antes de medir
+            self._label_legajo.setMinimumHeight(self._label_legajo.fontMetrics().height() + 14)
             self._label_nombre.setText(p.nombre_completo())
             self._label_dni.setText(p.dni)
             self._label_telefono.setText(p.telefono or "—")
