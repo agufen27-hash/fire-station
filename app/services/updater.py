@@ -38,6 +38,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import urllib.error
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -107,14 +108,65 @@ def es_mas_nueva(remota: str, local: str = __version__) -> bool:
         return False
 
 
+def _leer_config() -> dict:
+    try:
+        datos = json.loads((get_writable_dir("data") / "config.json").read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        log.warning("[Actualizaciones] data/config.json ilegible (%s): se usan valores por defecto.", e)
+        return {}
+    return datos if isinstance(datos, dict) else {}
+
+
 def modo_configurado() -> str:
     """data/config.json -> {"actualizaciones": {"modo": "preguntar"}} (por defecto)."""
-    try:
-        datos = json.loads((get_writable_dir("data") / "config.json").read_text(encoding="utf-8"))
-        modo = (datos.get("actualizaciones") or {}).get("modo", MODO_PREGUNTAR)
-    except (OSError, ValueError, AttributeError):
-        modo = MODO_PREGUNTAR
+    seccion = _leer_config().get("actualizaciones")
+    modo = seccion.get("modo", MODO_PREGUNTAR) if isinstance(seccion, dict) else MODO_PREGUNTAR
     return modo if modo in MODOS else MODO_PREGUNTAR
+
+
+def github_token() -> str:
+    """Token de GitHub para un repo privado. Se busca en data/config.json:
+    {"github_token": "..."} (raíz) o {"actualizaciones": {"github_token": "..."}}.
+    Cadena vacía si no hay (repo público o sin configurar)."""
+    datos = _leer_config()
+    seccion = datos.get("actualizaciones")
+    token = datos.get("github_token") or (seccion.get("github_token") if isinstance(seccion, dict) else None)
+    return str(token).strip() if token else ""
+
+
+def _cabeceras_github(token: str, binario: bool = False) -> dict:
+    cabeceras = {"Accept": "application/octet-stream" if binario else "application/vnd.github+json",
+                 "X-GitHub-Api-Version": "2022-11-28"}
+    if token:
+        cabeceras["Authorization"] = f"Bearer {token}"
+    return cabeceras
+
+
+def _informar(mensaje: str, nivel: int = logging.INFO) -> None:
+    """Al log y a la consola (en el .exe sin consola, print no hace nada)."""
+    log.log(nivel, mensaje)
+    print(mensaje)
+
+
+def _error_http_github(e: urllib.error.HTTPError, con_token: bool) -> ActualizacionError:
+    """Traduce el error HTTP de la API a un mensaje que diga si es de autenticación."""
+    if e.code == 401:
+        motivo = "AUTENTICACIÓN FALLIDA (401): el github_token de data/config.json es inválido o venció."
+    elif e.code == 403 and (e.headers.get("X-RateLimit-Remaining") == "0"):
+        motivo = "límite de consultas de la API de GitHub agotado (403); se reintentará más tarde."
+    elif e.code == 403:
+        motivo = "ACCESO DENEGADO (403): el github_token no tiene permiso de lectura sobre el repo."
+    elif e.code == 404 and con_token:
+        motivo = ("repo o release no encontrado (404) aun con github_token: verificá que el token "
+                  f"tenga acceso a {REPO_GITHUB} (Contents: read-only).")
+    elif e.code == 404:
+        motivo = ("repo o release no encontrado (404): si el repo es privado falta 'github_token' "
+                  "en data/config.json.")
+    else:
+        motivo = f"error HTTP {e.code} de GitHub: {e.reason}"
+    return ActualizacionError(f"No se pudo consultar actualizaciones: {motivo}")
 
 
 def carpeta_instalacion() -> Path:
@@ -129,16 +181,24 @@ def carpeta_instalacion() -> Path:
 def buscar_en_releases() -> Optional[InfoActualizacion]:
     """Último GitHub Release; None si no hay uno más nuevo que esta versión.
     Un repo privado (o inexistente) responde 404 sin token: se informa
-    como excepción y el que llama lo loguea sin molestar al usuario."""
-    cabeceras = {"Accept": "application/vnd.github+json"}
-    release = obtener_json_verificado(URL_ULTIMO_RELEASE, TIMEOUT_CONSULTA_SEG, cabeceras)
-    version = str(release.get("tag_name") or "").lstrip("v")
-    if not es_mas_nueva(version):
-        return None
-    assets = {a.get("name"): a for a in release.get("assets") or []}
-    if NOMBRE_MANIFIESTO not in assets:
-        raise ActualizacionError(f"El release v{version} no trae '{NOMBRE_MANIFIESTO}' (¿publicado a mano?).")
-    manifiesto = obtener_json_verificado(assets[NOMBRE_MANIFIESTO]["browser_download_url"], TIMEOUT_CONSULTA_SEG)
+    como excepción y el que llama lo loguea sin molestar al usuario.
+    Con `github_token` en data/config.json se autentica (repo privado) y los
+    assets se bajan por la API (`asset.url`), que es lo único que acepta token."""
+    token = github_token()
+    _informar(f"[Actualizaciones] Consultando {REPO_GITHUB} (v{__version__} instalada, "
+              f"{'con' if token else 'sin'} github_token)...")
+    try:
+        release = obtener_json_verificado(URL_ULTIMO_RELEASE, TIMEOUT_CONSULTA_SEG, _cabeceras_github(token))
+        version = str(release.get("tag_name") or "").lstrip("v")
+        if not es_mas_nueva(version):
+            return None
+        assets = {a.get("name"): a for a in release.get("assets") or []}
+        if NOMBRE_MANIFIESTO not in assets:
+            raise ActualizacionError(f"El release v{version} no trae '{NOMBRE_MANIFIESTO}' (¿publicado a mano?).")
+        manifiesto = obtener_json_verificado(_url_asset(assets[NOMBRE_MANIFIESTO], token), TIMEOUT_CONSULTA_SEG,
+                                             _cabeceras_github(token, binario=True))
+    except urllib.error.HTTPError as e:
+        raise _error_http_github(e, bool(token)) from e
     if str(manifiesto.get("version")) != version:
         raise ActualizacionError(f"update.json dice v{manifiesto.get('version')} pero el release es v{version}.")
     paquete = assets.get(manifiesto.get("paquete"))
@@ -146,10 +206,16 @@ def buscar_en_releases() -> Optional[InfoActualizacion]:
         raise ActualizacionError(f"El release v{version} tiene un update.json incompleto.")
     return InfoActualizacion(
         version=version, origen="release", notas=str(manifiesto.get("notas") or release.get("body") or ""),
-        url_paquete=paquete["browser_download_url"], nombre_paquete=paquete["name"],
+        url_paquete=_url_asset(paquete, token), nombre_paquete=paquete["name"],
         sha256=manifiesto["sha256"], tamano=int(paquete.get("size") or 0),
         chromium=[str(c) for c in manifiesto.get("chromium") or []],
     )
+
+
+def _url_asset(asset: dict, token: str) -> str:
+    """Con token, la URL de la API del asset (browser_download_url no acepta
+    autenticación y da 404 en un repo privado); sin token, la pública."""
+    return str(asset.get("url") or asset["browser_download_url"]) if token else asset["browser_download_url"]
 
 
 def _git(*args: str, cwd: Path, timeout: float = 30) -> str:
@@ -173,7 +239,22 @@ def buscar_en_git(raiz: Optional[Path] = None) -> Optional[InfoActualizacion]:
 
 
 def buscar_actualizacion() -> Optional[InfoActualizacion]:
-    return buscar_en_releases() if is_frozen() else buscar_en_git()
+    """Busca y deja constancia en el log/consola del resultado: versión nueva,
+    al día, o el motivo del fallo (autenticación incluida). Re-levanta el
+    error para que la UI decida si lo muestra."""
+    try:
+        info = buscar_en_releases() if is_frozen() else buscar_en_git()
+    except ActualizacionError as e:
+        _informar(f"[Actualizaciones] {e}", logging.WARNING)
+        raise
+    except Exception as e:  # noqa: BLE001 - sin internet, sin git, etc.: se loguea y se re-levanta
+        _informar(f"[Actualizaciones] Falló la verificación: {type(e).__name__}: {e}", logging.WARNING)
+        raise
+    if info is None:
+        _informar(f"[Actualizaciones] Sin versión nueva: v{__version__} está al día.")
+    else:
+        _informar(f"[Actualizaciones] Versión nueva encontrada: {info.version} (origen: {info.origen}).")
+    return info
 
 
 # ---------------------------------------------------------------------------
@@ -227,7 +308,12 @@ def descargar_y_preparar(info: InfoActualizacion, instalacion: Optional[Path] = 
     staging.mkdir(parents=True, exist_ok=True)
     zip_local = staging / info.nombre_paquete
     if not (zip_local.is_file() and _sha256(zip_local) == info.sha256):
-        descargar_archivo(info.url_paquete, zip_local, TIMEOUT_DESCARGA_SEG, on_progreso)
+        token = github_token() if info.origen == "release" else ""
+        try:
+            descargar_archivo(info.url_paquete, zip_local, TIMEOUT_DESCARGA_SEG, on_progreso,
+                              headers=_cabeceras_github(token, binario=True))
+        except urllib.error.HTTPError as e:
+            raise _error_http_github(e, bool(token)) from e
     if _sha256(zip_local) != info.sha256:
         zip_local.unlink(missing_ok=True)
         raise ActualizacionError("El paquete descargado está dañado (SHA-256 no coincide). Se reintentará.")

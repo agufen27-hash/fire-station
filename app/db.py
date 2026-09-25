@@ -151,19 +151,27 @@ def _sincronizar_moviles_desde_mapping(session: Session) -> None:
         session.add(Movil(nombre_identificador=nombre, activo=True, id_ruba=movil.id_ruba))
 
 
-def _sincronizar_personal_desde_padron(session: Session) -> None:
+def _sincronizar_personal_desde_padron(session: Session, padron=None) -> int:
     """Vincula/da de alta al personal activo del padrón oficial
-    (data/Reporte de bomberos.xlsx). Se cruza por Id de RUBA y, si no, por
-    DNI -- así el personal ya cargado conserva su PIN y su firma. Si el
-    Excel no está, no hace nada (la app sigue funcionando)."""
+    (data/Reporte de bomberos.xlsx, o el `padron` ya leído que se pase).
+    Se cruza por Id de RUBA y, si no, por DNI -- así el personal ya cargado
+    conserva su PIN y su firma. Si el Excel no está, no hace nada (la app
+    sigue funcionando con lo que ya hay en la base). Devuelve cuántas
+    personas se dieron de alta."""
     from app.core.catalogos import leer_padron_personal
 
-    try:
-        padron = leer_padron_personal()
-    except (OSError, ValueError) as e:
-        logging.getLogger(__name__).warning("No se pudo leer el padrón de personal: %s", e)
-        return
+    if padron is None:
+        try:
+            padron = leer_padron_personal()
+        except FileNotFoundError:
+            logging.getLogger(__name__).info(
+                "Padrón de bomberos no cargado todavía (se importa desde Personal y Unidades).")
+            return 0
+        except (OSError, ValueError) as e:
+            logging.getLogger(__name__).warning("No se pudo leer el padrón de personal: %s", e)
+            return 0
 
+    altas = 0
     session.flush()
     legajos_usados = {p.legajo for p in session.query(Personal).filter(Personal.legajo.isnot(None)).all()}
     for bombero in padron:
@@ -177,10 +185,19 @@ def _sincronizar_personal_desde_padron(session: Session) -> None:
                 nombre=bombero.nombre, apellido=bombero.apellido, dni=bombero.dni, legajo=legajo,
                 jerarquia=bombero.clasificacion, activo=True, estado="Activo", id_ruba=bombero.id_ruba,
             ))
+            altas += 1
             if legajo:
                 legajos_usados.add(legajo)
         elif persona.id_ruba is None:
             persona.id_ruba = bombero.id_ruba
+    return altas
+
+
+def sincronizar_padron_importado(padron) -> int:
+    """Tras importar un Excel desde la UI: da de alta/vincula su personal
+    en la base. Devuelve la cantidad de altas nuevas."""
+    with get_session() as session:
+        return _sincronizar_personal_desde_padron(session, padron)
 
 
 # Guía telefónica: SOLO números oficiales de emergencia, de alcance nacional o

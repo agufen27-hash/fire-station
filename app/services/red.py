@@ -53,6 +53,32 @@ def obtener_json(url: str, timeout: float, headers: Optional[Dict[str, str]] = N
         return json.loads(resp.read().decode("utf-8"))
 
 
+class _SinAuthEnRedireccion(urllib.request.HTTPRedirectHandler):
+    """GitHub redirige la descarga de assets a otro host (S3 / objects.
+    githubusercontent.com) con una URL ya firmada: reenviar ahí el
+    `Authorization` del token filtra la credencial y además S3 responde 400.
+    Se descarta al cambiar de host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
+        nuevo = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if nuevo is not None:
+            from urllib.parse import urlsplit
+
+            if urlsplit(newurl).netloc != urlsplit(req.full_url).netloc:
+                for clave in list(nuevo.headers):
+                    if clave.lower() == "authorization":
+                        del nuevo.headers[clave]
+                nuevo.unredirected_hdrs.pop("Authorization", None)
+        return nuevo
+
+
+def _abrir_verificado(pedido: urllib.request.Request, timeout: float):
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=_contexto_verificado()), _SinAuthEnRedireccion()
+    )
+    return opener.open(pedido, timeout=timeout)
+
+
 def descargar_archivo(url: str, destino: "Path", timeout: float,
                       on_progreso: "Optional[Callable[[int, int], None]]" = None,
                       headers: Optional[Dict[str, str]] = None) -> "Path":
@@ -67,7 +93,7 @@ def descargar_archivo(url: str, destino: "Path", timeout: float,
     cabeceras = {"User-Agent": USER_AGENT_POR_DEFECTO, **(headers or {})}
     pedido = urllib.request.Request(url, headers=cabeceras)
     parcial = destino.with_suffix(destino.suffix + ".parcial")
-    with urllib.request.urlopen(pedido, timeout=timeout, context=_contexto_verificado()) as resp:  # noqa: S310
+    with _abrir_verificado(pedido, timeout) as resp:
         total = int(resp.headers.get("Content-Length") or 0)
         leidos = 0
         with parcial.open("wb") as salida:
@@ -88,5 +114,5 @@ def obtener_json_verificado(url: str, timeout: float, headers: Optional[Dict[str
     que deciden qué se instala (manifiesto de actualización)."""
     cabeceras = {"User-Agent": USER_AGENT_POR_DEFECTO, "Accept": "application/json", **(headers or {})}
     pedido = urllib.request.Request(url, headers=cabeceras)
-    with urllib.request.urlopen(pedido, timeout=timeout, context=_contexto_verificado()) as resp:  # noqa: S310
+    with _abrir_verificado(pedido, timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))

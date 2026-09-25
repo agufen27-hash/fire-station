@@ -53,10 +53,10 @@ from PySide6.QtWidgets import (
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 
-from app.core.catalogos import obtener_catalogos_ruba, obtener_padron
+from app.core.catalogos import importar_padron, obtener_catalogos_ruba, obtener_padron
 from app import __version__
 from app.paths import ICONO_APP, LOGO_INSTITUCIONAL, ruta_recurso_existente
-from app.db import DATA_DIR, get_session, siguiente_numero_parte
+from app.db import DATA_DIR, get_session, sincronizar_padron_importado, siguiente_numero_parte
 from app.models import (
     MEDIOS_CONTACTO,
     MEDIOS_TELEFONICOS,
@@ -834,7 +834,11 @@ class MainWindow(QMainWindow):
         self._avisos_catalogos: List[str] = []
         try:
             self._padron = obtener_padron().bomberos
-        except (OSError, ValueError) as e:
+        except FileNotFoundError:
+            self._padron = []
+            self._avisos_catalogos.append(
+                "Padrón de bomberos sin cargar: importalo desde Personal y Unidades → 📥 Importar padrón.")
+        except Exception as e:  # noqa: BLE001 - un Excel roto nunca debe impedir que la app arranque
             self._padron = []
             self._avisos_catalogos.append(f"No se pudo leer el padrón de bomberos ({e}).")
         try:
@@ -1866,9 +1870,13 @@ class MainWindow(QMainWindow):
         boton_nueva_unidad = QPushButton("+ Nueva Unidad", pagina)
         boton_nueva_unidad.setObjectName("botonAhora")
         boton_nueva_unidad.clicked.connect(lambda: self._dialogo_unidad())
+        boton_importar_padron = QPushButton("📥 Importar padrón (Excel)", pagina)
+        boton_importar_padron.setToolTip("Elegí el 'Reporte de bomberos' exportado de RUBA (.xlsx) desde cualquier carpeta")
+        boton_importar_padron.clicked.connect(self._importar_padron_bomberos)
         fila_botones.addWidget(boton_nuevo_bombero)
         fila_botones.addWidget(boton_nueva_unidad)
         fila_botones.addStretch(1)
+        fila_botones.addWidget(boton_importar_padron)
         layout.addLayout(fila_botones)
 
         contenido = QHBoxLayout()
@@ -1959,6 +1967,35 @@ class MainWindow(QMainWindow):
             )
             self._tabla_personal_dotacion.setCellWidget(fila, 3, widget)
         self._tabla_personal_dotacion.resizeRowsToContents()
+
+    def _importar_padron_bomberos(self) -> None:
+        """El usuario elige el Excel (cualquier ubicación); se valida, se copia
+        a data/ y se sincroniza la base. Si algo falla no se toca nada."""
+        ruta_texto, _ = QFileDialog.getOpenFileName(
+            self, "Importar padrón de bomberos (Reporte de bomberos de RUBA)", "",
+            "Excel (*.xlsx *.xlsm)",
+        )
+        if not ruta_texto:
+            return
+        try:
+            padron = importar_padron(Path(ruta_texto))
+            altas = sincronizar_padron_importado(padron)
+        except (OSError, ValueError) as e:
+            QMessageBox.warning(self, "No se pudo importar el padrón", str(e))
+            return
+        except Exception as e:  # noqa: BLE001 - base u openpyxl: se informa sin cerrar la app
+            QMessageBox.critical(self, "No se pudo importar el padrón", f"{type(e).__name__}: {e}")
+            return
+
+        self._padron = padron.bomberos
+        self._avisos_catalogos = [a for a in self._avisos_catalogos if "padrón" not in a.lower()]
+        self._actualizar_chips()
+        self._cargar_pagina_dotaciones()
+        QMessageBox.information(
+            self, "Padrón importado",
+            f"{len(padron)} bomberos activos en el padrón; {altas} alta(s) nueva(s) en la base.\n\n"
+            "Los selectores del formulario de parte toman el padrón nuevo al reiniciar la app.",
+        )
 
     def _alternar_movil(self, movil_id: int) -> None:
         with get_session() as session:

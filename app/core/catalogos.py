@@ -95,14 +95,31 @@ def _normalizar_dni(valor: Any) -> str:
     return re.sub(r"\D", "", str(valor or ""))
 
 
+def ruta_padron_por_defecto() -> Path:
+    """Copia local del padrón (data/Reporte de bomberos.xlsx). Puede no
+    existir: se crea al importar el Excel desde la vista de Personal."""
+    return get_writable_dir("data") / NOMBRE_REPORTE_PERSONAL
+
+
 def leer_padron_personal(ruta: Optional[Path] = None) -> List[Bombero]:
     """Lee el export 'Reporte de bomberos' de RUBA y devuelve solo el
     personal activo, ordenado por apellido y nombre. Las columnas se ubican
-    por nombre de encabezado (sin importar orden ni acentos)."""
-    from openpyxl import load_workbook  # import diferido: openpyxl es pesado
+    por nombre de encabezado (sin importar orden ni acentos).
 
-    ruta = ruta or get_writable_dir("data") / NOMBRE_REPORTE_PERSONAL
-    libro = load_workbook(ruta, read_only=True, data_only=True)
+    Errores: FileNotFoundError si el archivo no existe; ValueError si no es
+    un Excel válido o le faltan columnas (nunca otra excepción de openpyxl)."""
+    from zipfile import BadZipFile
+
+    from openpyxl import load_workbook  # import diferido: openpyxl es pesado
+    from openpyxl.utils.exceptions import InvalidFileException
+
+    ruta = Path(ruta) if ruta else ruta_padron_por_defecto()
+    if not ruta.is_file():
+        raise FileNotFoundError(f"No existe el padrón de bomberos: {ruta}")
+    try:
+        libro = load_workbook(ruta, read_only=True, data_only=True)
+    except (BadZipFile, InvalidFileException, KeyError) as e:
+        raise ValueError(f"{ruta.name} no es un Excel (.xlsx) válido: {e}") from e
     try:
         filas = libro.worksheets[0].iter_rows(values_only=True)
         encabezado = next(filas, None)
@@ -129,8 +146,12 @@ def leer_padron_personal(ruta: Optional[Path] = None) -> List[Bombero]:
                 continue
 
             formacion = _texto(celda(fila, "FORMACION")) or ""
+            try:
+                id_ruba = int(celda(fila, "ID"))
+            except (TypeError, ValueError):
+                continue  # fila de totales / texto suelto: no es un bombero
             personal.append(Bombero(
-                id_ruba=int(celda(fila, "ID")),
+                id_ruba=id_ruba,
                 apellido=(_texto(celda(fila, "APELLIDO")) or "").upper(),
                 nombre=_texto(celda(fila, "NOMBRE")) or "",
                 dni=_normalizar_dni(celda(fila, "DNI")),
@@ -199,6 +220,27 @@ def obtener_padron() -> PadronPersonal:
     """Padrón por defecto (data/Reporte de bomberos.xlsx), cacheado.
     Llamar `obtener_padron.cache_clear()` tras reemplazar el Excel."""
     return PadronPersonal(leer_padron_personal())
+
+
+def importar_padron(origen: Path) -> PadronPersonal:
+    """Importa un 'Reporte de bomberos' elegido por el usuario (cualquier
+    ubicación): lo valida ANTES de tocar nada y recién entonces lo copia a
+    data/Reporte de bomberos.xlsx, reemplazando el anterior. Levanta
+    FileNotFoundError / ValueError sin modificar la copia local si el
+    archivo no sirve."""
+    import shutil
+
+    origen = Path(origen)
+    padron = PadronPersonal(leer_padron_personal(origen))
+    if not len(padron):
+        raise ValueError(f"{origen.name} no tiene personal activo: no se importó.")
+    destino = ruta_padron_por_defecto()
+    if origen.resolve() != destino.resolve():
+        temporal = destino.with_suffix(".importando.xlsx")
+        shutil.copy2(origen, temporal)
+        temporal.replace(destino)
+    obtener_padron.cache_clear()
+    return padron
 
 
 # ---------------------------------------------------------------------------
