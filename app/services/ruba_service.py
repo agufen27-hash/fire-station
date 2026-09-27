@@ -70,9 +70,22 @@ def _completar_denunciante(payload: Dict[str, Any]) -> None:
 
 
 def _ruba_id_guardado(incidente_id: int) -> Optional[str]:
+    """ID remoto a retomar, leído en cada corrida (nunca cacheado): si el
+    usuario lo desvinculó o quedó vacío/en blanco, se crea desde cero."""
     with get_session() as session:
         incidente = session.get(Incidente, incidente_id)
-        return incidente.ruba_id_remoto if incidente else None
+        ruba_id = (incidente.ruba_id_remoto or "").strip() if incidente else ""
+        return ruba_id or None
+
+
+def _descartar_id_remoto(incidente_id: int, id_viejo: str) -> None:
+    """El incidente viejo no abrió en RUBA (500, timeout, eliminado): se
+    olvida su ID para que ni esta corrida ni un reintento vuelvan a él."""
+    with get_session() as session:
+        incidente = session.get(Incidente, incidente_id)
+        if incidente is not None and incidente.ruba_id_remoto == id_viejo:
+            incidente.ruba_id_remoto = None
+            incidente.actualizado_en = datetime.now()
 
 
 def _guardar_id_remoto(incidente_id: int, ruba_id_remoto: str) -> None:
@@ -152,7 +165,7 @@ def sincronizar_incidente(
     navegador: Optional[NavegadorLote] = None,
 ) -> Dict[str, Any]:
     """Carga el incidente en RUBA y devuelve {'ruba_id_remoto', 'url_final',
-    'advertencias'}. Lanza una excepción con un mensaje claro si algo falla;
+    'advertencias', 'ruba_id_descartado', 'aviso_recreado'}. Lanza una excepción con un mensaje claro si algo falla;
     no toca el estado en la base (eso lo hace el worker). Con `navegador`
     reusa ese navegador (lote); sin él abre y cierra uno propio."""
     payload = preparar_payload(incidente_id)
@@ -161,6 +174,7 @@ def sincronizar_incidente(
         on_progreso=on_progreso,
         ruba_id_existente=_ruba_id_guardado(incidente_id),
         on_id_remoto=lambda ruba_id: _guardar_id_remoto(incidente_id, ruba_id),
+        on_id_descartado=lambda id_viejo: _descartar_id_remoto(incidente_id, id_viejo),
     )
     if navegador is None:
         resultado = automatizacion.ejecutar()
@@ -171,6 +185,8 @@ def sincronizar_incidente(
         "ruba_id_remoto": resultado.ruba_id_remoto,
         "url_final": resultado.url_final,
         "advertencias": resultado.advertencias,
+        "ruba_id_descartado": resultado.ruba_id_descartado,
+        "aviso_recreado": resultado.aviso_recreado,
     }
 
 
@@ -267,6 +283,7 @@ class RubaLoteWorker(QObject):
     item_ok = Signal(int, str, str, str)         # incidente_id, numero_parte, ruba_id_remoto, url_final
     item_error = Signal(int, str, str, str)      # incidente_id, numero_parte, mensaje, ruta_captura
     item_omitido = Signal(int, str, str)         # incidente_id, numero_parte, motivo
+    item_advertencia = Signal(int, str, str)     # incidente_id, numero_parte, aviso (tras item_ok)
     navegador_faltante = Signal(str)             # sin Chrome/Edge/Chromium: mensaje con instrucciones
     terminado = Signal(int, int, int, int)       # ok, errores, omitidos, sin_procesar (por cancelación)
 
@@ -319,7 +336,7 @@ class RubaLoteWorker(QObject):
         def progreso(evento: EventoProgreso) -> None:
             if evento.estado == "inicio":
                 self.detalle.emit(incidente_id, prefijo + TEXTO_PASO.get(evento.paso.name, evento.mensaje))
-            elif evento.estado == "omitido":
+            elif evento.estado in ("omitido", "aviso"):
                 self.detalle.emit(incidente_id, prefijo + evento.mensaje)
 
         try:
@@ -350,6 +367,8 @@ class RubaLoteWorker(QObject):
         self.detalle.emit(incidente_id, prefijo + "Guardado exitoso.")
         self.item_ok.emit(incidente_id, numero, resultado.get("ruba_id_remoto") or "",
                           resultado.get("url_final") or "")
+        if resultado.get("aviso_recreado"):
+            self.item_advertencia.emit(incidente_id, numero, resultado["aviso_recreado"])
         return True
 
 

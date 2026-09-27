@@ -108,6 +108,7 @@ class DialogoLoteRuba(QDialog):
         worker.item_ok.connect(self.on_item_ok)
         worker.item_error.connect(self.on_item_error)
         worker.item_omitido.connect(self.on_item_omitido)
+        worker.item_advertencia.connect(self.on_item_advertencia)
         worker.navegador_faltante.connect(self.on_navegador_faltante)
         worker.terminado.connect(self.on_terminado)
 
@@ -135,6 +136,16 @@ class DialogoLoteRuba(QDialog):
     def on_item_ok(self, incidente_id: int, numero_parte: str, ruba_id: str, url: str) -> None:
         self._completar(incidente_id, f"✅ Parte N° {numero_parte}: cargado en RUBA (ID {ruba_id or '—'})",
                         "verde_texto", url)
+
+    def on_item_advertencia(self, incidente_id: int, numero_parte: str, aviso: str) -> None:
+        """Cargado, pero reemplazando un incidente viejo que no abría: queda
+        en ámbar con el aviso a la vista (no suma a la barra: ya lo hizo item_ok)."""
+        item = self._items.get(incidente_id)
+        if item is None:
+            return
+        item.setText(f"{item.text()}\n    {aviso}")
+        item.setForeground(QColor(theme.color("ambar")))
+        item.setToolTip(aviso + ("\n\n" + item.toolTip() if item.toolTip() else ""))
 
     def on_item_error(self, incidente_id: int, numero_parte: str, mensaje: str, captura: str) -> None:
         self._completar(incidente_id, f"❌ Parte N° {numero_parte}: {mensaje}", "rojo",

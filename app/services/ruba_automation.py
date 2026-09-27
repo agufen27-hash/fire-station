@@ -81,7 +81,7 @@ PASOS = list(PasoRuba)
 @dataclass(frozen=True)
 class EventoProgreso:
     paso: PasoRuba
-    estado: str        # "inicio" | "ok" | "omitido" | "error"
+    estado: str        # "inicio" | "ok" | "omitido" | "aviso" | "error"
     porcentaje: int    # avance total 0-100
     mensaje: str = ""
 
@@ -102,6 +102,10 @@ class ResultadoRuba:
     ruba_id_remoto: Optional[str]
     url_final: str
     advertencias: List[str] = field(default_factory=list)
+    # ID viejo que no abrió en RUBA (500 / timeout / sin formulario) y se
+    # reemplazó por un servicio creado desde cero; None si no hubo reemplazo.
+    ruba_id_descartado: Optional[str] = None
+    aviso_recreado: Optional[str] = None
 
 
 # Listas de sugerencias de los autocompletes más comunes (jQuery UI, typeahead,
@@ -328,11 +332,18 @@ class RubaServiceAutomation:
         timeout_navegacion_ms: int = 45000,
         ruba_id_existente: Optional[str] = None,
         on_id_remoto: Optional[Callable[[str], None]] = None,
+        on_id_descartado: Optional[Callable[[str], None]] = None,
     ) -> None:
         """`ruba_id_existente`: si una corrida anterior ya creó el incidente en
         RUBA, se retoma en /editar/{id} en vez de inicializar otro (evita
         partes duplicados). `on_id_remoto` se llama apenas RUBA asigna el ID,
         para persistirlo aunque un paso posterior falle.
+
+        Si el incidente existente no abre (error 500, timeout, redirige fuera
+        de /editar/ o no muestra el formulario), se descarta ese ID -- se
+        avisa por `on_id_descartado(id_viejo)` para limpiarlo en la base -- y
+        se crea el servicio desde cero en /agregar, con una advertencia para
+        que el usuario verifique que el borrador viejo no quedó duplicado.
 
         `timeout_ms`: espera de elementos/acciones. `timeout_navegacion_ms`:
         cargas de página y guardados que navegan (POST + redirect) -- RUBA
@@ -355,8 +366,12 @@ class RubaServiceAutomation:
 
         self.page: Optional[Page] = None
         self.advertencias: List[str] = []
-        self.ruba_id_remoto: Optional[str] = ruba_id_existente
+        # Un ID vacío o en blanco (parte desvinculado a mano) = crear desde cero.
+        self.ruba_id_remoto: Optional[str] = (str(ruba_id_existente).strip() or None) if ruba_id_existente else None
         self.on_id_remoto = on_id_remoto
+        self.on_id_descartado = on_id_descartado
+        self.ruba_id_descartado: Optional[str] = None
+        self.aviso_recreado: Optional[str] = None
         self._paso_activo = PasoRuba.SESION
 
     # ------------------------------------------------------------------
@@ -397,7 +412,16 @@ class RubaServiceAutomation:
                 self._cargar_bomberos()
             with self._paso(PasoRuba.VEHICULOS):
                 self._cargar_vehiculos_y_guardar()
-            return ResultadoRuba(self.ruba_id_remoto, self.page.url, list(self.advertencias))
+            if self.ruba_id_descartado:
+                self.aviso_recreado = (
+                    f"⚠️ Atención: Se creó un nuevo servicio en RUBA (ID {self.ruba_id_remoto or '—'}). "
+                    f"Verificá manualmente en el listado de RUBA que el borrador {self.ruba_id_descartado} "
+                    "no haya quedado duplicado."
+                )
+                self.advertencias.append(self.aviso_recreado)
+                log.warning("RUBA: %s", self.aviso_recreado)
+            return ResultadoRuba(self.ruba_id_remoto, self.page.url, list(self.advertencias),
+                                 self.ruba_id_descartado, self.aviso_recreado)
         finally:
             try:
                 self.page.close()
@@ -475,14 +499,10 @@ class RubaServiceAutomation:
         sel = self.sel["inicializacion"]
         page = self.page
         if self.ruba_id_remoto:
-            self._ir_a(f"{self.url_incidentes.rstrip('/')}/editar/{self.ruba_id_remoto}")
-            self._esperar_red()
-            if "/editar/" not in page.url:
-                raise RubaAutomationError(
-                    PasoRuba.INICIALIZACION,
-                    f"No se pudo abrir el incidente existente {self.ruba_id_remoto} en RUBA (quedó en {page.url}).",
-                )
-            raise _PasoOmitido(f"El incidente ya existía en RUBA (ID {self.ruba_id_remoto}): se retoma la carga.")
+            motivo = self._abrir_edicion_existente(self.ruba_id_remoto)
+            if motivo is None:
+                raise _PasoOmitido(f"El incidente ya existía en RUBA (ID {self.ruba_id_remoto}): se retoma la carga.")
+            self._descartar_id_existente(motivo)
 
         self._ir_a(self.url_agregar)
         page.locator(sel["numero_parte"]).first.wait_for(state="visible")
@@ -505,6 +525,62 @@ class RubaServiceAutomation:
         self.ruba_id_remoto = _extraer_id(page.url)
         if self.ruba_id_remoto and self.on_id_remoto:
             self.on_id_remoto(self.ruba_id_remoto)
+
+    def _abrir_edicion_existente(self, ruba_id: str) -> Optional[str]:
+        """Abre /editar/{id} y verifica que muestre el formulario de Datos
+        Generales. None si abrió bien; si no, el motivo (error del servidor,
+        timeout, redirección). Ante un 500 recarga UNA vez (suele ser
+        transitorio) antes de darlo por perdido. Nunca lanza: el que llama
+        decide crear el servicio desde cero."""
+        url = f"{self.url_incidentes.rstrip('/')}/editar/{ruba_id}"
+        selector_calle = self.sel["editar_general"]["calle"]
+        motivo = "sin respuesta"
+        for intento in (1, 2):
+            try:
+                if intento == 1:
+                    self._ir_a(url)
+                else:
+                    self.page.wait_for_timeout(self.ESPERA_REINTENTO_500_MS)
+                    self.page.reload(wait_until="domcontentloaded", timeout=self.timeout_navegacion_ms)
+                self._esperar_red()
+            except RubaAutomationError as e:
+                motivo = e.detalle
+                continue
+            except PlaywrightError as e:
+                motivo = f"{type(e).__name__}: {e}"
+                continue
+            error = detectar_error_servidor(self.page)
+            if error is not None:
+                motivo = f"error del servidor ({error})"
+                continue
+            if "/editar/" not in self.page.url:
+                return f"RUBA redirigió a {self.page.url}"  # borrado o sin permiso: recargar no cambia nada
+            try:
+                self.page.locator(selector_calle).first.wait_for(state="attached", timeout=self.timeout_ms)
+                return None
+            except PlaywrightError:
+                error = detectar_error_servidor(self.page)
+                motivo = (f"error del servidor ({error})" if error
+                          else f"el formulario de edición no cargó (título: '{_evaluar_titulo(self.page)}')")
+        return motivo
+
+    def _descartar_id_existente(self, motivo: str) -> None:
+        """El incidente viejo no responde: se olvida su ID (en memoria y, vía
+        `on_id_descartado`, en la base local) para crear uno nuevo."""
+        id_viejo = self.ruba_id_remoto
+        self.ruba_id_descartado = id_viejo
+        self.ruba_id_remoto = None
+        aviso = (f"El incidente anterior ({id_viejo}) no responde o fue eliminado en RUBA. "
+                 "Creando nuevo servicio desde cero...")
+        log.warning("RUBA: %s Motivo: %s", aviso, motivo)
+        self._capturar(PasoRuba.INICIALIZACION)  # diagnóstico de la pantalla que falló
+        if self.on_id_descartado:
+            try:
+                self.on_id_descartado(id_viejo)
+            except Exception:  # noqa: BLE001 - no poder limpiar la base no frena la creación
+                log.exception("RUBA: no se pudo limpiar el ID descartado %s en la base local", id_viejo)
+        indice = PASOS.index(PasoRuba.INICIALIZACION)
+        self._emitir(PasoRuba.INICIALIZACION, "aviso", int(100 * indice / len(PASOS)), aviso)
 
     def _cargar_general(self) -> None:
         datos = self.payload["editar_general"]
