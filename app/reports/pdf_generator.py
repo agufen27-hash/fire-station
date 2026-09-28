@@ -12,6 +12,10 @@ formateadores de fecha/hora/nombre de archivo de
 son exactamente la misma lógica que ya arma correctamente las Dotaciones,
 sus horarios propios (Fase 7) y su firma electrónica (Fase 8); no tiene
 sentido duplicarla acá.
+
+Tipografía unificada (app/reports/tipografia.py): Aptos 12 pt (o Segoe UI /
+Helvetica), texto a la izquierda y números / fechas / horas centrados. El
+pie lleva quién confeccionó la planilla (validado con PIN).
 """
 
 from __future__ import annotations
@@ -20,7 +24,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QMarginsF
-from PySide6.QtGui import QPageLayout, QPageSize, QTextDocument
+from PySide6.QtGui import QFont, QPageLayout, QPageSize, QTextDocument
 from PySide6.QtPrintSupport import QPrinter
 
 from app.db import get_session
@@ -32,16 +36,33 @@ from app.reports.excel_generator import (
     _formatear_hora,
     _limpiar_para_archivo,
     abrir_para_impresion,
+    texto_autor,
+    total_efectivos,
 )
+from app.reports.tipografia import TAMANO_PT, es_numerico, familia_css, fuente_planillas
 
 OUTPUT_DIR = get_writable_dir("output") / "informes"
 
 
 def _fila_tabla(etiqueta: str, valor) -> str:
+    """Rótulo a la izquierda; el valor a la izquierda si es texto y centrado
+    si es número, fecha u hora."""
     texto = str(valor) if valor not in (None, "") else "—"
+    alineacion = "center" if es_numerico(valor) else "left"
     return (
-        f"<tr><td style='padding:3px 10px;color:#64748b;width:35%;'>{etiqueta}</td>"
-        f"<td style='padding:3px 10px;'><b>{texto}</b></td></tr>"
+        f"<tr><td align='left' style='padding:3px 10px;color:#64748b;width:35%;'>{etiqueta}</td>"
+        f"<td align='{alineacion}' style='padding:3px 10px;'><b>{texto}</b></td></tr>"
+    )
+
+
+def _estilo_base() -> str:
+    familia = familia_css()
+    return (
+        "<style>"
+        f"body, p, div, td, span {{ font-family: {familia}; font-size: {TAMANO_PT}pt; text-align: left; }}"
+        f"h3 {{ font-family: {familia}; }}"
+        "td.num { text-align: center; }"
+        "</style>"
     )
 
 
@@ -49,6 +70,7 @@ def _construir_html(incidente: Incidente) -> str:
     dotaciones = _agrupar_dotaciones(incidente)
 
     partes = [
+        _estilo_base(),
         """
         <div style="text-align:center; border-bottom:3px solid #b91c1c; padding-bottom:10px; margin-bottom:16px;">
           <div style="font-size:32px;">🚒</div>
@@ -77,6 +99,11 @@ def _construir_html(incidente: Incidente) -> str:
     partes.append("</table>")
 
     partes.append("<h3>Dotaciones Intervinientes</h3>")
+    if dotaciones:
+        partes.append(
+            f"<p><b>Total Efectivos: {total_efectivos(dotaciones)}</b> "
+            f"&nbsp;·&nbsp; Dotaciones: {len(dotaciones)}</p>"
+        )
     if not dotaciones:
         partes.append("<p style='color:#64748b;'>No se registraron dotaciones despachadas.</p>")
     for i, d in enumerate(dotaciones, start=1):
@@ -84,10 +111,12 @@ def _construir_html(incidente: Incidente) -> str:
             "<div style='margin-bottom:10px; border:1px solid #e2e8f0; border-radius:6px; padding:8px 10px;'>"
         )
         partes.append(f"<b>Dotación {i} — Unidad {d.get('movil') or '—'}</b><br>")
+        horas = [_formatear_hora(d.get(k)) or "—" for k in ("hora_salida", "hora_arribo", "hora_regreso")]
         partes.append(
-            f"Salida: {_formatear_hora(d.get('hora_salida')) or '—'} &nbsp;&nbsp; "
-            f"Arribo a QTH: {_formatear_hora(d.get('hora_arribo')) or '—'} &nbsp;&nbsp; "
-            f"Regreso a Base: {_formatear_hora(d.get('hora_regreso')) or '—'}<br>"
+            "<table width='100%' cellspacing='0' cellpadding='2'><tr>"
+            + "".join(f"<td align='center' style='color:#64748b;'>{r}</td>"
+                      for r in ("Salida", "Arribo a QTH", "Regreso a Base"))
+            + "</tr><tr>" + "".join(f"<td align='center'><b>{h}</b></td>" for h in horas) + "</tr></table>"
         )
         partes.append(f"Jefe de Dotación: {d.get('a_cargo') or '—'} &nbsp;&nbsp; Chofer: {d.get('chofer') or '—'}<br>")
         if d.get("bomberos"):
@@ -139,9 +168,12 @@ def _construir_html(incidente: Incidente) -> str:
             f"(Jefe de Dotación {i})</span></div>"
         )
 
+    autor = texto_autor(incidente)
     partes.append(
-        "<p style='margin-top:24px; font-size:10px; color:#94a3b8;'>"
-        f"Informe generado automáticamente por Fire Station el {datetime.now().strftime('%d/%m/%Y %H:%M')}.</p>"
+        "<p style='margin-top:24px;'>"
+        + (f"{autor}<br>" if autor else "Confeccionó: — (sin autor validado con PIN)<br>")
+        + "<span style='font-size:10pt; color:#94a3b8;'>Informe generado automáticamente por Fire Station el "
+        f"{datetime.now().strftime('%d/%m/%Y %H:%M')}.</span></p>"
     )
 
     return "".join(partes)
@@ -164,6 +196,7 @@ def generar_informe_pdf(incidente_id: int) -> Path:
         ruta_salida = _ruta_salida_pdf(incidente)
 
     documento = QTextDocument()
+    documento.setDefaultFont(QFont(fuente_planillas(), TAMANO_PT))
     documento.setHtml(html)
 
     impresora = QPrinter(QPrinter.PrinterMode.HighResolution)

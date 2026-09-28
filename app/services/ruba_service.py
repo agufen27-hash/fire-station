@@ -75,6 +75,8 @@ def _ruba_id_guardado(incidente_id: int) -> Optional[str]:
     with get_session() as session:
         incidente = session.get(Incidente, incidente_id)
         ruba_id = (incidente.ruba_id_remoto or "").strip() if incidente else ""
+        if ruba_id == ID_REMOTO_MANUAL:  # marcador de carga manual, no un incidente de RUBA
+            return None
         return ruba_id or None
 
 
@@ -208,6 +210,48 @@ def _marcar_sincronizado(incidente_id: int, ruba_id_remoto: Optional[str]) -> No
         incidente.ruba_error_log = None
         incidente.ruba_sincronizado_en = ahora
         incidente.actualizado_en = ahora
+
+
+ID_REMOTO_MANUAL = "MANUAL"
+
+
+def marcar_sincronizado_manual(incidente_ids: List[int]) -> List[int]:
+    """"Ya cargado en RUBA manualmente": SINCRONIZADO sin pasar por la
+    automatización (el lote lo omite como cualquier parte cargado). Conserva
+    el ID remoto real si una corrida anterior lo había creado; si no, queda
+    "MANUAL". No toca los EN CURSO (hay que cerrarlos antes). Devuelve los
+    ids marcados."""
+    marcados: List[int] = []
+    ahora = datetime.now()
+    with get_session() as session:
+        for incidente_id in incidente_ids:
+            incidente = session.get(Incidente, incidente_id)
+            if incidente is None or incidente.en_curso or incidente.estado_ruba == EstadoRuba.SINCRONIZADO.value:
+                continue
+            incidente.estado_ruba = EstadoRuba.SINCRONIZADO.value
+            incidente.ruba_carga_manual = True
+            incidente.ruba_id_remoto = (incidente.ruba_id_remoto or "").strip() or ID_REMOTO_MANUAL
+            incidente.ruba_error_log = None
+            incidente.ruba_sincronizado_en = ahora
+            incidente.actualizado_en = ahora
+            marcados.append(incidente_id)
+    return marcados
+
+
+def desmarcar_sincronizado_manual(incidente_id: int) -> bool:
+    """Deshace un marcado manual (error del operador): vuelve a PENDIENTE y
+    olvida el ID "MANUAL". Los cargados por la automatización no se tocan."""
+    with get_session() as session:
+        incidente = session.get(Incidente, incidente_id)
+        if incidente is None or not incidente.ruba_carga_manual:
+            return False
+        incidente.estado_ruba = EstadoRuba.PENDIENTE.value
+        incidente.ruba_carga_manual = False
+        if incidente.ruba_id_remoto == ID_REMOTO_MANUAL:
+            incidente.ruba_id_remoto = None
+        incidente.ruba_sincronizado_en = None
+        incidente.actualizado_en = datetime.now()
+        return True
 
 
 def _marcar_error(incidente_id: int, mensaje: str) -> None:

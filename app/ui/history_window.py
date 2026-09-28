@@ -1,9 +1,15 @@
 """
-Historial de Salidas: lista todos los incidentes guardados, con filtros
-rápidos y acciones por fila (editar, eliminar, reimprimir planillas,
-reintentar la carga en RUBA, ver el log de error), también desde el menú
-contextual (clic derecho). Se embebe como página del dashboard en
-`main_window.py` ("📋 Historial de Salidas" en la sidebar).
+Estadísticas (antes "Historial de Salidas"): lista todos los incidentes
+guardados, con filtros rápidos (texto, estado RUBA, tipo, año), KPIs del
+conjunto filtrado (salidas, horas trabajadas y horas por móvil) y acciones
+por fila (editar, eliminar, reimprimir planillas, reintentar la carga en
+RUBA, ver el log de error), también desde el menú contextual (clic
+derecho). Se embebe como página del dashboard en `main_window.py`
+("📊 Estadísticas" en la sidebar).
+
+Marcado manual: uno o varios partes (tildados o seleccionados) se pueden
+marcar "✔ Ya cargado en RUBA manualmente" -- quedan SINCRONIZADOS sin pasar
+por la automatización. Es el único estado cargado que se puede deshacer.
 
 Carga a RUBA en lote: la primera columna es un checkbox por parte (con
 "Seleccionar todos") y "🚀 Cargar Seleccionados a RUBA (X)" pide a
@@ -21,7 +27,9 @@ crear: justamente hay que poder corregirlos y reintentar. Editar y eliminar los 
 
 from __future__ import annotations
 
-from typing import List, Optional, Set
+from collections import defaultdict
+from datetime import date, datetime, time, timedelta
+from typing import Dict, List, Optional, Set
 
 from PySide6.QtCore import QPoint, Qt, Signal
 from PySide6.QtGui import QColor
@@ -46,9 +54,10 @@ from PySide6.QtWidgets import (
 from sqlalchemy.orm import joinedload
 
 from app.db import get_session
-from app.models import DotacionSalida, EstadoRuba, Incidente, TipoIncidente
+from app.models import DotacionSalida, EstadoRuba, Incidente, SalidaUnidad, TipoIncidente
 from app.reports.excel_generator import generar_e_imprimir_pcd2, generar_e_imprimir_pcs, resumen_advertencias
 from app.reports.pdf_generator import generar_e_imprimir_informe_pdf
+from app.services.ruba_service import desmarcar_sincronizado_manual, marcar_sincronizado_manual
 from app.ui import theme
 
 
@@ -57,16 +66,42 @@ ESTADO_FILTRO_SINCRONIZADOS = "Sincronizados"
 ESTADO_FILTRO_PENDIENTES = "Pendientes / Error"
 
 TIPO_FILTRO_TODOS = "Todos"
+ANIO_FILTRO_TODOS = "Todos"
+
+# Una duración mayor es un dato mal cargado (fecha de regreso errónea): no suma.
+MAX_HORAS_SERVICIO = 72
 
 COL_SELECCION, COL_NUMERO_PARTE, COL_FECHA, COL_TIPO, COL_MOVIL, COL_DIRECCION, COL_ESTADO, COL_ACCIONES = range(8)
 ENCABEZADOS = ["", "N° Parte", "Fecha", "Tipo y Categoría", "Móvil Principal", "Dirección", "Estado RUBA", "Acciones"]
 
 TEXTO_BOTON_LOTE = "🚀 Cargar Seleccionados a RUBA ({})"
+TEXTO_MARCAR_MANUAL = "✔ Marcar como sincronizado manualmente"
 
 MOTIVO_PARTE_CERRADO = (
     "Parte cerrado: ya está cargado en RUBA (portal nacional), no se puede editar ni eliminar "
     "desde Fire Station. Las planillas e informes se pueden reimprimir."
 )
+
+
+def duracion_horas(fecha_ini: Optional[date], hora_ini: Optional[time],
+                   fecha_fin: Optional[date], hora_fin: Optional[time]) -> float:
+    """Horas entre salida y regreso. Sin fecha de regreso y con la hora de
+    regreso "menor" se asume que cruzó la medianoche. 0 si falta algún
+    horario o el resultado no es creíble (negativo o > MAX_HORAS_SERVICIO)."""
+    if hora_ini is None or hora_fin is None:
+        return 0.0
+    inicio_fecha = fecha_ini or fecha_fin or date.today()
+    fin_fecha = fecha_fin or inicio_fecha
+    delta = datetime.combine(fin_fecha, hora_fin) - datetime.combine(inicio_fecha, hora_ini)
+    if delta < timedelta(0) and fecha_fin is None:
+        delta += timedelta(days=1)
+    horas = delta.total_seconds() / 3600
+    return horas if 0 <= horas <= MAX_HORAS_SERVICIO else 0.0
+
+
+def formatear_horas(horas: float) -> str:
+    total_min = int(round(horas * 60))
+    return f"{total_min // 60} h {total_min % 60:02d} min"
 
 
 def permisos_servicio(estado_ruba: str) -> tuple:
@@ -86,6 +121,7 @@ class HistoryWindow(QWidget):
     continuar_solicitado = Signal(int)       # incidente_id de un servicio en curso
     editar_solicitado = Signal(int)          # incidente_id (cualquier estado)
     eliminar_solicitado = Signal(int)        # incidente_id (MainWindow confirma y borra)
+    estados_cambiados = Signal()             # marcado/desmarcado manual de RUBA (refrescar Inicio)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -151,6 +187,13 @@ class HistoryWindow(QWidget):
         self.combo_tipo_filtro.currentIndexChanged.connect(self.refrescar)
         fila.addWidget(self.combo_tipo_filtro)
 
+        fila.addWidget(QLabel("Año:"))
+        self.combo_anio = QComboBox(self)
+        self.combo_anio.addItem(ANIO_FILTRO_TODOS, None)
+        self.combo_anio.setToolTip("Filtra la tabla y los indicadores por año del servicio")
+        self.combo_anio.currentIndexChanged.connect(self.refrescar)
+        fila.addWidget(self.combo_anio)
+
         boton_actualizar = QPushButton("Actualizar", self)
         boton_actualizar.clicked.connect(self.refrescar)
         fila.addWidget(boton_actualizar)
@@ -165,6 +208,22 @@ class HistoryWindow(QWidget):
         self.check_todos.clicked.connect(self._seleccionar_todos)
         fila.addWidget(self.check_todos)
         fila.addStretch(1)
+
+        # KPIs del conjunto filtrado, a la izquierda de los botones de RUBA.
+        self.kpi_salidas = self._crear_kpi("Cantidad de servicios de la tabla (según los filtros y el año)")
+        self.kpi_horas = self._crear_kpi("Suma de la duración de cada servicio cerrado (salida → regreso)")
+        self.kpi_movil = self._crear_kpi("Horas de servicio por unidad / móvil")
+        for kpi in (self.kpi_salidas, self.kpi_horas, self.kpi_movil):
+            fila.addWidget(kpi)
+        fila.addSpacing(8)
+
+        self.boton_marcar_manual = QPushButton("✔ Marcar cargado manual", self)
+        self.boton_marcar_manual.setToolTip(
+            "Marca los partes tildados (o las filas seleccionadas) como ya cargados en RUBA a mano: "
+            "quedan sincronizados sin usar la automatización")
+        self.boton_marcar_manual.clicked.connect(self._marcar_manual_desde_boton)
+        fila.addWidget(self.boton_marcar_manual)
+
         self.boton_cargar_lote = QPushButton(TEXTO_BOTON_LOTE.format(0), self)
         self.boton_cargar_lote.setObjectName("botonPrimarioRojo")
         self.boton_cargar_lote.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -173,6 +232,13 @@ class HistoryWindow(QWidget):
         theme.aplicar_sombra(self.boton_cargar_lote, "rojo")
         fila.addWidget(self.boton_cargar_lote)
         return fila
+
+    def _crear_kpi(self, tooltip: str) -> QLabel:
+        kpi = QLabel("—", self)
+        kpi.setObjectName("chip")
+        kpi.setToolTip(tooltip)
+        theme.set_tono(kpi, "info")
+        return kpi
 
     def _cargar_tipos_filtro(self) -> None:
         self.combo_tipo_filtro.blockSignals(True)
@@ -189,6 +255,7 @@ class HistoryWindow(QWidget):
         texto = self.entry_busqueda.text().strip().lower()
         filtro_estado = self.combo_estado.currentText()
         filtro_tipo_id = self.combo_tipo_filtro.currentData()
+        filtro_anio = self.combo_anio.currentData()
 
         with get_session() as session:
             incidentes = (
@@ -198,18 +265,73 @@ class HistoryWindow(QWidget):
                     joinedload(Incidente.categoria),
                     joinedload(Incidente.dotacion).joinedload(DotacionSalida.movil),
                     joinedload(Incidente.dotacion).joinedload(DotacionSalida.personal),
+                    joinedload(Incidente.salidas_unidad).joinedload(SalidaUnidad.movil),
                 )
                 .order_by(Incidente.creado_en.desc(), Incidente.id.desc())
                 .all()
             )
+            self._actualizar_anios({inc.fecha.year for inc in incidentes if inc.fecha})
             filas = [
                 self._extraer_fila(inc)
                 for inc in incidentes
-                if self._incidente_coincide(inc, texto, filtro_estado, filtro_tipo_id)
+                if (filtro_anio is None or (inc.fecha and inc.fecha.year == filtro_anio))
+                and self._incidente_coincide(inc, texto, filtro_estado, filtro_tipo_id)
             ]
 
         self._poblar_tabla(filas)
+        self._actualizar_kpis(filas, filtro_anio)
         self.label_estado.setText(f"{len(filas)} siniestro(s) encontrados.")
+
+    def _actualizar_anios(self, anios: Set[int]) -> None:
+        """Años con partes, del más nuevo al más viejo (conserva la elección)."""
+        actuales = {self.combo_anio.itemData(i) for i in range(1, self.combo_anio.count())}
+        if actuales == anios:
+            return
+        elegido = self.combo_anio.currentData()
+        self.combo_anio.blockSignals(True)
+        self.combo_anio.clear()
+        self.combo_anio.addItem(ANIO_FILTRO_TODOS, None)
+        for anio in sorted(anios, reverse=True):
+            self.combo_anio.addItem(str(anio), anio)
+        self.combo_anio.setCurrentIndex(max(0, self.combo_anio.findData(elegido)))
+        self.combo_anio.blockSignals(False)
+
+    def _actualizar_kpis(self, filas: List[dict], anio: Optional[int]) -> None:
+        sufijo = f" {anio}" if anio else ""
+        self.kpi_salidas.setText(f"🚒 Salidas{sufijo}: {len(filas)}")
+        total = sum(f["horas"] for f in filas)
+        por_movil: Dict[str, float] = defaultdict(float)
+        for f in filas:
+            for movil, horas in f["horas_por_movil"].items():
+                por_movil[movil] += horas
+        self.kpi_horas.setText(f"⏱ Horas{sufijo}: {formatear_horas(total)}")
+        ranking = sorted(por_movil.items(), key=lambda kv: kv[1], reverse=True)
+        detalle = "\n".join(f"{movil}: {formatear_horas(horas)}" for movil, horas in ranking)
+        self.kpi_horas.setToolTip("Suma de la duración de cada servicio cerrado (salida → regreso)"
+                                  + (f"\n\nPor unidad:\n{detalle}" if detalle else ""))
+        if ranking:
+            movil, horas = ranking[0]
+            self.kpi_movil.setText(f"🚐 {movil}: {formatear_horas(horas)}")
+            self.kpi_movil.setToolTip("Unidad con más horas de servicio. Todas:\n" + detalle)
+        else:
+            self.kpi_movil.setText("🚐 Sin horas por unidad")
+            self.kpi_movil.setToolTip("Todavía no hay servicios cerrados con horario de salida y regreso.")
+
+    @staticmethod
+    def _horas_incidente(inc: Incidente) -> tuple:
+        """(horas del servicio, {móvil: horas}). Los EN CURSO no suman."""
+        if inc.en_curso:
+            return 0.0, {}
+        total = duracion_horas(inc.fecha_salida or inc.fecha, inc.hora_salida, inc.fecha_llegada, inc.hora_regreso)
+        por_movil: Dict[str, float] = defaultdict(float)
+        for su in inc.salidas_unidad:
+            nombre = su.movil.nombre_identificador if su.movil else "Sin unidad"
+            horas = duracion_horas(su.fecha_salida or inc.fecha_salida or inc.fecha, su.hora_salida or inc.hora_salida,
+                                   su.fecha_llegada or inc.fecha_llegada, su.hora_regreso or inc.hora_regreso)
+            por_movil[nombre] += horas
+        if not total and por_movil:  # sin horario general: el de la unidad más larga
+            total = max(por_movil.values())
+        return total, dict(por_movil)
 
     @staticmethod
     def _incidente_coincide(inc: Incidente, texto: str, filtro_estado: str, filtro_tipo_id) -> bool:
@@ -231,8 +353,9 @@ class HistoryWindow(QWidget):
 
         return True
 
-    @staticmethod
-    def _extraer_fila(inc: Incidente) -> dict:
+    @classmethod
+    def _extraer_fila(cls, inc: Incidente) -> dict:
+        horas, horas_por_movil = cls._horas_incidente(inc)
         tipo_categoria = "—"
         if inc.tipo:
             tipo_categoria = inc.tipo.nombre
@@ -255,6 +378,9 @@ class HistoryWindow(QWidget):
             "ruba_id_remoto": inc.ruba_id_remoto,
             "ruba_sincronizado_en": inc.ruba_sincronizado_en,
             "en_curso": inc.en_curso,
+            "carga_manual": bool(inc.ruba_carga_manual),
+            "horas": horas,
+            "horas_por_movil": horas_por_movil,
         }
 
     @staticmethod
@@ -285,7 +411,10 @@ class HistoryWindow(QWidget):
                 item_estado.setForeground(QColor(theme.color("rojo_hover")))
                 item_estado.setToolTip("Cerralo (con los horarios de regreso) para poder cargarlo en RUBA")
             else:
-                item_estado = QTableWidgetItem(self._texto_estado(datos["estado_ruba"]))
+                texto = self._texto_estado(datos["estado_ruba"])
+                if datos["carga_manual"]:
+                    texto += " (manual)"
+                item_estado = QTableWidgetItem(texto)
                 item_estado.setForeground(self._color_estado(datos["estado_ruba"]))
                 item_estado.setToolTip(self._tooltip_estado(datos))
             self.tabla.setItem(fila_idx, COL_ESTADO, item_estado)
@@ -351,6 +480,7 @@ class HistoryWindow(QWidget):
         return sorted(self._seleccionados)
 
     def set_carga_en_curso(self, en_curso: bool) -> None:
+        self.boton_marcar_manual.setEnabled(not en_curso)
         """MainWindow: mientras corre un lote no se puede lanzar otro."""
         self._carga_en_curso = en_curso
         self.boton_cargar_lote.setToolTip(
@@ -391,6 +521,9 @@ class HistoryWindow(QWidget):
         estado = datos["estado_ruba"]
         if estado == EstadoRuba.SINCRONIZADO.value:
             cuando = datos.get("ruba_sincronizado_en")
+            if datos.get("carga_manual"):
+                return ("Marcado a mano como cargado en RUBA" + (f" el {cuando:%d/%m/%Y %H:%M}" if cuando else "")
+                        + ". Clic derecho: deshacer el marcado.")
             return ("Cargado en RUBA" + (f" el {cuando:%d/%m/%Y %H:%M}" if cuando else "")
                     + (f" (ID {datos['ruba_id_remoto']})" if datos.get("ruba_id_remoto") else "")
                     + ". Parte cerrado: no se edita ni se elimina.")
@@ -472,10 +605,22 @@ class HistoryWindow(QWidget):
         datos = self._datos_de_fila(indice.row()) if indice.isValid() else None
         if not datos:
             return
-        self.tabla.selectRow(indice.row())
+        if not self.tabla.selectionModel().isRowSelected(indice.row(), indice.parent()):
+            self.tabla.selectRow(indice.row())  # clic derecho fuera de la selección: solo esa fila
         puede_editar, puede_eliminar, motivo = permisos_servicio(datos["estado_ruba"])
 
         menu = QMenu(self.tabla)
+        marcables = [d for d in self._datos_seleccionados() if self.seleccionable(d)]
+        texto_marcar = TEXTO_MARCAR_MANUAL + (f" ({len(marcables)})" if len(marcables) > 1 else "")
+        accion_marcar = menu.addAction(texto_marcar)
+        accion_marcar.setEnabled(bool(marcables) and not self._carga_en_curso)
+        accion_marcar.setToolTip("Ya lo cargaste a mano en RUBA: queda sincronizado y no se envía a la automatización")
+        accion_marcar.triggered.connect(lambda: self._marcar_manual([d["id"] for d in marcables]))
+        if datos["carga_manual"]:
+            accion_desmarcar = menu.addAction("↩ Deshacer marcado manual (volver a Pendiente)")
+            accion_desmarcar.triggered.connect(lambda: self._desmarcar_manual(datos))
+        menu.addSeparator()
+
         if datos["en_curso"]:
             accion_editar = menu.addAction("✏️ Continuar servicio en curso")
             accion_editar.triggered.connect(lambda: self.continuar_solicitado.emit(datos["id"]))
@@ -495,6 +640,53 @@ class HistoryWindow(QWidget):
         accion_eliminar.triggered.connect(lambda: self.eliminar_solicitado.emit(datos["id"]))
         menu.setToolTipsVisible(True)
         menu.exec(self.tabla.viewport().mapToGlobal(posicion))
+
+    def _datos_seleccionados(self) -> List[dict]:
+        filas = sorted({i.row() for i in self.tabla.selectionModel().selectedRows()})
+        return [d for d in (self._datos_de_fila(f) for f in filas) if d]
+
+    # -- Marcado manual de RUBA -------------------------------------------------
+
+    def _marcar_manual_desde_boton(self) -> None:
+        """Los tildados; si no hay ninguno, las filas seleccionadas."""
+        ids = list(self._seleccionados) or [d["id"] for d in self._datos_seleccionados() if self.seleccionable(d)]
+        if not ids:
+            QMessageBox.information(
+                self, "Nada para marcar",
+                "Tildá (o seleccioná) los partes pendientes que ya cargaste a mano en RUBA.")
+            return
+        self._marcar_manual(ids)
+
+    def _marcar_manual(self, ids: List[int]) -> None:
+        if self._carga_en_curso:
+            QMessageBox.information(self, "Carga en RUBA en curso", "Esperá a que termine la carga en RUBA.")
+            return
+        if not ids:
+            return
+        respuesta = QMessageBox.question(
+            self, "Marcar como cargado en RUBA",
+            f"¿Marcar {len(ids)} parte(s) como YA CARGADOS en RUBA manualmente?\n\n"
+            "Quedan sincronizados (cerrados: no se editan ni se eliminan) y la carga automática los omite. "
+            "Se puede deshacer desde el menú del clic derecho.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No,
+        )
+        if respuesta != QMessageBox.StandardButton.Yes:
+            return
+        marcados = marcar_sincronizado_manual(ids)
+        self._seleccionados -= set(marcados)
+        self.refrescar()
+        self.estados_cambiados.emit()
+        self.label_estado.setText(f"{len(marcados)} parte(s) marcados como cargados en RUBA manualmente.")
+
+    def _desmarcar_manual(self, datos: dict) -> None:
+        respuesta = QMessageBox.question(
+            self, "Deshacer marcado manual",
+            f"¿Volver el parte N° {datos['numero_parte']} a PENDIENTE de carga en RUBA?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No,
+        )
+        if respuesta == QMessageBox.StandardButton.Yes and desmarcar_sincronizado_manual(datos["id"]):
+            self.refrescar()
+            self.estados_cambiados.emit()
 
     def _on_doble_clic(self, indice) -> None:
         datos = self._datos_de_fila(indice.row())

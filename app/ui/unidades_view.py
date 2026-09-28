@@ -49,12 +49,15 @@ class PanelUnidades(QGroupBox):
     # Tras importar / eliminar / dar de baja: MainWindow refresca los combos
     # de móviles del formulario de parte.
     unidades_cambiadas = Signal()
+    # Tras cada recarga de la tabla (MainWindow reaplica el filtro de búsqueda).
+    recargada = Signal()
 
     def __init__(self, crear_acciones: Callable[[int, bool], QWidget], parent: Optional[QWidget] = None) -> None:
         """`crear_acciones(movil_id, activo)` arma los botones de la fila
         (Editar / Dar de baja / Eliminar) que ya define MainWindow."""
-        super().__init__("Unidades", parent)
+        super().__init__("Unidades / Móviles", parent)
         self._crear_acciones = crear_acciones
+        self.col_acciones = COL_ACCIONES
 
         layout = QVBoxLayout(self)
         fila = QHBoxLayout()
@@ -105,6 +108,7 @@ class PanelUnidades(QGroupBox):
             self.tabla.setItem(i, 4, item_estado)
             self.tabla.setCellWidget(i, COL_ACCIONES, self._crear_acciones(movil_id, activo))
         self.tabla.resizeRowsToContents()
+        self.recargada.emit()
 
     # -- Importación ------------------------------------------------------------
 

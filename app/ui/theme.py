@@ -247,6 +247,22 @@ QPushButton#navButton:checked {{
     font-weight: 700;
 }}
 
+/* Selector de vista (Personal | Unidades / Móviles): pestañas tipo toggle. */
+QPushButton#toggleVista {{
+    background-color: {p.superficie};
+    color: {p.texto_secundario};
+    border: 1px solid {p.borde};
+    border-radius: 0px;
+    padding: 8px 18px;
+}}
+QPushButton#toggleVista:hover {{ color: {p.texto}; border-color: {p.borde_fuerte}; }}
+QPushButton#toggleVista:checked {{
+    background-color: {_rgba(p.rojo, 0.14)};
+    border: 1px solid {p.rojo};
+    color: {p.texto};
+    font-weight: 700;
+}}
+
 /* ===== Barra superior (sección activa + estado) ========================= */
 QFrame#barraInstitucional {{
     background-color: {p.barra};

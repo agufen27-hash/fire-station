@@ -21,6 +21,14 @@ PCD2 Página S6 · Total páginas V6 · N° parte C6. Dos dotaciones por página
      Inferior: Dot A32 · Unidad C32 · Salida I32/L32 · Arribo O32 · Llegada R32/U32 ·
                Jefe B34 · Grado O34 · Chofer E37 · Embarcados E38:E47 · Firma P49
 
+TIPOGRAFÍA (app/reports/tipografia.py): todo dato escrito va en Aptos 12 pt
+(o Segoe UI / Helvetica si Aptos no está instalada); texto a la izquierda y
+números / fechas / horas centrados.
+
+PIE Y ENCABEZADO DE PÁGINA: el pie izquierdo lleva quién confeccionó la
+planilla (validado con PIN al guardarla) y la PCD2 lleva en el encabezado
+"Total Efectivos: X" (personas distintas en todas las dotaciones).
+
 VERIFICACIÓN DE PLANTILLA: antes de escribir cada dato se comprueba que la
 celda destino sea escribible en la plantilla en uso. Si cae dentro de un
 rango combinado (no es su celda ancla) o ya trae un rótulo impreso, NO se
@@ -51,6 +59,7 @@ from openpyxl.worksheet.worksheet import Worksheet
 from app.db import get_session
 from app.models import MEDIOS_CONTACTO, FuncionBase, Incidente, RolDotacion
 from app.paths import get_resource_path, get_writable_dir
+from app.reports.tipografia import TAMANO_PT, es_numerico, fuente_planillas
 
 # Las plantillas son de solo lectura (viajan embebidas en el bundle); las
 # planillas completadas son escribibles y viven al lado del .exe.
@@ -131,7 +140,7 @@ class EscritorVerificado:
             return False
         celda = self.hoja[coordenada]
         celda.value = valor
-        _ajustar_formato(celda)
+        _ajustar_formato(celda, valor)
         return True
 
     def escribir_lista(self, coordenadas: List[str], valores: List[str], campo: str) -> None:
@@ -152,18 +161,23 @@ def _mismo_color(a, b) -> bool:
     return a.type == "rgb" and a.rgb == b.rgb
 
 
-def _ajustar_formato(celda) -> None:
-    """Solo en la planilla generada (la plantilla no se toca): el dato nunca
-    queda invisible (letra del mismo color que el relleno) ni cortado (si no
-    entra en la celda, Excel achica la letra en vez de recortarla)."""
+def _ajustar_formato(celda, valor: Any = None) -> None:
+    """Solo en la planilla generada (la plantilla no se toca): tipografía
+    unificada (Aptos 12 pt; números/fechas/horas centrados, texto a la
+    izquierda), y el dato nunca queda invisible (letra del mismo color que
+    el relleno) ni cortado (si no entra en la celda, Excel achica la letra
+    en vez de recortarla; los textos largos que ya ajustaban siguen igual)."""
+    fuente = copy(celda.font)
+    fuente.name = fuente_planillas()
+    fuente.sz = TAMANO_PT
     if celda.fill.fill_type == "solid" and _mismo_color(celda.font.color, celda.fill.fgColor):
-        fuente = copy(celda.font)
         fuente.color = Color(rgb="FF000000")
-        celda.font = fuente
+    celda.font = fuente
     a = celda.alignment
-    if not a.wrap_text and not a.shrink_to_fit:
-        celda.alignment = Alignment(horizontal=a.horizontal, vertical=a.vertical, indent=a.indent,
-                                    text_rotation=a.text_rotation, shrink_to_fit=True)
+    horizontal = "center" if es_numerico(valor if valor is not None else celda.value) else "left"
+    celda.alignment = Alignment(horizontal=horizontal, vertical=a.vertical or "center", indent=a.indent,
+                                text_rotation=a.text_rotation, wrap_text=a.wrap_text,
+                                shrink_to_fit=not a.wrap_text)
 
 
 ANCHO_MAX_FIRMA_PX = 200
@@ -276,6 +290,32 @@ def _agrupar_dotaciones(incidente: Incidente) -> List[Dict[str, Any]]:
     return dotaciones
 
 
+def total_efectivos(dotaciones: List[Dict[str, Any]]) -> int:
+    """Personas distintas en todas las dotaciones (Jefe, chofer y embarcados)."""
+    personas = set()
+    for d in dotaciones:
+        personas.update(x for x in (d.get("a_cargo"), d.get("chofer"), *d.get("bomberos", [])) if x)
+    return len(personas)
+
+
+def texto_autor(incidente: Incidente) -> Optional[str]:
+    """"Confeccionó: PÉREZ, Juan (validado con PIN) el 12/03/2026 08:45"."""
+    if incidente.confecciono is None:
+        return None
+    cuando = f" el {incidente.confeccionado_en:%d/%m/%Y %H:%M}" if incidente.confeccionado_en else ""
+    return f"Confeccionó: {incidente.confecciono.nombre_completo()} (validado con PIN){cuando}"
+
+
+def _pie_y_encabezado(wb, autor: Optional[str], encabezado: Optional[str] = None) -> None:
+    """Pie izquierdo = autor; encabezado derecho = resumen (en todas las hojas)."""
+    for hoja in wb.worksheets:
+        for item, texto in ((hoja.oddFooter.left, autor), (hoja.oddHeader.right, encabezado)):
+            if texto:
+                item.text = texto.replace("&", "&&")  # & es código de formato en Excel
+                item.font = f"{fuente_planillas()},Regular"
+                item.size = TAMANO_PT
+
+
 def _una_hoja_por_pagina(wb) -> None:
     """Cada hoja del libro se imprime en UNA hoja A4 (la plantilla a escala
     100% no entra y Excel la partía en dos páginas del PDF)."""
@@ -359,6 +399,7 @@ def _completar_pcs(incidente: Incidente) -> ResultadoPlanilla:
     e.escribir_lista(m["reserva"], reserva, "Personal de reserva")
 
     ruta = _ruta_salida(incidente, "PCS")
+    _pie_y_encabezado(wb, texto_autor(incidente))
     _una_hoja_por_pagina(wb)
     wb.save(ruta)
     return ResultadoPlanilla(ruta, _sin_repetir(e.advertencias))
@@ -428,6 +469,7 @@ def _completar_pcd2(incidente: Incidente) -> ResultadoPlanilla:
         advertencias.extend(e.advertencias)
 
     ruta = _ruta_salida(incidente, "PCD2")
+    _pie_y_encabezado(wb, texto_autor(incidente), f"Total Efectivos: {total_efectivos(dotaciones)}")
     _una_hoja_por_pagina(wb)
     wb.save(ruta)
     return ResultadoPlanilla(ruta, _sin_repetir(advertencias))

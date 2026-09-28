@@ -275,6 +275,12 @@ class Incidente(Base):
     # Cuándo quedó cargado en RUBA (estado_ruba = SINCRONIZADO). Desde ese
     # momento el parte está cerrado: no se edita ni se elimina localmente.
     ruba_sincronizado_en: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # Marcado a mano como "ya cargado en RUBA" desde Estadísticas (se cargó en
+    # el portal sin la automatización). Es el único SINCRONIZADO reversible.
+    ruba_carga_manual: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Quién confeccionó / cerró la planilla (validado con su PIN) y cuándo.
+    confecciono_personal_id: Mapped[Optional[int]] = mapped_column(ForeignKey("personal.id"), nullable=True)
+    confeccionado_en: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     # "📍 Marcar en Mapa": PNG del área centrada en el punto (data/mapas/parte_<N>_<AÑO>.png).
     ruta_imagen_mapa: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
@@ -287,6 +293,7 @@ class Incidente(Base):
     categoria: Mapped[Optional["CategoriaIncidente"]] = relationship()
     recibio: Mapped[Optional["Personal"]] = relationship(foreign_keys=[recibio_personal_id])
     autorizo: Mapped[Optional["Personal"]] = relationship(foreign_keys=[autorizo_personal_id])
+    confecciono: Mapped[Optional["Personal"]] = relationship(foreign_keys=[confecciono_personal_id])
     dotacion: Mapped[List["DotacionSalida"]] = relationship(
         back_populates="incidente", cascade="all, delete-orphan"
     )

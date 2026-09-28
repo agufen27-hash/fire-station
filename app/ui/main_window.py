@@ -56,7 +56,7 @@ from sqlalchemy.exc import IntegrityError
 from app.core.catalogos import obtener_padron
 from app import __version__
 from app.paths import ICONO_APP, LOGO_INSTITUCIONAL, ruta_recurso_existente
-from app.db import DATA_DIR, get_session, moviles_para_despacho, siguiente_numero_parte
+from app.db import DATA_DIR, get_session, moviles_para_despacho, reiniciar_partes, siguiente_numero_parte
 from app.models import (
     MEDIOS_CONTACTO,
     MEDIOS_TELEFONICOS,
@@ -96,6 +96,7 @@ from app.services.ruba_payload import (
 from app.services.ruba_helpers import cargar_credenciales
 from app.services.ruba_service import RubaLoteWorker, lanzar_lote
 from app.ui.history_window import MOTIVO_PARTE_CERRADO, HistoryWindow
+from app.ui.autor_dialog import pedir_autor
 from app.services import cartografia
 from app.ui.widgets.map_widget import MapWidget, OperationsMapWindow
 from app.ui.damnificados_widgets import PanelDamnificados
@@ -137,18 +138,34 @@ IDX_CONFIGURACION = 6
 
 ITEMS_NAV = [
     (IDX_DASHBOARD, "📊  Inicio"),
-    (IDX_FORMULARIO, "🚨  Nueva Salida"),
-    (IDX_HISTORIAL, "📋  Historial de Salidas"),
+    (IDX_FORMULARIO, "📝  Nueva Planilla"),
+    (IDX_HISTORIAL, "📈  Estadísticas"),
     (IDX_MAPA, "🗺️  Cartografía Táctica"),
     (IDX_DOTACIONES, "🚒  Personal y Unidades"),
     (IDX_DOCUMENTACION, "📁  Documentación"),
     (IDX_CONFIGURACION, "⚙️  Configuración"),
 ]
 
+COLUMNAS_PERSONAL = ["Nombre", "Legajo", "DNI", "Jerarquía", "Estado", "Acciones"]
+COL_PERSONAL_ACCIONES = len(COLUMNAS_PERSONAL) - 1
+
+
+def filtrar_tabla(tabla: QTableWidget, texto: str, col_excluida: int = -1) -> None:
+    """Oculta las filas que no contienen TODAS las palabras buscadas en alguna
+    de sus celdas de texto (sin distinguir mayúsculas; DNI con o sin puntos)."""
+    palabras = [p for p in texto.lower().replace(".", "").split() if p]
+    for fila in range(tabla.rowCount()):
+        contenido = " ".join(
+            (tabla.item(fila, c).text() if tabla.item(fila, c) else "")
+            for c in range(tabla.columnCount()) if c != col_excluida
+        ).lower().replace(".", "")
+        tabla.setRowHidden(fila, not all(p in contenido for p in palabras))
+
+
 NOMBRES_SECCION = {
     IDX_DASHBOARD: "INICIO",
-    IDX_FORMULARIO: "NUEVA SALIDA",
-    IDX_HISTORIAL: "HISTORIAL DE SALIDAS",
+    IDX_FORMULARIO: "NUEVA PLANILLA",
+    IDX_HISTORIAL: "ESTADÍSTICAS",
     IDX_MAPA: "CARTOGRAFÍA TÁCTICA",
     IDX_DOTACIONES: "PERSONAL Y UNIDADES",
     IDX_DOCUMENTACION: "DOCUMENTACIÓN",
@@ -255,6 +272,7 @@ class MainWindow(QMainWindow):
         self._pagina_historial.continuar_solicitado.connect(self.continuar_servicio_en_curso)
         self._pagina_historial.editar_solicitado.connect(self.editar_servicio)
         self._pagina_historial.eliminar_solicitado.connect(self.eliminar_servicio)
+        self._pagina_historial.estados_cambiados.connect(self._actualizar_dashboard)
         self._pagina_mapa = OperationsMapWindow(self)
         self._pagina_dotaciones = self._crear_pagina_dotaciones()
         self._pagina_documentacion = self._crear_pagina_documentacion()
@@ -1052,7 +1070,7 @@ class MainWindow(QMainWindow):
         self.boton_guardar_local.setObjectName("botonPrimarioAzul")
         self.boton_guardar_local.setToolTip(
             "Guarda en la base local (queda PENDIENTE de RUBA) y abre las planillas PCS/PCD2. "
-            "La carga en RUBA se hace desde el Historial de Salidas (🚀 Cargar Seleccionados a RUBA)."
+            "La carga en RUBA se hace desde Estadísticas (🚀 Cargar Seleccionados a RUBA)."
         )
         self.boton_guardar_local.clicked.connect(self._guardar_y_generar_planillas)
 
@@ -1185,6 +1203,15 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Revisá el formulario", "\n".join(f"• {e}" for e in errores))
             return None
 
+        # Finalizar la planilla exige confirmar la autoría con el PIN del
+        # responsable (los borradores EN CURSO no: se guardan en plena salida).
+        autor_id = None
+        if not en_curso:
+            autor_id = pedir_autor(self.label_numero_parte.text(), self._autor_sugerido(), self)
+            if autor_id is None:
+                self.statusBar().showMessage("Guardado cancelado: falta confirmar la autoría con PIN.", 8000)
+                return None
+
         zona = "Urbana" if self.radio_urbana.isChecked() else "Rural"
         datos_especificos = self._datos_especificos()
         horario = self._horario_general()
@@ -1226,6 +1253,8 @@ class MainWindow(QMainWindow):
                 **self.mapa.obtener_datos(),
                 ruta_imagen_mapa=getattr(self, "_ruta_imagen_mapa", None),
             )
+            if autor_id is not None:
+                campos.update(confecciono_personal_id=autor_id, confeccionado_en=datetime.now())
             incidente = session.get(Incidente, self._incidente_en_edicion) if self._incidente_en_edicion else None
             if self._incidente_en_edicion is not None and incidente is None:
                 QMessageBox.warning(
@@ -1265,6 +1294,15 @@ class MainWindow(QMainWindow):
             numero_parte = incidente.numero_parte
 
         return incidente_id, numero_parte
+
+    def _autor_sugerido(self) -> Optional[int]:
+        """Operador 1 de la guardia (id local), para preseleccionarlo en el PIN."""
+        id_ruba = self.panel_base.datos().get("operador_1")
+        if id_ruba is None:
+            return None
+        with get_session() as session:
+            persona = session.query(Personal).filter(Personal.id_ruba == id_ruba).first()
+            return persona.id if persona else None
 
     def _moviles_inexistentes(self) -> List[str]:
         """Dotaciones cuyo móvil ya no está en la base (eliminado mientras el
@@ -1469,7 +1507,7 @@ class MainWindow(QMainWindow):
         if problemas:
             resumen += "\n\nProblemas al generar planillas:\n" + "\n".join(problemas)
 
-        resumen += ("\n\nQuedó PENDIENTE de carga en RUBA: cargalo desde el Historial de Salidas "
+        resumen += ("\n\nQuedó PENDIENTE de carga en RUBA: cargalo desde Estadísticas "
                     "(🚀 Cargar Seleccionados a RUBA).")
         (QMessageBox.warning if problemas else QMessageBox.information)(self, "Siniestro guardado", resumen)
 
@@ -1926,30 +1964,63 @@ class MainWindow(QMainWindow):
         fila_botones.addWidget(boton_importar_padron)
         layout.addLayout(fila_botones)
 
-        contenido = QHBoxLayout()
-        contenido.setSpacing(16)
+        # Una tabla a la vez, a todo el ancho (antes iban lado a lado y se
+        # cortaban las columnas): selector "Personal | Unidades / Móviles".
+        fila_selector = QHBoxLayout()
+        fila_selector.setSpacing(0)
+        self._grupo_vista_dotaciones = QButtonGroup(pagina)
+        self._grupo_vista_dotaciones.setExclusive(True)
+        for indice, texto in enumerate(("👥  Personal", "🚒  Unidades / Móviles")):
+            boton = QPushButton(texto, pagina)
+            boton.setCheckable(True)
+            boton.setObjectName("toggleVista")
+            boton.setCursor(Qt.CursorShape.PointingHandCursor)
+            boton.setMinimumWidth(190)
+            self._grupo_vista_dotaciones.addButton(boton, indice)
+            fila_selector.addWidget(boton)
+        fila_selector.addSpacing(16)
+        self._entry_buscar_dotaciones = QLineEdit(pagina)
+        self._entry_buscar_dotaciones.setPlaceholderText("Buscar por nombre, legajo, DNI o móvil...")
+        self._entry_buscar_dotaciones.setClearButtonEnabled(True)
+        self._entry_buscar_dotaciones.textChanged.connect(self._filtrar_dotaciones)
+        fila_selector.addWidget(self._entry_buscar_dotaciones, 1)
+        layout.addLayout(fila_selector)
 
-        # Tabla de unidades + importador del 'Reporte de vehiculos' (app/ui/unidades_view.py).
-        self._panel_unidades = PanelUnidades(self._acciones_movil, pagina)
-        self._panel_unidades.unidades_cambiadas.connect(self._refrescar_moviles_despacho)
-        caja_moviles = self._panel_unidades
+        self._stack_dotaciones = QStackedWidget(pagina)
 
         caja_personal = QGroupBox("Personal")
         layout_personal = QVBoxLayout(caja_personal)
         self._tabla_personal_dotacion = QTableWidget(caja_personal)
-        self._tabla_personal_dotacion.setColumnCount(4)
-        self._tabla_personal_dotacion.setHorizontalHeaderLabels(["Nombre", "Jerarquía", "Estado", "Acciones"])
+        self._tabla_personal_dotacion.setColumnCount(len(COLUMNAS_PERSONAL))
+        self._tabla_personal_dotacion.setHorizontalHeaderLabels(COLUMNAS_PERSONAL)
         self._tabla_personal_dotacion.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._tabla_personal_dotacion.verticalHeader().setVisible(False)
-        self._tabla_personal_dotacion.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self._tabla_personal_dotacion.setColumnWidth(3, 270)
+        cabecera = self._tabla_personal_dotacion.horizontalHeader()
+        cabecera.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        cabecera.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        cabecera.setSectionResizeMode(COL_PERSONAL_ACCIONES, QHeaderView.ResizeMode.Fixed)
+        self._tabla_personal_dotacion.setColumnWidth(COL_PERSONAL_ACCIONES, 270)
         theme.estilizar_tabla(self._tabla_personal_dotacion)
         layout_personal.addWidget(self._tabla_personal_dotacion)
+        self._stack_dotaciones.addWidget(caja_personal)
 
-        contenido.addWidget(caja_moviles, 1)
-        contenido.addWidget(caja_personal, 1)
-        layout.addLayout(contenido)
+        # Tabla de unidades + importador del 'Reporte de vehiculos' (app/ui/unidades_view.py).
+        self._panel_unidades = PanelUnidades(self._acciones_movil, pagina)
+        self._panel_unidades.unidades_cambiadas.connect(self._refrescar_moviles_despacho)
+        self._panel_unidades.recargada.connect(self._filtrar_dotaciones)
+        self._stack_dotaciones.addWidget(self._panel_unidades)
+
+        self._grupo_vista_dotaciones.idClicked.connect(self._stack_dotaciones.setCurrentIndex)
+        self._grupo_vista_dotaciones.button(0).setChecked(True)
+        layout.addWidget(self._stack_dotaciones, 1)
         return pagina
+
+    def _filtrar_dotaciones(self, *_args) -> None:
+        """Filtro en tiempo real sobre las dos tablas (la visible y la otra,
+        así al cambiar de vista el filtro ya está aplicado)."""
+        texto = self._entry_buscar_dotaciones.text()
+        filtrar_tabla(self._tabla_personal_dotacion, texto, COL_PERSONAL_ACCIONES)
+        filtrar_tabla(self._panel_unidades.tabla, texto, self._panel_unidades.col_acciones)
 
     def _crear_widget_acciones_tabla(self, etiqueta_editar: str, fn_editar, etiqueta_estado: str, fn_estado,
                                      fn_eliminar=None) -> QWidget:
@@ -1975,23 +2046,29 @@ class MainWindow(QMainWindow):
         self._refrescar_moviles_despacho()
         with get_session() as session:
             personal = session.query(Personal).order_by(Personal.apellido, Personal.nombre).all()
-            datos_personal = [(p.id, p.nombre_completo(), p.jerarquia or "—", p.activo) for p in personal]
+            datos_personal = [(p.id, p.nombre_completo(), p.legajo or "—", p.dni or "—", p.jerarquia or "—",
+                               p.activo) for p in personal]
 
         self._tabla_personal_dotacion.setRowCount(len(datos_personal))
-        for fila, (personal_id, nombre, jerarquia, activo) in enumerate(datos_personal):
+        for fila, (personal_id, nombre, legajo, dni, jerarquia, activo) in enumerate(datos_personal):
             self._tabla_personal_dotacion.setItem(fila, 0, QTableWidgetItem(nombre))
-            self._tabla_personal_dotacion.setItem(fila, 1, QTableWidgetItem(jerarquia))
+            for columna, valor in ((1, legajo), (2, dni)):
+                item = QTableWidgetItem(valor)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self._tabla_personal_dotacion.setItem(fila, columna, item)
+            self._tabla_personal_dotacion.setItem(fila, 3, QTableWidgetItem(jerarquia))
             item_estado = QTableWidgetItem("Activo" if activo else "Inactivo")
             item_estado.setForeground(QColor(theme.color("verde_texto" if activo else "ambar")))
-            self._tabla_personal_dotacion.setItem(fila, 2, item_estado)
+            self._tabla_personal_dotacion.setItem(fila, 4, item_estado)
             widget = self._crear_widget_acciones_tabla(
                 "Editar", lambda _=False, pid=personal_id: self._dialogo_bombero(pid),
                 "Dar de baja" if activo else "Reactivar",
                 lambda _=False, pid=personal_id: self._alternar_personal(pid),
                 lambda _=False, pid=personal_id: self._eliminar_personal(pid),
             )
-            self._tabla_personal_dotacion.setCellWidget(fila, 3, widget)
+            self._tabla_personal_dotacion.setCellWidget(fila, COL_PERSONAL_ACCIONES, widget)
         self._tabla_personal_dotacion.resizeRowsToContents()
+        self._filtrar_dotaciones()
 
     def _acciones_movil(self, movil_id: int, activo: bool) -> QWidget:
         return self._crear_widget_acciones_tabla(
@@ -2419,10 +2496,76 @@ class MainWindow(QMainWindow):
         layout.addWidget(caja_mapa)
         layout.addWidget(caja_apariencia)
         layout.addWidget(caja_acerca)
+        layout.addWidget(self._crear_caja_mantenimiento(contenido))
         layout.addWidget(boton_guardar_config, 0, Qt.AlignmentFlag.AlignLeft)
         layout.addStretch(1)
 
         return pagina
+
+    def _crear_caja_mantenimiento(self, parent: QWidget) -> QGroupBox:
+        caja = QGroupBox("Mantenimiento", parent)
+        layout = QVBoxLayout(caja)
+        texto = QLabel(
+            "Reiniciar partes: borra TODOS los partes/incidentes para empezar la carga limpia del año. "
+            "Se conservan el personal, las unidades, los contactos y la configuración del cuartel. "
+            "Antes se guarda un respaldo completo de la base en data/respaldos/.", caja)
+        texto.setWordWrap(True)
+        texto.setProperty("muted", True)
+        layout.addWidget(texto)
+        boton = QPushButton("🗑️ Reiniciar partes (dejar en cero)", caja)
+        boton.setObjectName("botonQuitarFila")
+        boton.clicked.connect(self._reiniciar_partes)
+        layout.addWidget(boton, 0, Qt.AlignmentFlag.AlignLeft)
+        return caja
+
+    def _reiniciar_partes(self) -> None:
+        if self._lote_ruba is not None:
+            QMessageBox.information(self, "Carga en RUBA en curso", "Esperá a que termine la carga en RUBA.")
+            return
+        with get_session() as session:
+            cantidad = session.query(Incidente).count()
+        if cantidad == 0:
+            QMessageBox.information(self, "Reiniciar partes", "No hay partes cargados: la base ya está en cero.")
+            return
+        dialogo = QDialog(self)
+        dialogo.setWindowTitle("Reiniciar partes")
+        layout = QVBoxLayout(dialogo)
+        aviso = QLabel(
+            f"Se van a borrar los {cantidad} partes cargados (con sus dotaciones, damnificados y estados "
+            "de RUBA). El personal, las unidades y la configuración se conservan y se guarda un respaldo "
+            "de la base antes de borrar.\n\nPara confirmar escribí BORRAR:", dialogo)
+        aviso.setWordWrap(True)
+        layout.addWidget(aviso)
+        entrada = QLineEdit(dialogo)
+        layout.addWidget(entrada)
+        fila = QHBoxLayout()
+        fila.addStretch(1)
+        boton_cancelar = QPushButton("Cancelar", dialogo)
+        boton_cancelar.clicked.connect(dialogo.reject)
+        boton_borrar = QPushButton("Borrar todos los partes", dialogo)
+        boton_borrar.setObjectName("botonQuitarFila")
+        boton_borrar.setEnabled(False)
+        boton_borrar.clicked.connect(dialogo.accept)
+        entrada.textChanged.connect(lambda t: boton_borrar.setEnabled(t.strip() == "BORRAR"))
+        fila.addWidget(boton_cancelar)
+        fila.addWidget(boton_borrar)
+        layout.addLayout(fila)
+        if dialogo.exec() != QDialog.DialogCode.Accepted:
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            borrados, respaldo = reiniciar_partes()
+        except Exception as e:  # noqa: BLE001 - base bloqueada / disco lleno: no se borró nada
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, "No se pudo reiniciar", f"{type(e).__name__}: {e}")
+            return
+        QApplication.restoreOverrideCursor()
+        self._incidente_en_edicion = None
+        self._limpiar_formulario()
+        self._pagina_historial.refrescar()
+        self._actualizar_dashboard()
+        QMessageBox.information(self, "Partes reiniciados",
+                                f"Se borraron {borrados} parte(s).\nRespaldo previo: {respaldo}")
 
     def _buscar_actualizaciones_ahora(self) -> None:
         """Búsqueda manual: funciona aunque el modo sea "desactivado" o la

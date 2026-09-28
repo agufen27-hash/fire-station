@@ -18,7 +18,8 @@ from __future__ import annotations
 
 import logging
 from contextlib import contextmanager
-from datetime import date
+import shutil
+from datetime import date, datetime
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -332,6 +333,10 @@ COLUMNAS_NUEVAS_INCIDENTES = {
     "recibio_personal_id": "INTEGER REFERENCES personal(id)",
     "alarma_general": "BOOLEAN",
     "autorizo_personal_id": "INTEGER REFERENCES personal(id)",
+    # Estadísticas: marcado manual de RUBA y autor de la planilla (PIN).
+    "ruba_carga_manual": "BOOLEAN NOT NULL DEFAULT 0",
+    "confecciono_personal_id": "INTEGER REFERENCES personal(id)",
+    "confeccionado_en": "DATETIME",
 }
 
 # Fase 7: "Dotaciones y Unidades" dinámicas -- dotacion_salida ahora se
@@ -424,6 +429,51 @@ def init_db() -> None:
         if session.query(Contacto).count() == 0:
             _sembrar_contactos(session)
         _sincronizar_personal_desde_padron(session)
+
+
+# ---------------------------------------------------------------------------
+# Reinicio de partes (arranque limpio del año)
+# ---------------------------------------------------------------------------
+
+# Todo lo que cuelga de un parte. Personal, móviles, contactos, catálogos y la
+# configuración del cuartel (data/config.json) NO se tocan.
+TABLAS_DE_PARTES = (
+    "dotacion_salida", "salidas_unidad", "damnificados_civiles", "bienes_afectados",
+    "bomberos_damnificados", "personal_base", "incidentes",
+)
+
+
+def respaldar_base(etiqueta: str = "respaldo") -> Path:
+    """Copia data/fire_station.db a data/respaldos/fire_station_<etiqueta>_<fecha>.db."""
+    carpeta = DATA_DIR / "respaldos"
+    carpeta.mkdir(parents=True, exist_ok=True)
+    destino = carpeta / f"fire_station_{etiqueta}_{datetime.now():%Y%m%d_%H%M%S}.db"
+    engine.dispose()  # sin conexiones abiertas: la copia queda consistente
+    shutil.copy2(DB_PATH, destino)
+    return destino
+
+
+def reiniciar_partes() -> tuple:
+    """Deja la base con CERO partes/incidentes para empezar la carga limpia
+    del año. Antes guarda un respaldo completo de la base. Devuelve
+    (cantidad de partes borrados, ruta del respaldo). La numeración vuelve a
+    001/AAAA sola (siguiente_numero_parte se calcula de lo que haya)."""
+    respaldo = respaldar_base("antes_de_reiniciar")
+    existentes = set(inspect(engine).get_table_names())
+    with engine.begin() as conexion:
+        cantidad = conexion.execute(text("SELECT COUNT(*) FROM incidentes")).scalar() or 0
+        for tabla in TABLAS_DE_PARTES:  # hijos primero: no quedan filas huérfanas
+            if tabla in existentes:
+                conexion.execute(text(f"DELETE FROM {tabla}"))
+        hay_secuencias = conexion.execute(
+            text("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sqlite_sequence'")).first()
+        if hay_secuencias:
+            nombres = ", ".join(f"'{t}'" for t in TABLAS_DE_PARTES)
+            conexion.execute(text(f"DELETE FROM sqlite_sequence WHERE name IN ({nombres})"))
+    with engine.connect() as conexion:
+        conexion.exec_driver_sql("VACUUM")
+    logging.getLogger(__name__).warning("Partes reiniciados: %s borrados (respaldo en %s)", cantidad, respaldo)
+    return cantidad, respaldo
 
 
 # ---------------------------------------------------------------------------
