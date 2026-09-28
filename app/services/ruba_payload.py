@@ -22,7 +22,7 @@ no hay un segundo mapeo de nombres en el medio.
                                  intervencion_comision, hay_intervinientes_bomberos},
       "intervencion_bomberos":  {cantidad_bomberos, bomberos: [{autocomplete_nombre: PERSONA,
                                  fecha_inicio, hora_inicio, fecha_fin, hora_fin, tipo_tarea, is_encargado}]},
-      "intervencion_vehiculos": {vehiculos: [{select_vehiculo, autocomplete_chofer: PERSONA | None,
+      "intervencion_vehiculos": {vehiculos: [{select_vehiculo, numero_movil, autocomplete_chofer: PERSONA | None,
                                  fecha_salida, hora_salida, fecha_llegada, hora_llegada}]},
       "vehiculos_accidentes":   [{marca (ID RUBA), marca_nombre, dominio, modelo, anio,
                                  asegurado, aseguradora, poliza}]   (solo Accidentes)
@@ -70,6 +70,9 @@ class PersonaRuba:
 class VehiculoServicio:
     movil_id_ruba: Optional[int]
     chofer: Optional[PersonaRuba]
+    # 'Nº Móvil' local ("24", "Rojo 24", "B-24"): respaldo para elegir la
+    # opción de RUBA por texto si el value (id_ruba) no está en el combo.
+    numero_movil: Optional[str] = None
     fecha_salida: Optional[date] = None
     hora_salida: Optional[time] = None
     fecha_llegada: Optional[date] = None
@@ -94,6 +97,7 @@ class UnidadServicio:
     movil_id_ruba: Optional[int]
     chofer: Optional[PersonaRuba]
     jefe: Optional[PersonaRuba] = None
+    numero_movil: Optional[str] = None
     fecha_salida: Optional[date] = None
     hora_salida: Optional[time] = None
     fecha_llegada: Optional[date] = None
@@ -123,7 +127,7 @@ def aplanar_unidades(unidades: List[UnidadServicio], base: Optional[List[Persona
 
     for numero, u in enumerate(unidades, start=1):
         vehiculos.append(VehiculoServicio(
-            movil_id_ruba=u.movil_id_ruba, chofer=u.chofer,
+            movil_id_ruba=u.movil_id_ruba, chofer=u.chofer, numero_movil=u.numero_movil,
             fecha_salida=u.fecha_salida, hora_salida=u.hora_salida,
             fecha_llegada=u.fecha_llegada, hora_llegada=u.hora_llegada,
         ))
@@ -396,12 +400,14 @@ def construir_payload(d: DatosServicio) -> Dict[str, Any]:
             "hora_salida": fmt_hora(d.hora_salida),
             "fecha_llegada": fmt_fecha(fecha_llegada),
             "hora_llegada": fmt_hora(d.hora_llegada),
-            "bomberos_heridos": d.bomberos_lesionados,
+            "bomberos_heridos": d.bomberos_lesionados or 0,
             "bomberos_fallecidos": 0,
             "bomberos_desaparecidos": 0,
             "intervencion_vehiculos": bool(d.vehiculos),
             "intervencion_comision": False,
-            "hay_intervinientes_bomberos": bool(d.bomberos),
+            # "Bomberos Damnificados de éste cuerpo": Sí solo con bomberos
+            # lesionados (con "Si" y contadores en 0 RUBA rechaza el guardado).
+            "hay_intervinientes_bomberos": bool(d.bomberos_lesionados),
         },
         "intervencion_bomberos": {
             "cantidad_bomberos": len(d.bomberos),
@@ -422,6 +428,7 @@ def construir_payload(d: DatosServicio) -> Dict[str, Any]:
             "vehiculos": [
                 {
                     "select_vehiculo": str(v.movil_id_ruba) if v.movil_id_ruba is not None else None,
+                    "numero_movil": v.numero_movil,
                     "autocomplete_chofer": _persona(v.chofer),
                     # Sin horario propio, el móvil hereda el general del servicio.
                     "fecha_salida": fmt_fecha(v.fecha_salida or fecha_salida),
@@ -449,7 +456,7 @@ def validar_payload(payload: Dict[str, Any]) -> List[str]:
 
     vehiculos = payload.get("intervencion_vehiculos", {}).get("vehiculos", [])
     for i, v in enumerate(vehiculos, start=1):
-        if not v.get("select_vehiculo"):
+        if not v.get("select_vehiculo") and not v.get("numero_movil"):
             errores.append(f"Móvil {i}: no es un vehículo oficial de RUBA (sin id en vehiculos_cuartel).")
         if not v.get("autocomplete_chofer"):
             errores.append(f"Móvil {i}: falta el chofer.")
@@ -481,6 +488,7 @@ def datos_desde_incidente(incidente: Incidente) -> DatosServicio:
         jefe = next((f.personal for f in filas if f.rol == RolDotacion.A_CARGO.value), None)
         unidades.append(UnidadServicio(
             movil_id_ruba=su.movil.id_ruba if su.movil else None,
+            numero_movil=(su.movil.numero_movil or su.movil.nombre_identificador) if su.movil else None,
             chofer=persona_desde_personal(chofer) if chofer else None,
             jefe=persona_desde_personal(jefe) if jefe else None,
             fecha_salida=su.fecha_salida, hora_salida=su.hora_salida,

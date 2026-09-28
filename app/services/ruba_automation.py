@@ -28,6 +28,7 @@ import json
 import logging
 import os
 import re
+import time
 import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -150,6 +151,77 @@ _JS_SETEAR_PICKER = r"""
 
 # Campos accesorios: nunca se espera el timeout general (30 s) por ellos.
 TIMEOUT_OPCIONAL_MS = 1500
+# Pantalla de Vehículos intervinientes. Las filas se buscan por su row_id real
+# (la colección Symfony no arranca en 0) y nunca en el prototipo `__name__`.
+PREFIJO_VEHICULOS = "bomberos_estructurabundle_intervencionType_vehiculos"
+SEL_FILAS_VEHICULO = (
+    "select[name*='[vehiculos]'][name$='[vehiculo]']:not([name*='__name__']), "
+    f"select[id^='{PREFIJO_VEHICULOS}_'][id$='_vehiculo']:not([id*='__name__'])"
+)
+SEL_BTN_AGREGAR_VEHICULO = "a:has-text('+ agregar'), button:has-text('+ agregar')"
+PATRONES_ROW_VEHICULO = (r"_vehiculos_(\d+)_vehiculo", r"\[vehiculos\]\[(\d+)\]")
+# Pantalla de Bomberos intervinientes: misma idea. Cada fila se reconoce por
+# su autocomplete de bombero o su select de Tipo de tarea (lo que esté visible).
+PREFIJO_BOMBEROS = "bomberos_estructurabundle_intervencionType_bomberos"
+SEL_FILAS_BOMBERO = ", ".join((
+    f"input[id^='autocomplete_{PREFIJO_BOMBEROS}_'][id$='_bombero']:not([id*='__name__'])",
+    f"select[id^='{PREFIJO_BOMBEROS}_'][id$='_tipoTarea']:not([id*='__name__'])",
+    "select[name*='[bomberos]'][name$='[tipoTarea]']:not([name*='__name__'])",
+    "input[name*='[bomberos]'][name$='[bombero]']:not([name*='__name__'])",
+))
+PATRONES_ROW_BOMBERO = (r"_bomberos_(\d+)_(?:bombero|tipoTarea)$", r"\[bomberos\]\[(\d+)\]")
+SEL_BTN_AGREGAR_BOMBERO = "a:has-text('+ agregar'), button:has-text('+ agregar'), a:has-text('Agregar bomberos')"
+TEXTO_TIPO_TAREA = {"1": "INTERVINIENTE", "2": "APRESTO"}
+# Pantalla de Damnificados: filas de heridos (Heridos_{row_id}_nombre...). RUBA
+# las arma según "Civiles heridos" y tampoco las numera desde 0 fijo.
+SEL_FILAS_HERIDO = ", ".join((
+    "input[id^='Heridos_'][id$='_nombre']:not([id*='__name__'])",
+    "input[id^='Heridos_'][id$='_apellido']:not([id*='__name__'])",
+    "select[id^='Heridos_'][id$='_genero']:not([id*='__name__'])",
+    "[name^='Heridos'][name*='[nombre]']:not([name*='__name__'])",
+))
+PATRONES_ROW_HERIDO = (r"^Heridos_(\d+)_(?:nombre|apellido|dni|genero)$", r"^Heridos_?\[?(\d+)\]?\[")
+SEL_BTN_AGREGAR_HERIDO = "a:has-text('+ agregar'), button:has-text('+ agregar')"
+
+# Botón/ícono de eliminar una fila de colección: se busca DENTRO del
+# contenedor de esa fila (el ancestro más grande que no contiene controles de
+# otra fila). Clases, title, onclick o texto con estas palabras.
+_JS_MARCAR_BORRAR_FILA = r"""
+([selAnclas, patrones, rowId, marca]) => {
+    const regexes = patrones.map((p) => new RegExp(p));
+    const rowDe = (el) => {
+        for (const a of [el.id || "", el.getAttribute("name") || ""])
+            for (const r of regexes) { const m = a.match(r); if (m) return m[1]; }
+        return null;
+    };
+    const anclas = Array.from(document.querySelectorAll(selAnclas)).filter((el) => rowDe(el) === rowId);
+    if (!anclas.length) return "sin_fila";
+    // "minus": el círculo rojo con "-" de RUBA (glyphicon-minus-sign / fa-minus-circle).
+    const palabras = /(delete|remove|eliminar|borrar|quitar|trash|tacho|remover|minus)/i;
+    const esBorrar = (el) => /^[-−–]$/.test((el.textContent || "").trim()) || palabras.test([
+        el.className && el.className.baseVal !== undefined ? el.className.baseVal : el.className,
+        el.getAttribute("title"), el.getAttribute("onclick"), el.getAttribute("data-action"),
+        el.getAttribute("aria-label"), (el.textContent || "").trim().slice(0, 30),
+    ].join(" "));
+    const visible = (el) => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+    let nodo = anclas[0].parentElement;
+    while (nodo && nodo !== document.body) {
+        const deOtraFila = Array.from(nodo.querySelectorAll(selAnclas))
+            .some((el) => { const r = rowDe(el); return r !== null && r !== rowId; });
+        if (deOtraFila) return "sin_boton";
+        const candidato = Array.from(nodo.querySelectorAll("a, button, input[type=button], i, span"))
+            .filter(esBorrar)
+            .map((el) => el.closest("a, button, input[type=button]") || el)
+            .find(visible);
+        if (candidato) { candidato.setAttribute("data-ruba-borrar", marca); return "ok"; }
+        nodo = nodo.parentElement;
+    }
+    return "sin_boton";
+}
+"""
+SEL_BTN_GUARDAR_CAMBIOS = "button:has-text('Guardar cambios'), input[value='Guardar cambios']"
+# Contadores de "Bomberos Damnificados de éste cuerpo" (pantalla Participación).
+CONTADORES_BOMBEROS_DAMNIFICADOS = ("bomberos_heridos", "bomberos_fallecidos", "bomberos_desaparecidos")
 TIMEOUT_SEGURO_MS = 2000
 # select_option / check sobre filas dinámicas de vehículos: nunca 30 s.
 TIMEOUT_FILA_MS = 3000
@@ -989,20 +1061,48 @@ class RubaServiceAutomation:
             raise RubaAutomationError(PasoRuba.DAMNIFICADOS, f"RUBA quedó en una pantalla inesperada: {url}")
         heridos = self.payload["damnificados"]["heridos"]
         if self.payload["editar_general"].get("civiles_heridos", 0) > 0 and heridos:
-            base = self._indice_base(sel["fila_herido"]["nombre"])
-            if base is None:
-                raise RubaAutomationError(PasoRuba.DAMNIFICADOS, "RUBA no generó las filas de heridos.")
-            for i, herido in enumerate(heridos):
-                fila = {k: v.format(i=base + i) for k, v in sel["fila_herido"].items()}
-                for clave in ("nombre", "apellido", "dni"):
-                    self._llenar(fila[clave], herido.get(clave))
-                self._seleccionar_genero(fila["genero"], herido.get("genero"), i + 1)
-            self._completar_generos_vacios()
+            self._cargar_filas_heridos(sel, heridos)
         if any(f.get("nombre") or f.get("apellido") for f in self.payload["damnificados"]["fallecidos"]):
             self.advertencias.append("Hay fallecidos individualizados pero el mapping no tiene selectores para ellos.")
         self._guardar_y_continuar(sel["btn_guardar_continuar"], destinos=(self.sel["participacion"]["url_patron"],))
         if not heridos:
             raise _PasoOmitido("Sin civiles heridos: se continuó sin cargar filas.")
+
+    def _cargar_filas_heridos(self, sel: Dict[str, Any], heridos: List[Dict[str, Any]]) -> None:
+        """Una fila por herido del parte, por su row_id real (RUBA puede
+        arrancar en Heridos_1_, Heridos_12_...). RUBA arma las filas según
+        "Civiles heridos" del paso 3; si faltan y la pantalla tiene "+ agregar"
+        se generan, si no se cargan las que hay y se avisa."""
+        listar = lambda: self._row_ids_visibles(SEL_FILAS_HERIDO, PATRONES_ROW_HERIDO)  # noqa: E731
+        limite = time.monotonic() + self.timeout_ms / 1000
+        filas = listar()
+        while not filas and time.monotonic() < limite:  # RUBA las dibuja por JS al cargar
+            self.page.wait_for_timeout(200)
+            filas = listar()
+        if not filas:
+            raise RubaAutomationError(PasoRuba.DAMNIFICADOS, "RUBA no generó las filas de heridos.")
+        boton = ", ".join(filter(None, (sel.get("btn_agregar_fila"), SEL_BTN_AGREGAR_HERIDO)))
+        if len(filas) < len(heridos):
+            if self.page.locator(boton).count():
+                filas = self._generar_filas(listar, len(heridos), boton, "herido")
+            else:
+                self.advertencias.append(
+                    f"RUBA mostró {len(filas)} fila(s) de heridos y el parte tiene {len(heridos)}: "
+                    f"se cargan los primeros {len(filas)} (revisá 'Civiles heridos')."
+                )
+        a_cargar = heridos[:len(filas)]
+        valores = {r: self._valor_de(sel["fila_herido"]["apellido"].format(i=r)) for r in filas}
+        asignadas = _asignar_filas(
+            filas, a_cargar, valores,
+            ya_cargado=lambda h, valor: bool(h.get("apellido")) and _normalizar(valor) == _normalizar(h["apellido"]),
+        )
+        log.info("Heridos: filas visibles %s -> asignadas %s", filas, asignadas)
+        for n, (herido, row_id) in enumerate(zip(a_cargar, asignadas), start=1):
+            fila = {k: v.format(i=row_id) for k, v in sel["fila_herido"].items()}
+            for clave in ("nombre", "apellido", "dni"):
+                self._llenar(fila[clave], herido.get(clave))
+            self._seleccionar_genero(fila["genero"], herido.get("genero"), n)
+        self._completar_generos_vacios()
 
     # `:not([name*='__name__'])`: nunca el prototype oculto de Symfony.
     SEL_GENEROS_HERIDOS = "select[name^='Heridos_'][name*='[genero]']:not([name*='__name__'])"
@@ -1044,55 +1144,162 @@ class RubaServiceAutomation:
         datos = self.payload["participacion"]
         sel = self.sel["participacion"]
         self.page.locator(sel["numero_parte"]).first.wait_for(state="attached")
+        tratados_aparte = {"hay_intervinientes_bomberos", "intervencion_comision", *CONTADORES_BOMBEROS_DAMNIFICADOS}
         for clave, valor in datos.items():
-            if clave not in sel:
+            if clave not in sel or clave in tratados_aparte:
                 continue
             if isinstance(valor, bool):
                 self._setear_booleano(sel[clave], valor)
             else:
                 self._llenar(sel[clave], valor)
+        # Comisión Directiva: No salvo que el parte diga explícitamente que participó.
+        if sel.get("intervencion_comision") and self._existe(sel["intervencion_comision"]):
+            self._setear_booleano(sel["intervencion_comision"], bool(datos.get("intervencion_comision")))
+        self._cargar_bomberos_damnificados(sel, datos)
         self._guardar_y_continuar(sel["btn_guardar_continuar"])
 
+    def _cargar_bomberos_damnificados(self, sel: Dict[str, Any], datos: Dict[str, Any]) -> None:
+        """"Bomberos Damnificados de éste cuerpo" (`hayIntervinientesBomberos`).
+
+        NO significa "hubo bomberos en el servicio" (eso es el paso Bomberos):
+        es si hubo bomberos del cuartel heridos/fallecidos/desaparecidos. Si
+        queda en "Si" con los tres contadores en 0, Symfony rechaza con
+        "Debe indicar algun bombero" (igual que `hayIntervinientesPersonas`
+        del paso 3). Por eso el Sí/No se deriva SIEMPRE de los contadores del
+        parte, no de un flag del payload, y los contadores se escriben
+        siempre -- "0" si vienen vacíos, aunque RUBA los oculte con "No"."""
+        contadores = {clave: _entero(datos.get(clave)) for clave in CONTADORES_BOMBEROS_DAMNIFICADOS}
+        hay_damnificados = any(contadores.values())
+        selector = sel.get("hay_intervinientes_bomberos") or "[name*='[hayIntervinientesBomberos]']"
+        if self._existe(selector):
+            self._setear_booleano(selector, hay_damnificados)
+            self.page.wait_for_timeout(300)  # RUBA muestra/oculta los contadores por JS
+        elif hay_damnificados:
+            self.advertencias.append(
+                "RUBA no mostró 'Bomberos Damnificados de éste cuerpo': se cargan solo los contadores."
+            )
+        for clave, valor in contadores.items():
+            if sel.get(clave):
+                self._llenar(sel[clave], str(valor))  # "0" también se escribe
+        if hay_damnificados:
+            log.info("Participación: bomberos damnificados del cuartel %s", contadores)
+
     def _cargar_bomberos(self) -> None:
+        """Bomberos intervinientes (dotación + apresto).
+
+        Igual que en Vehículos, la colección no arranca en 0 ni en 1: se leen
+        las filas VISIBLES (sin el prototipo `__name__`), se generan las que
+        falten con "Agregar bomberos" y cada bombero va a la fila de su
+        row_id real."""
         datos = self.payload["intervencion_bomberos"]
         sel = self.sel["intervencion_bomberos"]
-        if not datos["bomberos"]:
+        bomberos = datos["bomberos"]
+        if not bomberos:
             if self._existe(sel["cantidad_bomberos"]):
                 self._guardar_y_continuar(sel["btn_guardar_continuar"])
             raise _PasoOmitido("Sin bomberos intervinientes.")
 
         self.page.locator(sel["cantidad_bomberos"]).first.wait_for(state="attached")
-        self._llenar(sel["cantidad_bomberos"], datos["cantidad_bomberos"])
-        base = self._asegurar_filas(sel["fila_bombero"]["autocomplete_nombre"], len(datos["bomberos"]),
-                                    sel["btn_agregar_filas"])
-        for i, bombero in enumerate(datos["bomberos"]):
-            fila = {k: v.format(i=base + i) for k, v in sel["fila_bombero"].items()}
-            self._autocompletar_persona(fila["autocomplete_nombre"], bombero["autocomplete_nombre"])
+        boton_agregar = ", ".join(filter(None, (sel.get("btn_agregar_filas"), SEL_BTN_AGREGAR_BOMBERO)))
+        listar = lambda: self._row_ids_visibles(SEL_FILAS_BOMBERO, PATRONES_ROW_BOMBERO)  # noqa: E731
+        filas_actuales = len(listar())
+        faltan = max(0, len(bomberos) - filas_actuales)
+        if faltan:
+            def antes_de_click(pendientes: int, intento: int) -> None:
+                # 1er click: #cantBomberos = exactamente las filas que faltan. Si
+                # RUBA no agregó ninguna (su JS completa HASTA el total), se
+                # reintenta con el total del parte.
+                total = len(bomberos) if intento else pendientes
+                self._llenar(sel["cantidad_bomberos"], total)
+            filas = self._generar_filas(listar, len(bomberos), boton_agregar, "bombero", antes_de_click)
+        else:
+            filas = listar()  # alcanzan: no se toca "Agregar bomberos"
+
+        valores = {r: self._valor_de(self._sel_fila(sel["fila_bombero"], "autocomplete_nombre", r)) for r in filas}
+        asignadas = _asignar_filas(
+            filas, bomberos, valores,
+            ya_cargado=lambda bombero, valor: _persona_coincide(bombero["autocomplete_nombre"], valor),
+        )
+        log.info("Bomberos: filas visibles %s -> asignadas %s", filas, asignadas)
+        sobrantes = [r for r in filas if r not in asignadas and not valores[r]]
+        if sobrantes:
+            quedan = self._eliminar_filas(sobrantes, SEL_FILAS_BOMBERO, PATRONES_ROW_BOMBERO)
+            if quedan:
+                self.advertencias.append(
+                    f"Quedaron filas de bomberos vacías que no se pudieron eliminar ({quedan}): "
+                    "pueden bloquear el guardado en RUBA."
+                )
+
+        for bombero, row_id in zip(bomberos, asignadas):
+            fila = {k: self._sel_fila(sel["fila_bombero"], k, row_id) for k in sel["fila_bombero"]}
+            persona = bombero["autocomplete_nombre"]
+            if not _persona_coincide(persona, valores[row_id]):
+                self._autocompletar_persona(fila["autocomplete_nombre"], persona)
             for clave in ("fecha_inicio", "hora_inicio", "fecha_fin", "hora_fin"):
                 self._llenar(fila[clave], bombero.get(clave))
             if bombero.get("tipo_tarea"):
-                self._seleccionar(fila["tipo_tarea"], bombero["tipo_tarea"])
-            self._tildar(fila["is_encargado"], bool(bombero.get("is_encargado")))
+                self._seleccionar_tipo_tarea(fila["tipo_tarea"], str(bombero["tipo_tarea"]))
+            if self._existe(fila["is_encargado"]):
+                self._tildar(fila["is_encargado"], bool(bombero.get("is_encargado")))
+            elif bombero.get("is_encargado"):
+                raise RubaAutomationError(PasoRuba.BOMBEROS, f"No se encontró 'Encargado' en la fila {row_id}.")
         self._guardar_y_continuar(sel["btn_guardar_continuar"])
 
+    def _sel_fila(self, patrones: Dict[str, str], clave: str, row_id: str) -> str:
+        return patrones[clave].format(i=row_id)
+
+    def _valor_de(self, selector: str) -> str:
+        loc = self.page.locator(selector).first
+        try:
+            return (loc.input_value() or "").strip() if loc.count() else ""
+        except PlaywrightError:
+            return ""
+
+    def _seleccionar_tipo_tarea(self, selector: str, valor: str) -> None:
+        """Tipo de tarea por value ("1" Interviniente / "2" Apresto) y, si el
+        portal cambió los values, por el texto de la opción."""
+        opciones = self.page.locator(selector).first.evaluate(_JS_OPCIONES)
+        if any(o["value"] == valor for o in opciones):
+            self._seleccionar(selector, valor)
+            return
+        texto = TEXTO_TIPO_TAREA.get(valor)
+        elegida = next((o for o in opciones if texto and o["value"] and texto in _normalizar(o["text"])), None)
+        if elegida is None:
+            raise RubaAutomationError(
+                PasoRuba.BOMBEROS, f"Tipo de tarea '{valor}' no existe en {selector}: {[o['text'] for o in opciones]}",
+            )
+        self._seleccionar(selector, elegida["value"])
+
     def _cargar_vehiculos_y_guardar(self) -> None:
+        """Vehículos intervinientes + guardado final.
+
+        Las filas de la colección Symfony NO se numeran desde 0: RUBA arrastra
+        el contador (ej. la primera fila visible es `..._vehiculos_11_vehiculo`).
+        Por eso no se asume ningún índice: se leen las filas VISIBLES (sin el
+        prototipo `__name__`), se agregan las que falten y cada vehículo se
+        carga en la fila de su `row_id` real."""
         vehiculos = self.payload["intervencion_vehiculos"]["vehiculos"]
         sel = self.sel["intervencion_vehiculos"]
         if not vehiculos:
             raise _PasoOmitido("Sin vehículos intervinientes.")
-        self.page.locator(sel["btn_agregar_fila"]).first.wait_for(state="attached")
-        base = self._asegurar_filas(sel["fila_vehiculo"]["select_vehiculo"], len(vehiculos), sel["btn_agregar_fila"])
-        for i, vehiculo in enumerate(vehiculos):
-            fila = {k: v.format(i=base + i) for k, v in sel["fila_vehiculo"].items()}
-            self._seleccionar(fila["select_vehiculo"], vehiculo["select_vehiculo"])
+        boton_agregar = ", ".join(filter(None, (sel.get("btn_agregar_fila"), SEL_BTN_AGREGAR_VEHICULO)))
+        self.page.locator(boton_agregar).first.wait_for(state="attached")
+
+        filas = self._asignar_filas_vehiculos(vehiculos, boton_agregar)
+        for vehiculo, row_id in zip(vehiculos, filas):
+            fila = {k: v.format(i=row_id) for k, v in sel["fila_vehiculo"].items()}
+            self._seleccionar_vehiculo(f"#{PREFIJO_VEHICULOS}_{row_id}_vehiculo", vehiculo)
             if vehiculo.get("autocomplete_chofer"):
-                self._autocompletar_persona(fila["autocomplete_chofer"], vehiculo["autocomplete_chofer"])
+                self._autocompletar_persona(self._selector_chofer(fila, row_id), vehiculo["autocomplete_chofer"])
             for clave in ("fecha_salida", "hora_salida", "fecha_llegada", "hora_llegada"):
-                self._llenar(fila[clave], vehiculo.get(clave))
+                if fila.get(clave):
+                    self._llenar_si_vacio(fila[clave], vehiculo.get(clave))
+        self._eliminar_vehiculos_sobrantes(filas)
 
         _sembrar_tab_activa(self.page)
         url_antes = self.page.url
-        self.page.locator(sel["btn_guardar_cambios"]).first.click()
+        boton_guardar = ", ".join(filter(None, (sel.get("btn_guardar_cambios"), SEL_BTN_GUARDAR_CAMBIOS)))
+        self._primero_visible(boton_guardar).click()
         try:
             self.page.wait_for_url(lambda u: u != url_antes, timeout=self.timeout_navegacion_ms)
         except PlaywrightError:
@@ -1105,6 +1312,176 @@ class RubaServiceAutomation:
                 f"RUBA rechazó el guardado final: {errores} campos_invalidos={detectar_campos_invalidos(self.page)}",
             )
         self.ruba_id_remoto = self.ruba_id_remoto or _extraer_id(self.page.url)
+
+    def _row_ids_visibles(self, selector: str, patrones: tuple) -> List[str]:
+        """row_id real (número de la colección Symfony) de cada fila con algún
+        control VISIBLE que matchee `selector`, en orden de pantalla. Cada
+        patrón es una regex con el row_id en el grupo 1; se prueba sobre el
+        id y el name de cada elemento."""
+        row_ids: List[str] = []
+        for elemento in self.page.locator(selector).all():
+            try:
+                if not elemento.is_visible():
+                    continue
+                atributos = (elemento.get_attribute("id") or "", elemento.get_attribute("name") or "")
+            except PlaywrightError:
+                continue  # la fila se re-renderizó entre el listado y la lectura
+            for patron in patrones:
+                coincidencia = next(filter(None, (re.search(patron, a) for a in atributos)), None)
+                if coincidencia:
+                    if coincidencia.group(1) not in row_ids:
+                        row_ids.append(coincidencia.group(1))
+                    break
+        return row_ids
+
+    def _generar_filas(
+        self, listar: Callable[[], List[str]], cantidad: int, boton: str, que: str,
+        antes_de_click: Optional[Callable[[int, int], None]] = None,
+    ) -> List[str]:
+        """Click en "+ agregar" hasta tener `cantidad` filas visibles, esperando
+        tras cada click que aparezca al menos una nueva. `antes_de_click(faltan,
+        intento)` prepara el click (ej. #cantBomberos). Si un click no generó
+        filas se reintenta una vez más antes de fallar. Devuelve los row_id."""
+        filas = listar()
+        sin_efecto = 0
+        for intento in range(max(cantidad - len(filas), 0) + 1):
+            if len(filas) >= cantidad:
+                break
+            antes = len(filas)
+            if antes_de_click:
+                antes_de_click(cantidad - antes, intento)
+            self._primero_visible(boton).click()
+            limite = time.monotonic() + min(self.timeout_ms, 10000) / 1000
+            while len(filas) <= antes and time.monotonic() < limite:
+                self.page.wait_for_timeout(150)
+                filas = listar()
+            if len(filas) <= antes:
+                sin_efecto += 1
+                if sin_efecto > 1:
+                    break
+        if len(filas) < cantidad:
+            raise RubaAutomationError(
+                self._paso_en_curso(),
+                f"'+ agregar' no generó las filas de {que} necesarias (hay {len(filas)}, hacen falta {cantidad}).",
+            )
+        return filas
+
+    def _eliminar_filas(self, row_ids: List[str], sel_anclas: str, patrones: tuple) -> List[str]:
+        """Elimina filas de colección vacías con su botón/ícono de borrar
+        (buscado dentro del contenedor de ESA fila). Acepta el confirm() que
+        pueda abrir el portal. Devuelve los row_id que no se pudieron quitar."""
+        quedan: List[str] = []
+        aceptar = lambda dialogo: dialogo.accept()  # noqa: E731
+        self.page.on("dialog", aceptar)
+        try:
+            for row_id in row_ids:
+                marca = f"borrar-{row_id}"
+                estado = self.page.evaluate(_JS_MARCAR_BORRAR_FILA, [sel_anclas, list(patrones), row_id, marca])
+                if estado != "ok":
+                    log.info("Fila %s: no se encontró cómo eliminarla (%s)", row_id, estado)
+                    quedan.append(row_id)
+                    continue
+                boton = self.page.locator(f"[data-ruba-borrar='{marca}']").first
+                try:
+                    boton.click(timeout=TIMEOUT_FILA_MS)
+                except PlaywrightError as e:
+                    # Ícono sin tamaño (fuente no cargada) o tapado: click por JS.
+                    log.info("Fila %s: click en eliminar falló (%s); se reintenta por JS", row_id, e)
+                    try:
+                        boton.evaluate("(el) => el.click()")
+                    except PlaywrightError:
+                        quedan.append(row_id)
+                        continue
+                self.page.wait_for_timeout(300)
+                if row_id in self._row_ids_visibles(sel_anclas, patrones):
+                    quedan.append(row_id)
+                else:
+                    log.info("Fila vacía %s eliminada", row_id)
+        finally:
+            self.page.remove_listener("dialog", aceptar)
+        return quedan
+
+    def _asignar_filas_vehiculos(self, vehiculos: List[Dict[str, Any]], boton_agregar: str) -> List[str]:
+        """Una fila (row_id) por vehículo del parte, en el mismo orden (ver
+        `_asignar_filas`: primero las que ya tienen ESE vehículo)."""
+        filas = self._generar_filas(
+            lambda: self._row_ids_visibles(SEL_FILAS_VEHICULO, PATRONES_ROW_VEHICULO),
+            len(vehiculos), boton_agregar, "vehículo",
+        )
+        valores = {r: self._valor_de(f"#{PREFIJO_VEHICULOS}_{r}_vehiculo") for r in filas}
+        asignadas = _asignar_filas(
+            filas, vehiculos, valores,
+            ya_cargado=lambda v, valor: bool(v.get("select_vehiculo")) and valor == str(v["select_vehiculo"]),
+        )
+        log.info("Vehículos: filas visibles %s -> asignadas %s", filas, asignadas)
+        return asignadas
+
+    def _eliminar_vehiculos_sobrantes(self, asignadas: List[str]) -> None:
+        """Filas de vehículo visibles que no recibieron un móvil del parte y
+        quedaron en "Seleccionar": RUBA rechaza el guardado (select required),
+        así que se quitan con su botón de eliminar (círculo rojo "-")."""
+        visibles = self._row_ids_visibles(SEL_FILAS_VEHICULO, PATRONES_ROW_VEHICULO)
+        sobrantes = [r for r in visibles
+                     if r not in asignadas and not self._valor_de(f"#{PREFIJO_VEHICULOS}_{r}_vehiculo")]
+        if not sobrantes:
+            return
+        quedan = self._eliminar_filas(sobrantes, SEL_FILAS_VEHICULO, PATRONES_ROW_VEHICULO)
+        log.info("Vehículos: filas vacías sobrantes %s, sin poder eliminar %s", sobrantes, quedan)
+        if quedan:
+            self.advertencias.append(
+                f"Quedaron filas de vehículos vacías que no se pudieron eliminar ({quedan}): "
+                "pueden bloquear el guardado en RUBA."
+            )
+
+    def _seleccionar_vehiculo(self, selector: str, vehiculo: Dict[str, Any]) -> None:
+        """Elige el móvil: por value (id de RUBA) y, si no está, por el Nº de
+        móvil en el texto de la opción ("Nº Móvil: Rojo 24 (Man - ...)")."""
+        opciones = self.page.locator(selector).first.evaluate(_JS_OPCIONES)
+        valor = _opcion_vehiculo(opciones, vehiculo.get("select_vehiculo"), vehiculo.get("numero_movil"))
+        if valor is None:
+            raise RubaAutomationError(
+                PasoRuba.VEHICULOS,
+                f"El móvil '{vehiculo.get('numero_movil') or vehiculo.get('select_vehiculo')}' no coincide con "
+                f"ninguno de los que ofrece RUBA en {selector}: {[o['text'] for o in opciones if o['value']][:12]}",
+            )
+        self._seleccionar(selector, valor)
+
+    def _selector_chofer(self, fila: Dict[str, str], row_id: str) -> str:
+        """Input visible del chofer de ESA fila: el autocomplete del mapping,
+        o por id/name con el row_id si el portal cambió."""
+        candidatos = (
+            fila.get("autocomplete_chofer"),
+            f"#autocomplete_{PREFIJO_VEHICULOS}_{row_id}_chofer",
+            f"#{PREFIJO_VEHICULOS}_{row_id}_chofer",
+            f"input[name*='[vehiculos][{row_id}][chofer]']",
+        )
+        for selector in filter(None, candidatos):
+            loc = self.page.locator(selector).first
+            if loc.count() and loc.is_visible():
+                return selector
+        raise RubaAutomationError(PasoRuba.VEHICULOS, f"No se encontró el campo Chofer de la fila {row_id}.")
+
+    def _llenar_si_vacio(self, selector: str, valor: Any) -> None:
+        """Fechas/horas del móvil: si RUBA ya las trae completas (las hereda
+        de Participación) se respetan; solo se escriben las vacías."""
+        loc = self.page.locator(selector).first
+        if not loc.count():
+            return
+        try:
+            actual = (loc.input_value() or "").strip()
+        except PlaywrightError:
+            actual = ""
+        if not actual:
+            self._llenar(selector, valor)
+
+    def _primero_visible(self, selector: str):
+        """El primer elemento VISIBLE que matchea (el template de RUBA tiene
+        botones ocultos o duplicados); si ninguno lo es, el primero."""
+        loc = self.page.locator(selector)
+        for i in range(loc.count()):
+            if loc.nth(i).is_visible():
+                return loc.nth(i)
+        return loc.first
 
     # ------------------------------------------------------------------
     # Primitivas de interacción
@@ -1264,19 +1641,10 @@ class RubaServiceAutomation:
             self._tildar(selector, valor)
 
     def _autocompletar_persona(self, selector: str, persona: Dict[str, Any]) -> None:
-        """Tipea el apellido y elige la sugerencia que coincide con la persona:
-        primero por DNI, si no por apellido + primer nombre."""
-        apellido = _normalizar(persona["apellido"])
-        primer_nombre = (_normalizar(persona.get("nombre") or "").split() or [""])[0]
-        dni = persona.get("dni")
-
-        def coincide(sugerencia: str) -> bool:
-            s = _normalizar(sugerencia)
-            if dni and dni in re.sub(r"\D", "", sugerencia):
-                return True
-            return apellido in s and primer_nombre in s
-
-        self._autocompletar(self._visible_de(selector), persona["texto_busqueda"], coincide, persona["nombre_completo"])
+        """Tipea el apellido y elige la sugerencia que coincide con la persona
+        (`_persona_coincide`: DNI, o apellido + nombre en cualquier orden)."""
+        self._autocompletar(self._visible_de(selector), persona["texto_busqueda"],
+                            lambda sugerencia: _persona_coincide(persona, sugerencia), persona["nombre_completo"])
 
     def _autocompletar(
         self, campo, busqueda: str, coincide: Callable[[str], bool], descripcion: str,
@@ -1345,24 +1713,6 @@ class RubaServiceAutomation:
             self.page.wait_for_timeout(150)
         return None
 
-    def _indice_base(self, patron: str) -> Optional[int]:
-        """Las colecciones de Symfony numeran desde 0 (a veces desde 1)."""
-        for base in (0, 1):
-            if self._existe(patron.format(i=base)):
-                return base
-        return None
-
-    def _asegurar_filas(self, patron: str, cantidad: int, selector_boton: str) -> int:
-        """Hace click en "agregar fila" hasta que exista la fila `cantidad`.
-        Devuelve el índice base de las filas."""
-        for _ in range(cantidad + 2):
-            base = self._indice_base(patron)
-            if base is not None and self._existe(patron.format(i=base + cantidad - 1)):
-                return base
-            self.page.locator(selector_boton).first.click()
-            self.page.wait_for_timeout(200)
-        raise RubaAutomationError(self._paso_en_curso(), f"No se pudieron generar {cantidad} filas ({patron}).")
-
     def _guardar_y_continuar(self, selector_boton: str, destinos: Optional[tuple] = None) -> None:
         """Guarda y verifica ADÓNDE llevó RUBA. El form hace POST a la misma
         URL: si hay errores de validación, RUBA re-renderiza esa URL; si
@@ -1422,6 +1772,93 @@ class _PasoOmitido(Exception):
 def _extraer_id(url: str) -> Optional[str]:
     coincidencia = re.search(r"/incidente/(?:editar/|damnificados/)?(\d+)(?:[/?#]|$)", url)
     return coincidencia.group(1) if coincidencia else None
+
+
+def _asignar_filas(filas: List[str], items: List[Dict[str, Any]], valores: Dict[str, str],
+                   ya_cargado: Callable[[Dict[str, Any], str], bool]) -> List[str]:
+    """row_id para cada item, en el orden de `items`. Prioridad: 1) la fila
+    que ya tiene ESE item (reintento tras un guardado parcial: no duplica),
+    2) filas vacías, 3) filas con otro dato (se pisan). `filas` debe tener
+    al menos len(items) elementos."""
+    libres = list(filas)
+    asignadas: List[Optional[str]] = [None] * len(items)
+    for n, item in enumerate(items):
+        fila = next((r for r in libres if valores.get(r) and ya_cargado(item, valores[r])), None)
+        if fila is not None:
+            asignadas[n] = fila
+            libres.remove(fila)
+    libres.sort(key=lambda r: bool(valores.get(r)))  # sort estable: respeta el orden de pantalla
+    for n in range(len(items)):
+        if asignadas[n] is None:
+            asignadas[n] = libres.pop(0)
+    return [r for r in asignadas if r is not None]
+
+
+def _persona_coincide(persona: Optional[Dict[str, Any]], texto: str) -> bool:
+    """¿El texto (sugerencia del autocomplete o valor ya cargado) es esta
+    persona? Por DNI (sin puntos) si está en el texto; si no, todas las
+    palabras del apellido + el primer nombre, en cualquier orden
+    ("PEREZ, Juan", "Juan Pérez (12.345.678)", "PEREZ GOMEZ JUAN CARLOS")."""
+    if not persona or not texto:
+        return False
+    dni = re.sub(r"\D", "", str(persona.get("dni") or ""))
+    if dni and len(dni) >= 6 and dni in re.sub(r"\D", "", texto):
+        return True
+    palabras = set(_normalizar(texto).split())
+    apellido = _normalizar(persona.get("apellido") or "").split()
+    primer_nombre = _normalizar(persona.get("nombre") or "").split()[:1]
+    return bool(apellido) and all(p in palabras for p in apellido + primer_nombre)
+
+
+def _numero_de_opcion(texto: str) -> str:
+    """"Nº Móvil: Rojo 24 (Ford - F-100 4x4) - Sociedad..." -> "ROJO 24"."""
+    m = re.search(r"m[oó]vil\s*:?\s*([^(]+)", texto, re.IGNORECASE)
+    return _normalizar(m.group(1) if m else texto.split("(")[0])
+
+
+def _ultimo_numero(texto: str) -> str:
+    numeros = re.findall(r"\d+", texto)
+    return numeros[-1] if numeros else ""
+
+
+def _opcion_vehiculo(opciones: List[Dict[str, str]], id_ruba: Any, numero_movil: Any) -> Optional[str]:
+    """value de la opción del móvil, en este orden:
+    1. value == id de RUBA del móvil;
+    2. Nº de móvil idéntico ("Rojo 24" == "ROJO 24");
+    3. mismo número final ("Móvil 24", "B-24" o "24" -> "Rojo 24");
+    4. el número como palabra suelta en cualquier parte del texto.
+    En 3 y 4 solo se elige si hay UNA coincidencia ("24" nunca matchea
+    "Rojo 245"); si es ambigua devuelve None y el paso falla con la lista."""
+    validas = [o for o in opciones if o.get("value")]
+    if id_ruba not in (None, ""):
+        directa = next((o for o in validas if o["value"] == str(id_ruba)), None)
+        if directa:
+            return directa["value"]
+    if not numero_movil:
+        return None
+    buscado = _normalizar(str(numero_movil))
+    digitos = _ultimo_numero(buscado)
+
+    exactas = [o for o in validas if _numero_de_opcion(o["text"]) == buscado]
+    if len(exactas) == 1:
+        return exactas[0]["value"]
+    if not digitos:
+        return None
+    por_numero = [o for o in validas if _ultimo_numero(_numero_de_opcion(o["text"])) == digitos]
+    if len(por_numero) == 1:
+        return por_numero[0]["value"]
+    parciales = [o for o in validas if re.search(rf"(?<!\d){digitos}(?!\d)", _normalizar(o["text"]))]
+    if len(parciales) == 1:
+        return parciales[0]["value"]
+    return None
+
+
+def _entero(valor: Any) -> int:
+    """Contador del parte como entero >= 0 (None, "" o basura -> 0)."""
+    try:
+        return max(int(valor or 0), 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _es_picker(selector: str) -> bool:
