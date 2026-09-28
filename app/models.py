@@ -174,6 +174,9 @@ class Movil(Base):
     marca: Mapped[Optional[str]] = mapped_column(String(60), nullable=True)
     modelo: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
     anio: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # Dominio / patente (ej. "AB123CD", "ABC123"): se carga a mano en el
+    # diálogo de la unidad o, si el reporte de RUBA lo trae, al importar.
+    dominio: Mapped[Optional[str]] = mapped_column(String(15), nullable=True)
     # "En Servicio" / "Fuera de Servicio" / "Baja" según RUBA; `activo` se
     # mantiene sincronizado (solo "En Servicio" es activo) porque todo el
     # código existente filtra por `activo`.

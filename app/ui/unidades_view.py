@@ -22,10 +22,8 @@ from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
     QGroupBox,
-    QHBoxLayout,
     QHeaderView,
     QMessageBox,
-    QPushButton,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -37,7 +35,8 @@ from app.models import Movil
 from app.services.ruba_importer import ESTADO_MOVIL_BAJA
 from app.ui import theme
 
-COLUMNAS = ["Unidad", "Tipo", "Marca / Modelo", "Año", "Estado", "Acciones"]
+COLUMNAS = ["Unidad", "Nº Móvil", "Tipo", "Marca / Modelo", "Año", "Dominio", "Estado", "Acciones"]
+COL_TIPO, COL_ESTADO = 2, 6
 COL_ACCIONES = len(COLUMNAS) - 1
 
 AccionMovil = Callable[[int], None]
@@ -59,14 +58,9 @@ class PanelUnidades(QGroupBox):
         self._crear_acciones = crear_acciones
         self.col_acciones = COL_ACCIONES
 
+        # El botón "📥 Importar Unidades desde Excel (RUBA)" vive en la barra de
+        # la página, al lado del de bomberos (MainWindow -> importar_desde_excel).
         layout = QVBoxLayout(self)
-        fila = QHBoxLayout()
-        self.boton_importar = QPushButton("📥 Importar Unidades desde Excel (RUBA)", self)
-        self.boton_importar.setToolTip("Elegí el 'Reporte de vehiculos' exportado de RUBA (.xlsx) desde cualquier carpeta")
-        self.boton_importar.clicked.connect(self.importar_desde_excel)
-        fila.addWidget(self.boton_importar)
-        fila.addStretch(1)
-        layout.addLayout(fila)
 
         self.tabla = QTableWidget(self)
         self.tabla.setColumnCount(len(COLUMNAS))
@@ -75,7 +69,7 @@ class PanelUnidades(QGroupBox):
         self.tabla.verticalHeader().setVisible(False)
         cabecera = self.tabla.horizontalHeader()
         cabecera.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        cabecera.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        cabecera.setSectionResizeMode(COL_TIPO, QHeaderView.ResizeMode.Stretch)
         cabecera.setSectionResizeMode(COL_ACCIONES, QHeaderView.ResizeMode.Fixed)
         self.tabla.setColumnWidth(COL_ACCIONES, 270)
         theme.estilizar_tabla(self.tabla)
@@ -86,26 +80,27 @@ class PanelUnidades(QGroupBox):
     def recargar(self) -> None:
         with get_session() as session:
             filas = [
-                (m.id, m.nombre_identificador, m.tipo, " ".join(x for x in (m.marca, m.modelo) if x),
-                 m.anio, m.estado, m.activo)
+                (m.id, m.nombre_identificador, m.numero_movil, m.tipo,
+                 " ".join(x for x in (m.marca, m.modelo) if x), m.anio, m.dominio, m.estado, m.activo)
                 for m in session.query(Movil).order_by(Movil.nombre_identificador)
             ]
         self.tabla.setRowCount(len(filas))
-        for i, (movil_id, nombre, tipo, marca_modelo, anio, estado, activo) in enumerate(filas):
+        for i, (movil_id, nombre, numero, tipo, marca_modelo, anio, dominio, estado, activo) in enumerate(filas):
             self.tabla.setItem(i, 0, QTableWidgetItem(nombre))
             item_tipo = QTableWidgetItem(tipo or "—")
             item_tipo.setToolTip(tipo or "")
-            self.tabla.setItem(i, 1, item_tipo)
-            self.tabla.setItem(i, 2, QTableWidgetItem(marca_modelo or "—"))
-            item_anio = QTableWidgetItem(str(anio) if anio else "—")
-            item_anio.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.tabla.setItem(i, 3, item_anio)
+            self.tabla.setItem(i, COL_TIPO, item_tipo)
+            self.tabla.setItem(i, 3, QTableWidgetItem(marca_modelo or "—"))
+            for columna, valor in ((1, numero), (4, anio), (5, dominio)):
+                item = QTableWidgetItem(str(valor) if valor else "—")
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.tabla.setItem(i, columna, item)
             # Sin estado de RUBA (unidad cargada a mano): el texto de siempre.
             texto_estado = estado or ("Operativo" if activo else "Fuera de servicio")
             color = "verde_texto" if activo else ("rojo" if estado == ESTADO_MOVIL_BAJA else "ambar")
             item_estado = QTableWidgetItem(texto_estado)
             item_estado.setForeground(QColor(theme.color(color)))
-            self.tabla.setItem(i, 4, item_estado)
+            self.tabla.setItem(i, COL_ESTADO, item_estado)
             self.tabla.setCellWidget(i, COL_ACCIONES, self._crear_acciones(movil_id, activo))
         self.tabla.resizeRowsToContents()
         self.recargada.emit()

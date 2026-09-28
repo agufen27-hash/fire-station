@@ -111,7 +111,9 @@ from app.ui.ruba_progreso_dialog import DialogoLoteRuba
 from app.ui.servicio_en_curso import TarjetaServicioEnCurso, resumen_de
 from app.ui.siniestro_widgets import FORM_ACCIDENTE, PanelDatosEspecificos
 from app.ui.unidades_view import PanelUnidades
-from app.services.ruba_importer import ESTADO_MOVIL_EN_SERVICIO, ESTADO_MOVIL_FUERA_DE_SERVICIO
+from app.services.ruba_importer import (
+    ESTADO_MOVIL_EN_SERVICIO, ESTADO_MOVIL_FUERA_DE_SERVICIO, clave_movil, normalizar_dominio,
+)
 from app.ui.widgets import DateField, TarjetaKPI, TimeField
 from app.ui.widgets.phonebook_widget import PhonebookWidget
 from app.ui.widgets.weather_widget import WeatherWidget
@@ -145,6 +147,13 @@ ITEMS_NAV = [
     (IDX_DOCUMENTACION, "📁  Documentación"),
     (IDX_CONFIGURACION, "⚙️  Configuración"),
 ]
+
+# Sugerencias del diálogo de unidad (combos editables: se puede escribir otro).
+TIPOS_UNIDAD_SUGERIDOS = ["Autobomba", "Cisterna", "Forestal", "Rescate", "Transporte de personal",
+                          "Ambulancia", "Camioneta", "Utilitario", "Unidad de comando", "Hidroelevador"]
+MARCAS_UNIDAD_SUGERIDAS = ["Man", "Ford", "Daf", "Mercedes-Benz", "Iveco", "Scania", "Volkswagen",
+                           "Chevrolet", "Toyota", "Hyundai", "Renault", "Fiat"]
+ANIO_UNIDAD_MINIMO = 1950
 
 COLUMNAS_PERSONAL = ["Nombre", "Legajo", "DNI", "Jerarquía", "Estado", "Acciones"]
 COL_PERSONAL_ACCIONES = len(COLUMNAS_PERSONAL) - 1
@@ -1958,10 +1967,15 @@ class MainWindow(QMainWindow):
         boton_importar_padron = QPushButton("📥 Importar Bomberos desde Excel (RUBA)", pagina)
         boton_importar_padron.setToolTip("Elegí el 'Reporte de bomberos' exportado de RUBA (.xlsx) desde cualquier carpeta")
         boton_importar_padron.clicked.connect(self._importar_padron_bomberos)
+        boton_importar_unidades = QPushButton("📥 Importar Unidades desde Excel (RUBA)", pagina)
+        boton_importar_unidades.setToolTip(
+            "Elegí el 'Reporte de vehiculos' exportado de RUBA (.xlsx) desde cualquier carpeta")
+        boton_importar_unidades.clicked.connect(lambda: self._panel_unidades.importar_desde_excel())
         fila_botones.addWidget(boton_nuevo_bombero)
         fila_botones.addWidget(boton_nueva_unidad)
         fila_botones.addStretch(1)
         fila_botones.addWidget(boton_importar_padron)
+        fila_botones.addWidget(boton_importar_unidades)
         layout.addLayout(fila_botones)
 
         # Una tabla a la vez, a todo el ancho (antes iban lado a lado y se
@@ -2266,22 +2280,60 @@ class MainWindow(QMainWindow):
         return True
 
     def _dialogo_unidad(self, movil_id: Optional[int] = None) -> None:
-        datos_previos = None
-        if movil_id is not None:
-            with get_session() as session:
+        """Alta / edición de una unidad con todos los datos del 'Reporte de
+        vehiculos' de RUBA: ID RUBA, identificador, Nº Móvil, tipo, marca,
+        modelo, año y dominio."""
+        previo: Dict[str, Any] = {}
+        with get_session() as session:
+            if movil_id is not None:
                 m = session.get(Movil, movil_id)
-                datos_previos = {"nombre": m.nombre_identificador, "activo": m.activo, "id_ruba": m.id_ruba}
+                previo = {"nombre": m.nombre_identificador, "activo": m.activo, "id_ruba": m.id_ruba,
+                          "numero_movil": m.numero_movil, "tipo": m.tipo, "marca": m.marca,
+                          "modelo": m.modelo, "anio": m.anio, "dominio": m.dominio}
+            tipos_usados = [t for (t,) in session.query(Movil.tipo).distinct() if t]
+            marcas_usadas = [x for (x,) in session.query(Movil.marca).distinct() if x]
 
         dialogo = QDialog(self)
         dialogo.setWindowTitle("Editar Unidad" if movil_id else "Nueva Unidad")
+        dialogo.setMinimumWidth(460)
         form = QFormLayout(dialogo)
 
-        entry_id_ruba = self._campo_id_ruba(datos_previos["id_ruba"] if datos_previos else None, dialogo)
-        entry_nombre = QLineEdit(datos_previos["nombre"] if datos_previos else "", dialogo)
+        def combo_sugerencias(sugeridos: List[str], actual: Optional[str]) -> QComboBox:
+            combo = QComboBox(dialogo)
+            combo.setEditable(True)  # sugerencias, pero se puede escribir cualquier valor
+            combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+            combo.addItems(sorted(set(sugeridos), key=str.lower))
+            combo.setEditText(actual or "")
+            return combo
+
+        entry_id_ruba = self._campo_id_ruba(previo.get("id_ruba"), dialogo)
+        entry_nombre = QLineEdit(previo.get("nombre") or "", dialogo)
+        entry_nombre.setPlaceholderText("Ej: Móvil 24, Rojo 24")
+        entry_numero = QLineEdit(previo.get("numero_movil") or "", dialogo)
+        entry_numero.setPlaceholderText("Como figura en RUBA, ej: Rojo 24")
+        entry_numero.setToolTip("Nº Móvil del Reporte de vehiculos: con él la carga en RUBA elige el vehículo")
+        combo_tipo = combo_sugerencias(TIPOS_UNIDAD_SUGERIDOS + tipos_usados, previo.get("tipo"))
+        combo_marca = combo_sugerencias(MARCAS_UNIDAD_SUGERIDAS + marcas_usadas, previo.get("marca"))
+        entry_modelo = QLineEdit(previo.get("modelo") or "", dialogo)
+        entry_modelo.setPlaceholderText("Ej: TGM-13.250, F-100 4x4")
+        spin_anio = QSpinBox(dialogo)
+        spin_anio.setRange(ANIO_UNIDAD_MINIMO - 1, date.today().year + 1)
+        spin_anio.setSpecialValueText("—")  # el mínimo representa "sin año"
+        spin_anio.setValue(previo.get("anio") or ANIO_UNIDAD_MINIMO - 1)
+        entry_dominio = QLineEdit(previo.get("dominio") or "", dialogo)
+        entry_dominio.setPlaceholderText("Ej: AB123CD (opcional)")
+        entry_dominio.setMaxLength(15)
         check_activo = QCheckBox("Activa", dialogo)
-        check_activo.setChecked(datos_previos["activo"] if datos_previos else True)
+        check_activo.setChecked(previo.get("activo", True))
+
         form.addRow(theme.etiqueta_requerida("ID RUBA"), entry_id_ruba)
-        form.addRow("Nombre / Identificador", entry_nombre)
+        form.addRow(theme.etiqueta_requerida("Nombre / Identificador"), entry_nombre)
+        form.addRow("Nº Móvil (RUBA)", entry_numero)
+        form.addRow("Tipo de unidad", combo_tipo)
+        form.addRow("Marca", combo_marca)
+        form.addRow("Modelo", entry_modelo)
+        form.addRow("Año de fabricación", spin_anio)
+        form.addRow("Dominio / Patente", entry_dominio)
         form.addRow("", check_activo)
 
         fila_botones = QHBoxLayout()
@@ -2306,6 +2358,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Datos incompletos", "El nombre/identificador es obligatorio.")
             return
         id_ruba = int(entry_id_ruba.text())
+        numero_movil = entry_numero.text().strip() or None
+        anio = spin_anio.value() if spin_anio.value() >= ANIO_UNIDAD_MINIMO else None
 
         with get_session() as session:
             duplicado = session.query(Movil).filter(Movil.id_ruba == id_ruba, Movil.id != movil_id).first()
@@ -2313,9 +2367,22 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "ID RUBA duplicado",
                                     f"El ID RUBA {id_ruba} ya es de la unidad {duplicado.nombre_identificador}.")
                 return
+            if numero_movil:
+                otro = next((m for m in session.query(Movil).filter(Movil.id != movil_id, Movil.numero_movil.isnot(None))
+                             if clave_movil(m.numero_movil) == clave_movil(numero_movil)), None)
+                if otro is not None:
+                    QMessageBox.warning(self, "Nº Móvil duplicado",
+                                        f"El Nº Móvil {numero_movil} ya es de la unidad {otro.nombre_identificador}.")
+                    return
             movil = session.get(Movil, movil_id) if movil_id is not None else Movil(nombre_identificador=nombre)
             movil.id_ruba = id_ruba
             movil.nombre_identificador = nombre
+            movil.numero_movil = numero_movil
+            movil.tipo = combo_tipo.currentText().strip() or None
+            movil.marca = combo_marca.currentText().strip() or None
+            movil.modelo = entry_modelo.text().strip() or None
+            movil.anio = anio
+            movil.dominio = normalizar_dominio(entry_dominio.text())
             movil.activo = check_activo.isChecked()
             _sincronizar_estado_movil(movil)
             if movil_id is None:
@@ -2328,6 +2395,7 @@ class MainWindow(QMainWindow):
                 return
 
         self._cargar_pagina_dotaciones()
+        self._refrescar_moviles_despacho()
 
     # -- Página: Documentación (legajos con acceso por PIN personal, Fase 8) ------
 

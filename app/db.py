@@ -371,6 +371,7 @@ COLUMNAS_NUEVAS_MOVILES = {
     "modelo": "VARCHAR(80)",
     "anio": "INTEGER",
     "estado": "VARCHAR(20)",
+    "dominio": "VARCHAR(15)",
 }
 
 # Fase 12: lesión de cada civil damnificado.

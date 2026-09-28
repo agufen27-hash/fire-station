@@ -137,6 +137,12 @@ COLUMNAS_VEHICULOS = ["Nº Móvil", "Marca", "Modelo", "Tipo", "Año", "Servicio
 _RE_PREFIJO_MOVIL = re.compile(r"^(MOVIL|MOV\.?|N[º°O]?\s*MOVIL:?)\s+(?=\d+$)")
 
 
+def normalizar_dominio(valor: Any) -> Optional[str]:
+    """'ab 123 cd' / 'AB-123-CD' -> 'AB123CD'. None si queda vacío."""
+    texto = re.sub(r"[\s.\-]", "", _texto(valor) or "").upper()
+    return texto[:15] or None
+
+
 def clave_movil(numero: Any) -> str:
     """Clave de comparación de un móvil: 'Rojo  22' == 'ROJO 22';
     26 == '26' == 'Móvil 26' (así calza con los nombres ya cargados)."""
@@ -158,6 +164,7 @@ class VehiculoRuba:
     anio: Optional[int]
     estado: str                        # ESTADO_MOVIL_*
     fecha_adquisicion: Optional[date] = None
+    dominio: Optional[str] = None      # solo si el reporte trae "Dominio" / "Patente"
     fila_excel: int = 0
     completitud: int = 0               # para elegir entre filas duplicadas
 
@@ -205,6 +212,7 @@ def leer_reporte_vehiculos(ruta: Path) -> Tuple[List[VehiculoRuba], List[str]]:
             anio=_entero(_celda(indices, fila, "Año")),
             estado=_estado_vehiculo(_celda(indices, fila, "Servicio"), _celda(indices, fila, "Baja")),
             fecha_adquisicion=_fecha(_celda(indices, fila, "Fecha de Adquisición")),
+            dominio=normalizar_dominio(_celda(indices, fila, "Dominio") or _celda(indices, fila, "Patente")),
             fila_excel=n,
             # un modelo puramente numérico igual al año suele ser un alta mal cargada
             completitud=sum(1 for x in (marca, tipo, vto) if x) + (1 if modelo and not modelo.isdigit() else 0),
@@ -267,6 +275,8 @@ def upsert_vehiculos(session: Session, vehiculos: List[VehiculoRuba]) -> Resumen
         movil.marca = v.marca
         movil.modelo = v.modelo
         movil.anio = v.anio
+        if v.dominio:  # el reporte habitual no trae dominio: no se borra el cargado a mano
+            movil.dominio = v.dominio
         movil.estado = v.estado
         movil.activo = v.activo
         if movil.id_ruba is None and v.clave in ids_ruba:
