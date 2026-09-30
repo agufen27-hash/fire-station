@@ -129,7 +129,8 @@
       "liberar_si_vacios": [
         "otraLocalidad",
         "fechaVencimientoSeguro",
-        "otroTipoLugarForestal"
+        "otroTipoLugarForestal",
+        "otroTipoLugar"
       ],
       "btn_guardar_continuar": "button[name='save_&_continue']",
       "condicionales": {
@@ -148,6 +149,7 @@
             "basural": "10",
             "otro": "999"
           },
+          "tipo_lugar_otro": "#bomberos_estructurabundle_incidenteIncendioType_otroTipoLugarForestal",
           "unidad_superficie": "#bomberos_estructurabundle_incidenteIncendioType_evacuacion",
           "unidad_superficie_opciones": {
             "no_se_evacuo": "1",
@@ -177,6 +179,7 @@
             "multifamiliar": "5",
             "otros": "999"
           },
+          "tipo_lugar_otro": "#bomberos_estructurabundle_incidenteIncendioType_otroTipoLugar",
           "unidad_superficie": "#bomberos_estructurabundle_incidenteIncendioType_evacuacion",
           "cantidad_superficie": "#bomberos_estructurabundle_incidenteIncendioType_superficieEvacuada",
           "cantidad_pisos": "#bomberos_estructurabundle_incidenteIncendioType_cantidadPisos",

@@ -33,9 +33,10 @@ from PySide6.QtWidgets import (
 )
 
 from app.core.catalogos import Bombero, Movil as MovilRuba
+from app.core.horarios import fecha_fin_ajustada
 from app.db import get_session
 from app.models import Personal
-from app.services.personal_info import grado_de
+from app.services.personal_info import bombero_historico, grado_de
 from app.ui import theme
 from app.ui.damnificados_widgets import _ajustar_alto, _boton_quitar, _tabla
 from app.ui.participacion_widgets import HorarioServicio, SelectorBombero, texto_movil
@@ -197,14 +198,30 @@ class TarjetaUnidad(QFrame):
 
     def _marcar_editado(self, nombre: str) -> None:
         self._editados.add(nombre)
-        if nombre in ("fecha_llegada", "hora_llegada"):
+        self._ajustar_fecha_llegada()
+        if nombre in ("fecha_llegada", "hora_llegada", "fecha_salida", "hora_salida"):
             self.llegada_editada.emit()
+
+    def _ajustar_fecha_llegada(self) -> None:
+        """Fecha + hora completas: si esta dotación tiene horario propio y la
+        fecha de llegada no se tocó a mano, se deduce de la salida -- el mismo
+        día, o el siguiente si cruzó la medianoche (sale 23:30, vuelve 01:15).
+        Sin horario propio sigue la fecha del horario general."""
+        if "fecha_llegada" in self._editados:
+            return
+        if not {"fecha_salida", "hora_salida", "hora_llegada"} & self._editados:
+            return
+        nueva = fecha_fin_ajustada(self.fecha_salida.value(), self.hora_salida.value(),
+                                   None, self.hora_regreso.value())
+        if nueva is not None and nueva != self.fecha_regreso.value():
+            self.fecha_regreso.set_value(nueva)
 
     def llegada_propia(self) -> Optional[Tuple[date, time]]:
         """(fecha, hora) de llegada cargada a mano en ESTA dotación (no la
-        heredada del horario general), o None."""
+        heredada del horario general), o None. La fecha ya contempla el cruce
+        de medianoche, así el máximo entre dotaciones es cronológico."""
         hora = self.hora_regreso.value()
-        if "hora_llegada" not in self._editados or hora is None:
+        if not {"hora_llegada", "fecha_llegada"} & self._editados or hora is None:
             return None
         return self.fecha_regreso.value(), hora
 
@@ -219,6 +236,7 @@ class TarjetaUnidad(QFrame):
                     campo.set_value(valor)
             else:
                 campo.set_value(valor)
+        self._ajustar_fecha_llegada()
 
     def cargar_horario(self, valores: HorarioServicio, general: HorarioServicio) -> None:
         for nombre, campo in self._campos_horarios().items():
@@ -231,8 +249,18 @@ class TarjetaUnidad(QFrame):
 
     # -- Jefe, grado y firma ----------------------------------------------------
 
+    def set_padron(self, padron: Sequence[Bombero]) -> None:
+        """Padrón recargado (🔄 Refrescar / baja de un bombero): nuevas opciones
+        en todos los selectores, conservando a quien ya estaba elegido."""
+        self._padron = list(padron)
+        self._por_id = {b.id_ruba: b for b in self._padron}
+        for selector in (self.selector_chofer, self.selector_jefe, *(f.selector for f in self._filas)):
+            selector.set_padron(self._padron)
+
     def _on_jefe_cambiado(self) -> None:
-        self.label_grado.setText(grado_de(self._por_id.get(self.selector_jefe.id_ruba())) or "—")
+        id_jefe = self.selector_jefe.id_ruba()
+        jefe = self._por_id.get(id_jefe) or (bombero_historico(id_jefe) if id_jefe is not None else None)
+        self.label_grado.setText(grado_de(jefe) or "—")
         if self._firmado_por is not None and self._firmado_por != self.selector_jefe.id_ruba():
             self._resetear_firma()
         self.dotacion_cambiada.emit()
@@ -374,6 +402,11 @@ class PanelDotaciones(QWidget):
         for tarjeta in self._tarjetas:
             tarjeta.set_moviles(self._moviles)
 
+    def actualizar_padron(self, padron: Sequence[Bombero]) -> None:
+        self._padron = list(padron)
+        for tarjeta in self._tarjetas:
+            tarjeta.set_padron(self._padron)
+
     def agregar_unidad(self) -> TarjetaUnidad:
         tarjeta = TarjetaUnidad(len(self._tarjetas) + 1, self._moviles, self._padron, self, self._resolver_personal)
         tarjeta.aplicar_horario(self._horario)
@@ -449,7 +482,9 @@ class PanelDotaciones(QWidget):
                 errores.append(f"Dotación N° {n}: la PCD2 admite hasta {MAX_EMBARCADOS_PCD2} embarcados.")
             if (u["fecha_salida"] and u["hora_salida"] and u["fecha_llegada"] and u["hora_llegada"]
                     and (u["fecha_llegada"], u["hora_llegada"]) < (u["fecha_salida"], u["hora_salida"])):
-                errores.append(f"Dotación N° {n}: la llegada es anterior a la salida.")
+                errores.append(f"Dotación N° {n}: la llegada ({u['fecha_llegada']:%d/%m} {u['hora_llegada']:%H:%M}) "
+                               f"es anterior a la salida ({u['fecha_salida']:%d/%m} {u['hora_salida']:%H:%M}); "
+                               "si cruzó la medianoche, la fecha de llegada es la del día siguiente.")
             if not parcial:
                 if u["hora_salida"] is None:
                     errores.append(f"Dotación N° {n}: falta la hora de salida.")
@@ -527,6 +562,11 @@ class PanelPersonalBase(QFrame):
         self.boton_agregar.clicked.connect(self.agregar_apresto)
         layout.addWidget(self.boton_agregar, 0, Qt.AlignmentFlag.AlignLeft)
         _ajustar_alto(self.tabla)
+
+    def set_padron(self, padron: Sequence[Bombero]) -> None:
+        self._padron = list(padron)
+        for selector in (self.selector_operador_1, self.selector_operador_2, *self._apresto):
+            selector.set_padron(self._padron)
 
     def agregar_apresto(self) -> SelectorBombero:
         selector = SelectorBombero(self._padron, self.tabla)

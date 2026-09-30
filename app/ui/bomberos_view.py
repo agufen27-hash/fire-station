@@ -44,8 +44,7 @@ def importar_bomberos_desde_excel(parent: QWidget) -> bool:
 
     texto = f"{resumen.total} bomberos importados ({resumen.nuevas} nuevos, {resumen.actualizadas} actualizados)."
     if activos is not None:
-        texto += (f"\nPadrón de RUBA: {activos} activos. Los selectores del formulario de parte "
-                  "lo toman al reiniciar la app.")
+        texto += f"\nPadrón de RUBA: {activos} activos (los selectores de la planilla ya lo toman)."
     if resumen.avisos:
         texto += "\n\nAvisos:\n• " + "\n• ".join(resumen.avisos)
     QMessageBox.information(parent, "Personal importado", texto)

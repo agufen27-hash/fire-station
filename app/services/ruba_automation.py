@@ -43,6 +43,7 @@ from app.core.catalogos import leer_mapping
 from app.services.ruba_payload import GENERO_DEFAULT, TIPO_VEHICULO_DEFAULT, genero_ruba
 from app.paths import configurar_entorno_playwright, get_writable_dir, is_frozen
 from app.services.ruba_helpers import (
+    CONDICIONALES_LIBERABLES_DEFAULT,
     SELECTORES_CLAVE,
     URL_INCIDENTE_DEFAULT,
     URL_LOGIN_DEFAULT,
@@ -151,6 +152,9 @@ _JS_SETEAR_PICKER = r"""
 
 # Campos accesorios: nunca se espera el timeout general (30 s) por ellos.
 TIMEOUT_OPCIONAL_MS = 1500
+# Campos condicionales de Tipo/Subtipo (tipoLugarForestal, tipoLugar, causaIncendio...):
+# si RUBA no los dibuja en 2 s, no aplican a este subtipo y se omiten.
+TIMEOUT_CONDICIONAL_MS = 2000
 # Pantalla de Vehículos intervinientes. Las filas se buscan por su row_id real
 # (la colección Symfony no arranca en 0) y nunca en el prototipo `__name__`.
 PREFIJO_VEHICULOS = "bomberos_estructurabundle_intervencionType_vehiculos"
@@ -225,12 +229,29 @@ CONTADORES_BOMBEROS_DAMNIFICADOS = ("bomberos_heridos", "bomberos_fallecidos", "
 TIMEOUT_SEGURO_MS = 2000
 # select_option / check sobre filas dinámicas de vehículos: nunca 30 s.
 TIMEOUT_FILA_MS = 3000
-# Solo si RUBA muestra "Datos del Seguro" como OBLIGATORIO (formulario de
-# Incendios: inputs required, sin checkbox) y el parte no tiene seguro: lo
-# que RUBA ya aceptó en cargas reales (captura del 24/09).
-SEGURO_SIN_DATOS = {"compania_seguro": "Sin datos", "numero_poliza": "00000000"}
+# "Datos del Seguro" de RUBA. Sin seguro en el parte quedan en blanco (nunca
+# se escriben valores ficticios); solo se les quita el `required` HTML5 para
+# que el navegador no frene el guardado por un campo que el parte no tiene.
+SEGURO_CAMPOS_RUBA = ("companiaSeguro", "numeroPoliza", "fechaVencimientoSeguro")
+_JS_SEGURO_SIN_REQUIRED = r"""(nombres) => {
+    const liberados = [];
+    nombres.forEach((n) => {
+        document.querySelectorAll('[id$="_' + n + '"]').forEach((el) => {
+            if (!["INPUT", "SELECT", "TEXTAREA"].includes(el.tagName)) return;
+            if ((el.value || "").trim() || !el.hasAttribute("required")) return;
+            el.removeAttribute("required");
+            liberados.push(el.id);
+        });
+    });
+    return liberados;
+}"""
 
 _JS_OPCIONES = "(el) => Array.from(el.options || []).map(o => ({value: o.value, text: o.textContent.trim()}))"
+# Un <select> oculto por select2/chosen sigue aplicando si su contenedor se ve.
+_JS_CONTENEDOR_VISIBLE = """(el) => {
+    const caja = el.closest('.control-group, .form-group, .controls');
+    return !!caja && caja.offsetParent !== null && getComputedStyle(caja).visibility !== 'hidden';
+}"""
 
 
 def _normalizar(texto: str) -> str:
@@ -668,9 +689,10 @@ class RubaServiceAutomation:
         self._confirmar_punto_en_mapa(sel)
         self._asegurar_punto_fijado(sel, datos)
 
-        for clave in ("nombre_solicitante", "apellido_solicitante", "descripcion"):
-            self._llenar(sel[clave], datos.get(clave))
-        for clave in ("telefono_solicitante", "dni_solicitante"):  # accesorios: sin esperas largas
+        self._llenar(sel["descripcion"], datos.get("descripcion"))  # obligatoria en RUBA
+        # Denunciante: NINGÚN dato es obligatorio. Vacío -> no se toca; campo
+        # ausente en RUBA -> se sigue sin error (espera corta, nunca 30 s).
+        for clave in ("nombre_solicitante", "apellido_solicitante", "telefono_solicitante", "dni_solicitante"):
             self._llenar_opcional(sel[clave], datos.get(clave))
         self._cargar_seguro(sel, datos)
         self._cargar_personas_damnificadas(sel, datos)
@@ -683,7 +705,7 @@ class RubaServiceAutomation:
                 "completarlos a mano en RUBA."
             )
         liberados = liberar_condicionales_vacios(
-            self.page, sel.get("liberar_si_vacios") or ("otraLocalidad", "fechaVencimientoSeguro", "otroTipoLugarForestal")
+            self.page, sel.get("liberar_si_vacios") or CONDICIONALES_LIBERABLES_DEFAULT
         )
         if liberados:
             log.info("Paso 3: condicionales vacíos liberados antes del guardado: %s", liberados)
@@ -696,24 +718,23 @@ class RubaServiceAutomation:
     def _cargar_seguro(self, sel: Dict[str, Any], datos: Dict[str, Any]) -> None:
         """"Datos del Seguro", condicionado al parte local.
 
-        - Parte SIN seguro: no se toca ningún checkbox ni se espera nada. Solo
-          si el formulario de este tipo YA tiene el bloque en pantalla como
-          obligatorio (Incendios) se escribe "Sin datos" para que el guardado
-          no rebote; si no existe (otros tipos) se sigue de largo al instante.
+        - Parte SIN seguro: Compañía, N° de Póliza y Fecha de Vencimiento
+          quedan EN BLANCO, tal como los trae RUBA: no se escribe nada (ni
+          "Sin datos" ni "00000000"), no se tilda ningún checkbox ni se
+          espera. Si el formulario (Incendios) los marca `required`, solo se
+          quita ese atributo para que el navegador no bloquee el guardado.
         - Parte CON seguro: se tilda el checkbox si el mapping define uno
           (`check_seguro`), se espera el campo como máximo 2 s y se completan
           compañía y póliza. Si RUBA no muestra el bloque, advertencia."""
         sel_compania, sel_poliza = sel["compania_seguro"], sel["numero_poliza"]
         if not datos.get("tiene_seguro"):
-            compania = self.page.locator(sel_compania).first
-            if compania.count() == 0:  # sin esperar: el formulario no tiene seguro
-                log.info("Paso 3: parte sin seguro y formulario sin 'Datos del Seguro': se omite.")
-                return
-            if not (compania.is_visible() and compania.get_attribute("required") is not None):
-                log.info("Paso 3: parte sin seguro; 'Datos del Seguro' no es obligatorio acá: no se toca.")
-                return
-            for clave, selector in (("compania_seguro", sel_compania), ("numero_poliza", sel_poliza)):
-                self._llenar_opcional(selector, SEGURO_SIN_DATOS[clave], timeout_ms=0)
+            try:
+                liberados = self.page.evaluate(_JS_SEGURO_SIN_REQUIRED, list(SEGURO_CAMPOS_RUBA))
+            except PlaywrightError as e:  # nunca frena la carga por el seguro
+                liberados = []
+                log.info("Paso 3: no se pudo revisar 'Datos del Seguro' (%s).", e)
+            log.info("Paso 3: parte sin seguro: 'Datos del Seguro' queda en blanco%s.",
+                     f" (required quitado en {', '.join(liberados)})" if liberados else "")
             return
 
         check = sel.get("check_seguro")
@@ -867,20 +888,91 @@ class RubaServiceAutomation:
         campos = self._completar_obligatorios(formulario, bloque, dict(condicionales.get("campos") or {}))
         if not campos:
             return  # nada que cargar: no se espera un bloque que quizá RUBA no muestre
-        primer_selector = next(
-            v for k, v in bloque.items() if isinstance(v, str) and not k.endswith(("_default", "_opciones"))
-        )
-        self.page.locator(primer_selector).first.wait_for(state="attached")
+        # Cada campo condicional (tipoLugarForestal, tipoLugar, evacuación,
+        # causaIncendio...) depende del Subtipo: RUBA puede no dibujarlo. Nunca
+        # se espera 30 s por uno: presencia con espera corta y, si no aplica,
+        # se omite con advertencia y se sigue con el resto del formulario.
+        espera_ms = TIMEOUT_CONDICIONAL_MS  # la 1ra vez da tiempo a que RUBA dibuje el bloque por JS
         for campo, valor in campos.items():
+            if valor in (None, ""):
+                continue
             selector = bloque.get(campo)
             if selector is None:
                 self.advertencias.append(f"Campo condicional sin selector en el mapping: {formulario}.{campo}")
-            elif isinstance(selector, dict):  # grupo de radios {"si": "#..._0", ...}
-                self._tildar(selector[valor], True)
-            elif f"{campo}_opciones" in bloque:
-                self._seleccionar(selector, str(valor))
-            else:
-                self._llenar(selector, valor)
+                continue
+            if campo.endswith("_otro") and not _es_opcion_otro(bloque, campo[:-len("_otro")],
+                                                                campos.get(campo[:-len("_otro")])):
+                # Texto "Otro" (otroTipoLugar...): solo con la opción Otro/Otros elegida.
+                log.info("Paso 3: %s.%s se ignora: no se eligió la opción 'Otro'.", formulario, campo)
+                continue
+            if isinstance(selector, dict):  # grupo de radios {"si": "#..._0", ...}
+                selector = selector.get(str(valor))
+                if selector is None:
+                    self.advertencias.append(f"{formulario}.{campo}: opción '{valor}' sin selector en el mapping.")
+                    continue
+            presente = self._condicional_presente(selector, espera_ms)
+            espera_ms = min(espera_ms, TIMEOUT_OPCIONAL_MS // 3)  # el bloque ya tuvo su oportunidad
+            if not presente:
+                log.info("Paso 3: %s.%s no está en pantalla (%s): se omite.", formulario, campo, selector)
+                self.advertencias.append(
+                    f"{formulario}: RUBA no mostró '{campo}' para este tipo de incidente; se omitió.")
+                continue
+            try:
+                if isinstance(bloque.get(campo), dict):
+                    self._tildar(selector, True)
+                elif f"{campo}_opciones" in bloque:
+                    self._seleccionar(selector, str(valor))
+                else:
+                    self._llenar_opcional(selector, valor, timeout_ms=0)
+            except (RubaAutomationError, PlaywrightError) as e:
+                detalle = e.detalle if isinstance(e, RubaAutomationError) else str(e).splitlines()[0]
+                log.warning("Paso 3: no se pudo cargar %s.%s: %s", formulario, campo, detalle)
+                self.advertencias.append(f"{formulario}: no se pudo cargar '{campo}' ({detalle}); revisalo en RUBA.")
+        self._avisar_combos_obligatorios_vacios(formulario, bloque, campos)
+
+    def _avisar_combos_obligatorios_vacios(self, formulario: str, bloque: Dict[str, Any],
+                                           campos: Dict[str, Any]) -> None:
+        """Combos del bloque (p. ej. Tipo de Lugar) que el parte no trae: quedan
+        en "Seleccionar" -- no se inventa una opción sin código confirmado. Si
+        RUBA los marca obligatorios, se avisa para completarlos a mano."""
+        for campo in bloque:
+            if not campo.endswith("_opciones"):
+                continue
+            nombre = campo[: -len("_opciones")]
+            selector = bloque.get(nombre)
+            if campos.get(nombre) not in (None, "") or not isinstance(selector, str):
+                continue
+            try:
+                loc = self.page.locator(selector).first
+                if not loc.count() or loc.get_attribute("required") is None or (loc.input_value() or "").strip():
+                    continue
+            except PlaywrightError:
+                continue
+            self.advertencias.append(
+                f"{formulario}: '{nombre}' quedó en 'Seleccionar' (el parte no lo trae) y RUBA lo marca "
+                "obligatorio: si rechaza el guardado, completalo en el parte o en RUBA.")
+
+    def _condicional_presente(self, selector: str, timeout_ms: int) -> bool:
+        """¿El campo condicional existe y aplica (visible, o su contenedor
+        visible si es un <select> reemplazado por select2 / chosen)? Espera
+        como máximo `timeout_ms`; nunca lanza."""
+        loc = self.page.locator(selector).first
+        try:
+            if loc.count() == 0:
+                if timeout_ms <= 0:
+                    return False
+                loc.wait_for(state="attached", timeout=timeout_ms)
+            if loc.is_visible():
+                return True
+            if timeout_ms > 0:
+                try:
+                    loc.wait_for(state="visible", timeout=timeout_ms)
+                    return True
+                except PlaywrightError:
+                    pass
+            return bool(loc.evaluate(_JS_CONTENEDOR_VISIBLE))
+        except PlaywrightError:
+            return False
 
     def _completar_obligatorios(self, formulario: str, bloque: Dict[str, Any],
                                 campos: Dict[str, Any]) -> Dict[str, Any]:
@@ -941,8 +1033,8 @@ class RubaServiceAutomation:
                     self.advertencias.append(f"Vehículo {n}: la marca '{v.get('marca_nombre')}' no existe en RUBA; "
                                              "se cargó como 'Otra'.")
             self._seleccionar_tipo_vehiculo(campo("tipo"), v.get("tipo"), n)
-            for clave in ("dominio", "modelo", "anio"):
-                self._llenar(campo(clave), v.get(clave))
+            for clave in ("dominio", "modelo", "anio"):  # opcionales: vacío -> no se tipea
+                self._llenar_opcional(campo(clave), v.get(clave), timeout_ms=TIMEOUT_FILA_MS)
 
             asegurado = bool(v.get("asegurado"))
             self._setear_asegurado(campo("asegurado"), asegurado)
@@ -1099,8 +1191,9 @@ class RubaServiceAutomation:
         log.info("Heridos: filas visibles %s -> asignadas %s", filas, asignadas)
         for n, (herido, row_id) in enumerate(zip(a_cargar, asignadas), start=1):
             fila = {k: v.format(i=row_id) for k, v in sel["fila_herido"].items()}
-            for clave in ("nombre", "apellido", "dni"):
-                self._llenar(fila[clave], herido.get(clave))
+            self._llenar(fila["apellido"], herido.get("apellido"))
+            for clave in ("nombre", "dni"):  # opcionales: sin dato (o sin campo) se sigue
+                self._llenar_opcional(fila[clave], herido.get(clave))
             self._seleccionar_genero(fila["genero"], herido.get("genero"), n)
         self._completar_generos_vacios()
 
@@ -1517,8 +1610,9 @@ class RubaServiceAutomation:
 
     def _llenar(self, selector: str, valor: Any) -> None:
         """Escribe un valor. Los date/timepicker de RUBA suelen ser readonly:
-        ahí se setea por JS y se disparan los eventos que escuchan."""
-        if valor is None or valor == "":
+        ahí se setea por JS y se disparan los eventos que escuchan. Un valor
+        vacío (None, "" o solo espacios) no se escribe."""
+        if _vacio(valor):
             return
         texto = str(valor)
         loc = self.page.locator(selector).first
@@ -1535,8 +1629,9 @@ class RubaServiceAutomation:
     def _llenar_opcional(self, selector: str, valor: Any, timeout_ms: int = TIMEOUT_OPCIONAL_MS) -> bool:
         """Como `_llenar`, para campos ACCESORIOS: si el campo no aparece en
         `timeout_ms` (nunca el timeout general de 30 s) se sigue sin error.
-        Devuelve True si se escribió algo."""
-        if valor is None or valor == "":
+        Devuelve True si se escribió algo; vacío/None/espacios -> False sin
+        tocar la página."""
+        if _vacio(valor):
             return False
         loc = self.page.locator(selector).first
         if loc.count() == 0:
@@ -1767,6 +1862,21 @@ def _evaluar_titulo(page: Page) -> str:
 
 class _PasoOmitido(Exception):
     """Un paso que no aplica a este servicio (sin heridos, sin bomberos...)."""
+
+
+def _es_opcion_otro(bloque: Dict[str, Any], campo: str, valor: Any) -> bool:
+    """¿`valor` es la opción "Otro"/"Otros" del combo `campo` (código 999 en
+    tipo_lugar_opciones)? Decide si se llena el texto `<campo>_otro`."""
+    if valor in (None, ""):
+        return False
+    opciones = bloque.get(f"{campo}_opciones") or {}
+    return any(str(codigo) == str(valor) and _normalizar(clave).startswith("OTRO")
+               for clave, codigo in opciones.items())
+
+
+def _vacio(valor: Any) -> bool:
+    """Dato opcional sin cargar en el parte local: se omite en RUBA."""
+    return valor is None or (isinstance(valor, str) and not valor.strip())
 
 
 def _extraer_id(url: str) -> Optional[str]:

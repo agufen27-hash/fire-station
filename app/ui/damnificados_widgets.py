@@ -326,6 +326,11 @@ class GrillaBomberosDamnificados(QWidget):
         layout.addWidget(self.boton_agregar, 0, Qt.AlignmentFlag.AlignLeft)
         _ajustar_alto(self.tabla)
 
+    def set_padron(self, padron: Sequence[Bombero]) -> None:
+        self._padron = list(padron)
+        for f in range(self.tabla.rowCount()):
+            self.tabla.cellWidget(f, COL_F_BOMBERO).set_padron(self._padron)
+
     def agregar_fila(self) -> SelectorBombero:
         fila = self.tabla.rowCount()
         self.tabla.insertRow(fila)
@@ -526,6 +531,9 @@ class PanelDamnificados(QWidget):
 
         for tarjeta in (self.tarjeta_civiles, self.tarjeta_bienes, self.tarjeta_vehiculos, self.tarjeta_bomberos):
             layout.addWidget(tarjeta)
+
+    def set_padron(self, padron: Sequence[Bombero]) -> None:
+        self.grilla_bomberos.set_padron(padron)
 
     def set_es_accidente(self, es_accidente: bool) -> None:
         """La tarjeta de vehículos solo aparece (y solo se envía) en Accidentes."""

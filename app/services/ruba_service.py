@@ -64,9 +64,8 @@ def _completar_denunciante(payload: Dict[str, Any]) -> None:
         for campo, clave in CAMPOS_DENUNCIANTE:
             if not general.get(clave):
                 general[clave] = por_defecto[campo]
-    # El seguro NO se completa acá: si el parte no tiene, la automatización ni
-    # busca el bloque en RUBA (ruba_automation._cargar_seguro); solo si el
-    # formulario de ese tipo lo muestra como obligatorio pone "Sin datos".
+    # El seguro NO se completa acá: si el parte no tiene, "Datos del Seguro"
+    # queda en blanco en RUBA (ruba_automation._cargar_seguro).
 
 
 def _ruba_id_guardado(incidente_id: int) -> Optional[str]:

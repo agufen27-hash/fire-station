@@ -323,7 +323,7 @@ def detectar_error_servidor(page: Page) -> Optional[str]:
 SEL_LATITUD_DEFAULT = "input[id$='_ubicacion_latitud']"
 SEL_LONGITUD_DEFAULT = "input[id$='_ubicacion_longitud']"
 SEL_HAY_PERSONAS_DEFAULT = "select[id$='_hayIntervinientesPersonas']"
-CONDICIONALES_LIBERABLES_DEFAULT = ("otraLocalidad", "fechaVencimientoSeguro", "otroTipoLugarForestal")
+CONDICIONALES_LIBERABLES_DEFAULT = ("otraLocalidad", "fechaVencimientoSeguro", "otroTipoLugarForestal", "otroTipoLugar")
 
 _JS_LEER_PUNTO = r"""
 ([selLat, selLng]) => {

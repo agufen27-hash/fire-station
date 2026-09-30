@@ -60,3 +60,34 @@ def grado_de(bombero: Optional[Bombero], jerarquias: Optional[Dict[int, Optional
 def mandos_del_padron(padron: List[Bombero]) -> List[Bombero]:
     jerarquias = jerarquias_por_id_ruba(b.id_ruba for b in padron)
     return [b for b in padron if es_mando(jerarquias.get(b.id_ruba), b.cargo)]
+
+
+def _es_activo(persona: Personal) -> bool:
+    return bool(persona.activo) and (persona.estado or "Activo") == "Activo"
+
+
+def padron_activo(padron: Iterable[Bombero]) -> List[Bombero]:
+    """Padrón que se OFRECE en los selectores de la planilla: excluye a quien
+    en la base local está de baja / licencia / reserva (aunque el Excel de
+    RUBA todavía lo liste como activo). Quien no tiene legajo local se
+    mantiene: el Excel es la única fuente sobre esa persona."""
+    padron = list(padron)
+    ids = [b.id_ruba for b in padron if b.id_ruba is not None]
+    if not ids:
+        return padron
+    with get_session() as session:
+        inactivos = {p.id_ruba for p in session.query(Personal).filter(Personal.id_ruba.in_(ids))
+                     if not _es_activo(p)}
+    return [b for b in padron if b.id_ruba not in inactivos]
+
+
+def bombero_historico(id_ruba: int) -> Optional[Bombero]:
+    """Persona que ya no está en el padrón ofrecido (baja, inactiva o fuera
+    del Excel) pero figura en un parte guardado: se arma desde la base local
+    para poder mostrarla en ESE parte sin ofrecerla como opción nueva."""
+    with get_session() as session:
+        p = session.query(Personal).filter(Personal.id_ruba == id_ruba).first()
+        if p is None:
+            return None
+        return Bombero(id_ruba=p.id_ruba, apellido=p.apellido, nombre=p.nombre, dni=p.dni or "",
+                       legajo=p.legajo, cargo=None, clasificacion=p.jerarquia or "", formacion="")

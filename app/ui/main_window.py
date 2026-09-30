@@ -42,6 +42,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QRadioButton,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QStackedWidget,
     QTableWidget,
@@ -54,6 +55,7 @@ from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 
 from app.core.catalogos import obtener_padron
+from app.core.horarios import fecha_fin_ajustada
 from app import __version__
 from app.paths import ICONO_APP, LOGO_INSTITUCIONAL, ruta_recurso_existente
 from app.db import DATA_DIR, get_session, moviles_para_despacho, reiniciar_partes, siguiente_numero_parte
@@ -100,10 +102,10 @@ from app.ui.autor_dialog import pedir_autor
 from app.services import cartografia
 from app.ui.widgets.map_widget import MapWidget, OperationsMapWindow
 from app.ui.damnificados_widgets import PanelDamnificados
-from app.services.personal_info import mandos_del_padron
+from app.services.personal_info import mandos_del_padron, padron_activo
 from app.ui.dotaciones_widgets import PanelDotaciones, PanelPersonalBase, personas_repetidas
 from app.ui.participacion_widgets import HorarioServicio, SelectorBombero
-from app.ui.bomberos_view import importar_bomberos_desde_excel, recargar_padron
+from app.ui.bomberos_view import importar_bomberos_desde_excel
 from app.ui.personnel_window import LegajoPrivadoWidget
 from app.ui import theme
 from app.ui.map_dialog import DialogoMarcarMapa, parsear_par
@@ -929,7 +931,9 @@ class MainWindow(QMainWindow):
         Si alguno falta, la app arranca igual y se avisa en la barra de estado."""
         self._avisos_catalogos: List[str] = []
         try:
-            self._padron = obtener_padron().bomberos
+            # Solo se ofrece el personal Activo en la base (una baja cargada en
+            # la app pesa más que el Excel de RUBA, que puede estar desactualizado).
+            self._padron = padron_activo(obtener_padron().bomberos)
         except FileNotFoundError:
             self._padron = []
             self._avisos_catalogos.append(
@@ -1003,7 +1007,10 @@ class MainWindow(QMainWindow):
             campo.valorCambiado.connect(lambda n=nombre: self._on_horario_general_editado(n))
         layout.addLayout(grid)
 
-        layout.addWidget(self._crear_subtitulo("Dotaciones (cada horario sigue al general hasta editarlo)"))
+        fila_subtitulo = QHBoxLayout()
+        fila_subtitulo.addWidget(self._crear_subtitulo("Dotaciones (cada horario sigue al general hasta editarlo)"), 1)
+        fila_subtitulo.addWidget(self._crear_boton_refrescar(marco))
+        layout.addLayout(fila_subtitulo)
         self.panel_dotaciones = PanelDotaciones(self._moviles_ruba, self._padron, marco)
         self.panel_dotaciones.llegadas_cambiadas.connect(self._recalcular_fin_servicio)
         layout.addWidget(self.panel_dotaciones)
@@ -1027,7 +1034,22 @@ class MainWindow(QMainWindow):
     def _on_horario_general_editado(self, campo: str) -> None:
         """Ajuste manual: ese campo deja de recalcularse solo."""
         self._horario_manual.add(campo)
+        self._ajustar_fecha_fin_general()
         self._on_horario_general_cambiado()
+
+    def _ajustar_fecha_fin_general(self) -> None:
+        """Fecha fin = fecha inicio, o el día siguiente si la hora fin es
+        anterior a la de inicio (el servicio cruzó la medianoche). No pisa una
+        fecha fin elegida a mano ni la que viene de la llegada de una dotación."""
+        if "fecha_llegada" in self._horario_manual:
+            return
+        panel = getattr(self, "panel_dotaciones", None)
+        if "hora_llegada" not in self._horario_manual and panel is not None and panel.llegada_mas_tardia() is not None:
+            return
+        nueva = fecha_fin_ajustada(self.campo_fecha_salida.value(), self.campo_hora_salida.value(),
+                                   None, self.campo_hora_llegada.value())
+        if nueva is not None and self.campo_hora_llegada.value() is not None:
+            self.campo_fecha_llegada.set_value(nueva)
 
     def _on_hora_inicio_cambiada(self) -> None:
         """Inicio del servicio = hora del llamado (o de la alarma, si no hay llamado)."""
@@ -1037,6 +1059,7 @@ class MainWindow(QMainWindow):
         if inicio is None:
             return
         self.campo_hora_salida.set_value(inicio)
+        self._ajustar_fecha_fin_general()
         self._on_horario_general_cambiado()
 
     def _recalcular_fin_servicio(self) -> None:
@@ -1190,7 +1213,8 @@ class MainWindow(QMainWindow):
         horario = self._horario_general()
         if horario.hora_salida and horario.hora_llegada and horario.fecha_salida and horario.fecha_llegada:
             if (horario.fecha_llegada, horario.hora_llegada) < (horario.fecha_salida, horario.hora_salida):
-                errores.append("El regreso del servicio es anterior a la salida.")
+                errores.append("El regreso del servicio es anterior a la salida (se comparan fecha y hora: "
+                               "si cruzó la medianoche, la fecha fin es la del día siguiente).")
         errores.extend(self.panel_damnificados.validar())
         errores.extend(self.panel_dotaciones.validar())
         errores.extend(self._validar_personas_del_servicio())
@@ -1323,6 +1347,52 @@ class MainWindow(QMainWindow):
             for d in self.panel_dotaciones.datos()
             if d["movil_id_ruba"] is not None and d["movil_id_ruba"] not in existentes
         ]
+
+    def _refrescar_padron_despacho(self, releer_excel: bool = False) -> None:
+        """Vuelve a leer el padrón (filtrando al personal inactivo en la base)
+        y lo reparte a todos los selectores de bomberos de la planilla, sin
+        perder a quien ya estaba elegido en el parte abierto."""
+        if releer_excel:
+            obtener_padron.cache_clear()
+        try:
+            padron = padron_activo(obtener_padron().bomberos)
+        except FileNotFoundError:
+            padron = []
+        except Exception:  # noqa: BLE001 - se queda con el padrón anterior
+            return
+        self._padron = padron
+        if padron:
+            self._avisos_catalogos = [a for a in self._avisos_catalogos if "padrón" not in a.lower()]
+        if getattr(self, "panel_dotaciones", None) is None:
+            return
+        self.panel_dotaciones.actualizar_padron(padron)
+        self.panel_base.set_padron(padron)
+        self.panel_damnificados.set_padron(padron)
+        self.selector_recibio.set_padron(padron)
+        self._mandos = mandos_del_padron(padron) if padron else []
+        self.selector_autorizo.set_padron(self._mandos)
+        self._actualizar_chips()
+
+    def _crear_boton_refrescar(self, parent: QWidget) -> QPushButton:
+        boton = QPushButton("🔄 Refrescar", parent)
+        boton.setObjectName("botonAhora")
+        boton.setToolTip("Recarga el padrón de bomberos y las unidades desde la base, sin reiniciar la app")
+        boton.setCursor(Qt.CursorShape.PointingHandCursor)
+        boton.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+        boton.clicked.connect(self._refrescar_padron_y_unidades)
+        return boton
+
+    def _refrescar_padron_y_unidades(self) -> None:
+        """Botón 🔄 Refrescar: recarga bomberos y unidades desde la base sin
+        reiniciar la app."""
+        self._refrescar_padron_despacho(releer_excel=True)
+        if hasattr(self, "_tabla_personal_dotacion"):
+            self._cargar_pagina_dotaciones()
+        else:
+            self._refrescar_moviles_despacho()
+        self.statusBar().showMessage(
+            f"Padrón y unidades actualizados: {len(self._padron)} bombero(s) activo(s), "
+            f"{len(self._moviles_ruba)} unidad(es) para despacho.", 6000)
 
     def _refrescar_moviles_despacho(self) -> None:
         """Tras importar / editar / eliminar / dar de baja unidades."""
@@ -1973,6 +2043,7 @@ class MainWindow(QMainWindow):
         boton_importar_unidades.clicked.connect(lambda: self._panel_unidades.importar_desde_excel())
         fila_botones.addWidget(boton_nuevo_bombero)
         fila_botones.addWidget(boton_nueva_unidad)
+        fila_botones.addWidget(self._crear_boton_refrescar(pagina))
         fila_botones.addStretch(1)
         fila_botones.addWidget(boton_importar_padron)
         fila_botones.addWidget(boton_importar_unidades)
@@ -2058,6 +2129,7 @@ class MainWindow(QMainWindow):
     def _cargar_pagina_dotaciones(self) -> None:
         self._panel_unidades.recargar()
         self._refrescar_moviles_despacho()
+        self._refrescar_padron_despacho()
         with get_session() as session:
             personal = session.query(Personal).order_by(Personal.apellido, Personal.nombre).all()
             datos_personal = [(p.id, p.nombre_completo(), p.legajo or "—", p.dni or "—", p.jerarquia or "—",
@@ -2097,11 +2169,8 @@ class MainWindow(QMainWindow):
         refrescan la tabla de personal y el chip del padrón."""
         if not importar_bomberos_desde_excel(self):
             return
-        padron = recargar_padron()
-        if padron is not None:
-            self._padron = padron
-            self._avisos_catalogos = [a for a in self._avisos_catalogos if "padrón" not in a.lower()]
-            self._actualizar_chips()
+        # _cargar_pagina_dotaciones -> _refrescar_padron_despacho reparte el
+        # padrón nuevo (ya filtrado) a los selectores de la planilla.
         self._cargar_pagina_dotaciones()
 
     def _alternar_movil(self, movil_id: int) -> None:
@@ -2115,6 +2184,7 @@ class MainWindow(QMainWindow):
         with get_session() as session:
             persona = session.get(Personal, personal_id)
             persona.activo = not persona.activo
+            persona.estado = "Activo" if persona.activo else "Baja"
         self._cargar_pagina_dotaciones()
 
     def _confirmar_eliminacion(self, titulo: str, texto: str) -> bool:

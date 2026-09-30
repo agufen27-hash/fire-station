@@ -53,6 +53,7 @@ from datetime import date, time
 from typing import Any, Dict, List, Optional
 
 from app.core.catalogos import formulario_para, leer_mapping
+from app.core.horarios import fecha_fin_ajustada
 from app.models import CondicionDamnificado, FuncionBase, Incidente, Personal, RolDotacion
 
 PAYLOAD_VERSION = 1
@@ -190,6 +191,26 @@ def fmt_hora(valor: Optional[time]) -> Optional[str]:
     return valor.strftime("%H:%M") if valor else None
 
 
+def opcional(valor: Any) -> Any:
+    """Campo NO obligatorio de RUBA (póliza, aseguradora, DNI / teléfono del
+    denunciante, dominio...): vacío, None o solo espacios -> None, así la
+    automatización lo saltea en vez de tipear "" o frenar la carga."""
+    if valor is None:
+        return None
+    if isinstance(valor, str):
+        return valor.strip() or None
+    return valor
+
+
+def horario_ruba(fecha_ini: Optional[date], hora_ini: Optional[time],
+                 fecha_fin: Optional[date], hora_fin: Optional[time]) -> Dict[str, Optional[str]]:
+    """Inicio y fin con fecha + hora completas: si cruza la medianoche
+    (23:30 -> 01:15) la fecha de fin pasa al día siguiente."""
+    return {"fecha_inicio": fmt_fecha(fecha_ini), "hora_inicio": fmt_hora(hora_ini),
+            "fecha_fin": fmt_fecha(fecha_fin_ajustada(fecha_ini, hora_ini, fecha_fin, hora_fin)),
+            "hora_fin": fmt_hora(hora_fin)}
+
+
 def numero_parte_ruba(numero_local: str) -> str:
     """RUBA solo acepta dígitos: '004/2026' -> '0042026'."""
     return re.sub(r"\D", "", numero_local or "")
@@ -307,12 +328,13 @@ def _vehiculos_accidente(datos_especificos: Optional[Dict[str, Any]]) -> List[Di
             "marca_nombre": v.get("marca"),
             "tipo": tipo_vehiculo_ruba(v.get("tipo")),
             "tipo_nombre": v.get("tipo"),
-            "dominio": v.get("dominio"),
-            "modelo": v.get("modelo"),
-            "anio": v.get("anio"),
+            "dominio": opcional(v.get("dominio")),
+            "modelo": opcional(v.get("modelo")),
+            "anio": opcional(v.get("anio")),
             "asegurado": bool(v.get("asegurado")),
-            "aseguradora": v.get("aseguradora") if v.get("asegurado") else None,
-            "poliza": v.get("poliza") if v.get("asegurado") else None,
+            # Aseguradora y póliza son opcionales aunque esté asegurado.
+            "aseguradora": opcional(v.get("aseguradora")) if v.get("asegurado") else None,
+            "poliza": opcional(v.get("poliza")) if v.get("asegurado") else None,
         }
         for v in datos_especificos["vehiculos"]
     ]
@@ -337,12 +359,22 @@ def _condicionales(datos_especificos: Optional[Dict[str, Any]], tipo_id: Optiona
 def construir_payload(d: DatosServicio) -> Dict[str, Any]:
     calle, altura = separar_calle_altura(d.calle_altura)
     fecha_salida = d.fecha_salida or d.fecha
-    fecha_llegada = d.fecha_llegada or fecha_salida
+    general = horario_ruba(fecha_salida, d.hora_salida, d.fecha_llegada, d.hora_llegada)
+
+    def horario_de(fecha_ini, hora_ini, fecha_fin, hora_fin) -> Dict[str, Optional[str]]:
+        """Horario propio de una dotación; lo que falte, del general. La
+        fecha de fin general solo se hereda si tampoco hay inicio propio (si
+        no, se deduce del inicio propio con la regla de la medianoche)."""
+        propio = fecha_ini is not None or hora_ini is not None
+        return horario_ruba(
+            fecha_ini or fecha_salida, hora_ini or d.hora_salida,
+            fecha_fin or (None if propio else d.fecha_llegada), hora_fin or d.hora_llegada,
+        )
 
     def damnificados_de(condicion: str) -> List[Dict[str, Optional[str]]]:
         return [
-            {"nombre": x.get("nombre"), "apellido": x.get("apellido"), "dni": x.get("dni"),
-             "genero": genero_ruba(x.get("genero"))}
+            {"nombre": opcional(x.get("nombre")), "apellido": opcional(x.get("apellido")),
+             "dni": opcional(x.get("dni")), "genero": genero_ruba(x.get("genero"))}
             for x in d.damnificados if x.get("condicion") == condicion
         ]
 
@@ -364,31 +396,32 @@ def construir_payload(d: DatosServicio) -> Dict[str, Any]:
             "tipo_zona": d.zona,
             "latitud": d.latitud,
             "longitud": d.longitud,
-            "nombre_solicitante": d.denunciante_nombre,
-            "apellido_solicitante": d.denunciante_apellido,
-            "telefono_solicitante": d.denunciante_telefono,
-            "dni_solicitante": d.denunciante_dni,
+            # Datos del denunciante: todos opcionales (None = no se tipean).
+            "nombre_solicitante": opcional(d.denunciante_nombre),
+            "apellido_solicitante": opcional(d.denunciante_apellido),
+            "telefono_solicitante": opcional(d.denunciante_telefono),
+            "dni_solicitante": opcional(d.denunciante_dni),
             "descripcion": d.descripcion,
             "civiles_heridos": d.civiles_heridos,
             "civiles_fallecidos": d.civiles_fallecidos,
             "civiles_desaparecidos": d.civiles_desaparecidos,
-            "compania_seguro": d.seguro_compania,
-            "numero_poliza": d.seguro_poliza,
+            "compania_seguro": opcional(d.seguro_compania),
+            "numero_poliza": opcional(d.seguro_poliza),
             # True solo si el parte trae compañía o póliza reales: decide si la
             # automatización busca el bloque "Datos del Seguro" en RUBA.
-            "tiene_seguro": bool((d.seguro_compania or "").strip() or (d.seguro_poliza or "").strip()),
+            "tiene_seguro": bool(opcional(d.seguro_compania) or opcional(d.seguro_poliza)),
             "condicionales": _condicionales(d.datos_especificos, d.tipo_id, d.categoria_codigo),
         },
         "damnificados": {
             "heridos": damnificados_de(CondicionDamnificado.HERIDO.value),
             "fallecidos": damnificados_de(CondicionDamnificado.FALLECIDO.value),
             "bienes": [
-                {"tipo": b.get("tipo"), "descripcion": b.get("descripcion"),
-                 "titular": b.get("titular"), "seguro": b.get("seguro")}
+                {"tipo": b.get("tipo"), "descripcion": opcional(b.get("descripcion")),
+                 "titular": opcional(b.get("titular")), "seguro": opcional(b.get("seguro"))}
                 for b in d.bienes
             ],
             "bomberos": [
-                {"bombero": _persona(b["persona"]), "detalle_atencion": b.get("detalle")}
+                {"bombero": _persona(b["persona"]), "detalle_atencion": opcional(b.get("detalle"))}
                 for b in d.bomberos_damnificados
             ],
         },
@@ -396,10 +429,10 @@ def construir_payload(d: DatosServicio) -> Dict[str, Any]:
             "numero_parte": numero_parte_ruba(d.numero_parte),
             "hora_llamado": fmt_hora(d.hora_llamado),
             "hora_toque": fmt_hora(d.hora_toque),
-            "fecha_salida": fmt_fecha(fecha_salida),
-            "hora_salida": fmt_hora(d.hora_salida),
-            "fecha_llegada": fmt_fecha(fecha_llegada),
-            "hora_llegada": fmt_hora(d.hora_llegada),
+            "fecha_salida": general["fecha_inicio"],
+            "hora_salida": general["hora_inicio"],
+            "fecha_llegada": general["fecha_fin"],
+            "hora_llegada": general["hora_fin"],
             "bomberos_heridos": d.bomberos_lesionados or 0,
             "bomberos_fallecidos": 0,
             "bomberos_desaparecidos": 0,
@@ -414,10 +447,7 @@ def construir_payload(d: DatosServicio) -> Dict[str, Any]:
             "bomberos": [
                 {
                     "autocomplete_nombre": _persona(b.persona),
-                    "fecha_inicio": fmt_fecha(b.fecha_inicio or fecha_salida),
-                    "hora_inicio": fmt_hora(b.hora_inicio or d.hora_salida),
-                    "fecha_fin": fmt_fecha(b.fecha_fin or fecha_llegada),
-                    "hora_fin": fmt_hora(b.hora_fin or d.hora_llegada),
+                    **horario_de(b.fecha_inicio, b.hora_inicio, b.fecha_fin, b.hora_fin),
                     "tipo_tarea": b.tipo_tarea,
                     "is_encargado": b.encargado,
                 }
@@ -431,16 +461,19 @@ def construir_payload(d: DatosServicio) -> Dict[str, Any]:
                     "numero_movil": v.numero_movil,
                     "autocomplete_chofer": _persona(v.chofer),
                     # Sin horario propio, el móvil hereda el general del servicio.
-                    "fecha_salida": fmt_fecha(v.fecha_salida or fecha_salida),
-                    "hora_salida": fmt_hora(v.hora_salida or d.hora_salida),
-                    "fecha_llegada": fmt_fecha(v.fecha_llegada or fecha_llegada),
-                    "hora_llegada": fmt_hora(v.hora_llegada or d.hora_llegada),
+                    **_como_vehiculo(horario_de(v.fecha_salida, v.hora_salida, v.fecha_llegada, v.hora_llegada)),
                 }
                 for v in d.vehiculos
             ],
         },
         "vehiculos_accidentes": _vehiculos_accidente(d.datos_especificos),
     }
+
+
+def _como_vehiculo(horario: Dict[str, Optional[str]]) -> Dict[str, Optional[str]]:
+    """Mismo horario con las claves de 'Vehículos intervinientes' de RUBA."""
+    return {"fecha_salida": horario["fecha_inicio"], "hora_salida": horario["hora_inicio"],
+            "fecha_llegada": horario["fecha_fin"], "hora_llegada": horario["hora_fin"]}
 
 
 def validar_payload(payload: Dict[str, Any]) -> List[str]:

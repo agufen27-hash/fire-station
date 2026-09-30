@@ -28,7 +28,7 @@ crear: justamente hay que poder corregirlos y reintentar. Editar y eliminar los 
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import date, datetime, time, timedelta
+from datetime import date, time
 from typing import Dict, List, Optional, Set
 
 from PySide6.QtCore import QPoint, Qt, Signal
@@ -53,6 +53,7 @@ from PySide6.QtWidgets import (
 )
 from sqlalchemy.orm import joinedload
 
+from app.core.horarios import duracion as duracion_servicio
 from app.db import get_session
 from app.models import DotacionSalida, EstadoRuba, Incidente, SalidaUnidad, TipoIncidente
 from app.reports.excel_generator import generar_e_imprimir_pcd2, generar_e_imprimir_pcs, resumen_advertencias
@@ -85,16 +86,18 @@ MOTIVO_PARTE_CERRADO = (
 
 def duracion_horas(fecha_ini: Optional[date], hora_ini: Optional[time],
                    fecha_fin: Optional[date], hora_fin: Optional[time]) -> float:
-    """Horas entre salida y regreso. Sin fecha de regreso y con la hora de
-    regreso "menor" se asume que cruzó la medianoche. 0 si falta algún
-    horario o el resultado no es creíble (negativo o > MAX_HORAS_SERVICIO)."""
+    """Horas entre salida y regreso (fecha + hora completas). Sin fecha de
+    regreso, o con la misma que la salida y la hora "menor", se asume que
+    cruzó la medianoche (23:30 -> 01:15 = 1,75 h). 0 si falta algún horario
+    o el resultado no es creíble (negativo o > MAX_HORAS_SERVICIO)."""
     if hora_ini is None or hora_fin is None:
         return 0.0
     inicio_fecha = fecha_ini or fecha_fin or date.today()
-    fin_fecha = fecha_fin or inicio_fecha
-    delta = datetime.combine(fin_fecha, hora_fin) - datetime.combine(inicio_fecha, hora_ini)
-    if delta < timedelta(0) and fecha_fin is None:
-        delta += timedelta(days=1)
+    if fecha_fin is not None and fecha_fin < inicio_fecha:
+        return 0.0  # regreso con fecha anterior a la salida: dato mal cargado
+    delta = duracion_servicio(inicio_fecha, hora_ini, fecha_fin, hora_fin)
+    if delta is None:
+        return 0.0
     horas = delta.total_seconds() / 3600
     return horas if 0 <= horas <= MAX_HORAS_SERVICIO else 0.0
 

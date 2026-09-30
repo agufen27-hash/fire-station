@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QRadioButton,
     QSpinBox,
     QStackedWidget,
@@ -53,18 +54,20 @@ from app.core.catalogos import (  # noqa: F401
 class Campo:
     clave: str        # clave en ruba_mapping.json (y en datos_especificos_json)
     etiqueta: str
-    tipo: str         # "combo" | "entero" | "decimal" | "radio"
+    tipo: str         # "combo" | "entero" | "decimal" | "radio" | "texto"
 
 
 CAMPOS_POR_FORMULARIO: Dict[str, List[Campo]] = {
     FORM_FORESTAL: [
         Campo("tipo_lugar", "Tipo de lugar forestal", "combo"),
+        Campo("tipo_lugar_otro", "Otro tipo de lugar (si eligió 'Otro')", "texto"),
         Campo("unidad_superficie", "Unidad de superficie", "combo"),
         Campo("cantidad_superficie", "Cantidad de superficie", "decimal"),
         Campo("causa", "Causa del incendio", "combo"),
     ],
     FORM_ESTRUCTURAL: [
         Campo("tipo_lugar", "Tipo de lugar", "combo"),
+        Campo("tipo_lugar_otro", "Otro tipo de lugar (si eligió 'Otros')", "texto"),
         Campo("cantidad_pisos", "Cantidad de pisos", "entero"),
         Campo("cantidad_ambientes", "Cantidad de ambientes", "entero"),
         Campo("numero_piso", "Piso N°", "entero"),
@@ -225,6 +228,23 @@ class _PaginaFormulario(QWidget):
             grid.addWidget(self._crear_widget(campo, mapping), fila, 1)
             fila += 1
 
+        # "<campo>_otro": texto libre habilitado solo con la opción Otro/Otros.
+        for clave, widget in self._widgets.items():
+            combo = self._widgets.get(clave[: -len("_otro")]) if clave.endswith("_otro") else None
+            if isinstance(widget, QLineEdit) and isinstance(combo, QComboBox):
+                codigos_otro = {valor for etiqueta, valor in opciones_combo(mapping, formulario, clave[: -len("_otro")])
+                                if etiqueta.lower().startswith("otro")}
+                combo.currentIndexChanged.connect(
+                    lambda _i, c=combo, t=widget, cod=codigos_otro: self._habilitar_otro(c, t, cod))
+                self._habilitar_otro(combo, widget, codigos_otro)
+
+    @staticmethod
+    def _habilitar_otro(combo: QComboBox, texto: QLineEdit, codigos_otro: set) -> None:
+        habilitado = combo.currentData() in codigos_otro
+        texto.setEnabled(habilitado)
+        if not habilitado:
+            texto.clear()
+
     def _crear_widget(self, campo: Campo, mapping: Dict[str, Any]) -> QWidget:
         if campo.tipo == "combo":
             combo = QComboBox(self)
@@ -241,6 +261,12 @@ class _PaginaFormulario(QWidget):
             spin = _spin_decimal(self)
             self._widgets[campo.clave] = spin
             return spin
+        if campo.tipo == "texto":
+            texto = QLineEdit(self)
+            texto.setMaxLength(120)
+            texto.setPlaceholderText("Opcional: describí el lugar")
+            self._widgets[campo.clave] = texto
+            return texto
 
         # radio
         contenedor = QWidget(self)
@@ -270,6 +296,8 @@ class _PaginaFormulario(QWidget):
                 valor = None if widget.value() < 0 else round(widget.value(), 2)
             elif isinstance(widget, QSpinBox):
                 valor = None if widget.value() < 0 else widget.value()
+            elif isinstance(widget, QLineEdit):
+                valor = widget.text().strip() or None
             else:  # QButtonGroup
                 boton = widget.checkedButton()
                 valor = boton.property("valor_ruba") if boton else None
@@ -283,6 +311,8 @@ class _PaginaFormulario(QWidget):
                 widget.setCurrentIndex(0)
             elif isinstance(widget, (QSpinBox, QDoubleSpinBox)):
                 widget.setValue(VALOR_VACIO_NUMERICO)
+            elif isinstance(widget, QLineEdit):
+                widget.clear()
             else:
                 # Con un grupo exclusivo no se puede "des-tildar" directamente.
                 widget.setExclusive(False)
@@ -304,6 +334,8 @@ class _PaginaFormulario(QWidget):
                     widget.setCurrentIndex(indice)
             elif isinstance(widget, (QSpinBox, QDoubleSpinBox)):
                 widget.setValue(valor)
+            elif isinstance(widget, QLineEdit):
+                widget.setText(str(valor))
             elif widget is not None:  # QButtonGroup
                 for boton in widget.buttons():
                     if boton.property("valor_ruba") == valor:
