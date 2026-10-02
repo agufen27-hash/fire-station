@@ -527,21 +527,37 @@ _JS_ERRORES_VALIDACION = r"""
 """
 
 _JS_CAMPOS_INVALIDOS = r"""
-() => {
+(opcionales) => {
     const nombres = [];
+    const sufijo = (el) => (el.id || "").split("_").pop();
     const agregar = (el) => {
         const tipo = (el.getAttribute("type") || "").toLowerCase();
         if (el.disabled || ["hidden", "submit", "button"].includes(tipo)) return;
         const n = el.name || el.id;
         if (n && !nombres.includes(n)) nombres.push(n);
     };
-    const visible = (el) => el.getClientRects().length > 0;
+    const visible = (el) => el.getClientRects().length > 0 && getComputedStyle(el).visibility !== "hidden";
+    // Contenedor activo: el grupo del control (y su fieldset/solapa) se ve.
+    const contenedorActivo = (el) => {
+        for (const caja of [el.closest(".control-group, .form-group"), el.closest("fieldset"), el.closest(".tab-pane")]) {
+            if (caja && !visible(caja)) return false;
+        }
+        return true;
+    };
+    const activo = (el) => !el.disabled && visible(el) && contenedorActivo(el);
+    // Un `required` vacío de un opcional no es un error real si el servidor no lo marcó.
+    const marcadoPorServidor = (el) => el.classList.contains("error")
+        || !!el.closest(".control-group.error, .form-group.has-error, .has-error");
+    const falsoRequired = (el) => opcionales.includes(sufijo(el)) && el.validity
+        && el.validity.valueMissing && !marcadoPorServidor(el);
     document.querySelectorAll("input, select, textarea").forEach((el) => {
-        if ((el.matches(":invalid") && visible(el)) || el.classList.contains("error")) agregar(el);
+        if (!activo(el)) return;
+        if ((el.matches(":invalid") && !falsoRequired(el)) || el.classList.contains("error")) agregar(el);
     });
     // Bootstrap 2 marca el contenedor (div.control-group.error), no el control.
     document.querySelectorAll(".error:not(input):not(select):not(textarea)").forEach((grupo) => {
-        grupo.querySelectorAll("input, select, textarea").forEach(agregar);
+        if (!visible(grupo)) return;
+        grupo.querySelectorAll("input, select, textarea").forEach((el) => { if (activo(el)) agregar(el); });
     });
     return nombres.slice(0, 50);
 }
@@ -555,8 +571,11 @@ def extraer_errores_validacion(page: Page) -> List[str]:
     return [str(t) for t in resultado] if isinstance(resultado, list) else []
 
 
-def detectar_campos_invalidos(page: Page) -> List[str]:
-    """name (o id) de los controles que el navegador considera `:invalid` o
-    que el servidor marcó con la clase `error`."""
-    resultado = _evaluar_con_reintentos(page, _JS_CAMPOS_INVALIDOS)
+def detectar_campos_invalidos(page: Page, opcionales: Any = ()) -> List[str]:
+    """name (o id) de los controles VISIBLES, habilitados y con su contenedor
+    activo que el navegador considera `:invalid` o que el servidor marcó con
+    la clase `error`. Los `opcionales` (sufijo del id Symfony, p. ej.
+    "companiaSeguro") vacíos solo cuentan si el servidor los marcó: su
+    `required` HTML5 solo no es un error real."""
+    resultado = _evaluar_con_reintentos(page, _JS_CAMPOS_INVALIDOS, list(opcionales))
     return [str(n) for n in resultado] if isinstance(resultado, list) else []

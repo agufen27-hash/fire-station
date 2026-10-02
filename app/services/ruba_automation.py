@@ -246,6 +246,89 @@ _JS_SEGURO_SIN_REQUIRED = r"""(nombres) => {
     return liberados;
 }"""
 
+# "Vehículos Afectados / Medios aéreos" del formulario de Incendio. Sin
+# medios aéreos en el parte el combo "Seleccionar Intervinientes" va en "No"
+# y los contadores se deshabilitan (no viajan ni se validan); con apoyo
+# aéreo explícito va en "Sí" y se cargan las cantidades.
+MEDIOS_AEREOS_CAMPOS_RUBA = {
+    "aviones": "cantidadAviones",
+    "avionetas": "cantidadAvionetas",
+    "helicopteros": "cantidadHelicopteros",
+    "otros": "cantidadOtrosAereo",
+}
+_JS_MEDIOS_AEREOS = r"""([campos, hay, cantidades]) => {
+    const inputs = campos.map((n) => document.querySelector('[id$="_' + n + '"]')).filter(Boolean);
+    if (!inputs.length) return "sin_campos";
+    const esSiNo = (s) => {
+        const vals = Array.from(s.options || []).map((o) => (o.value || "").toLowerCase());
+        return vals.some((v) => ["si", "sí", "1", "true"].includes(v))
+            && vals.some((v) => ["no", "0", "false"].includes(v));
+    };
+    const ajeno = (s) => /personas|bomberos/i.test(s.id || s.name || "");
+    let combo = Array.from(document.querySelectorAll("select"))
+        .find((s) => /hay\w*(aere|medio|avion)/i.test(s.id || s.name || ""));
+    // Sin id reconocible: el combo si/no más cercano que comparte bloque con los contadores.
+    for (let nodo = inputs[0].parentElement; !combo && nodo && nodo !== document.body; nodo = nodo.parentElement) {
+        combo = Array.from(nodo.querySelectorAll("select")).find((s) => esSiNo(s) && !ajeno(s));
+    }
+    const disparar = (el) => {
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+        if (window.jQuery) { try { window.jQuery(el).trigger("change"); } catch (e) {} }
+    };
+    if (combo) {
+        const buscados = hay ? ["si", "sí", "1", "true"] : ["no", "0", "false"];
+        const opcion = Array.from(combo.options).find((o) => buscados.includes((o.value || "").toLowerCase()));
+        if (opcion && combo.value !== opcion.value) { combo.value = opcion.value; disparar(combo); }
+    }
+    inputs.forEach((el, i) => {
+        if (hay) {
+            el.disabled = false;
+            el.value = String(cantidades[i] || 0);
+            disparar(el);
+        } else {
+            el.value = "";
+            el.removeAttribute("required");
+            el.removeAttribute("pattern");
+            el.disabled = true;
+        }
+    });
+    return combo ? (hay ? "si" : "no") : "sin_combo";
+}"""
+
+# Opcionales/condicionales de Datos Generales que RUBA puede marcar
+# `required` (o con `pattern`) aunque el parte no los use. Antes del submit,
+# si están VACÍOS se les quita `required`/`pattern`; si además su bloque está
+# inactivo (oculto o con el combo en "No") se deshabilitan.
+CAMPOS_OPCIONALES_PRE_SUBMIT = (
+    "otraLocalidad", *SEGURO_CAMPOS_RUBA, *MEDIOS_AEREOS_CAMPOS_RUBA.values(),
+    "otroTipoLugarForestal", "otroTipoLugar",
+)
+_JS_LIBERAR_OPCIONALES = r"""([nombres, inactivos]) => {
+    const liberados = [], deshabilitados = [];
+    const oculto = (el) => {
+        if (el.getClientRects().length === 0) return true;
+        const caja = el.closest(".control-group, .form-group, fieldset");
+        return !!caja && (caja.getClientRects().length === 0 || getComputedStyle(caja).visibility === "hidden");
+    };
+    nombres.forEach((n) => {
+        document.querySelectorAll('[id$="_' + n + '"]').forEach((el) => {
+            if (!["INPUT", "SELECT", "TEXTAREA"].includes(el.tagName) || el.disabled) return;
+            if ((el.value || "").trim()) return;
+            if (el.hasAttribute("required") || el.hasAttribute("pattern")) {
+                el.removeAttribute("required");
+                el.removeAttribute("pattern");
+                liberados.push(el.id);
+            }
+            if (inactivos.includes(n) || oculto(el)) {
+                el.disabled = true;
+                deshabilitados.push(el.id);
+            }
+        });
+    });
+    return { liberados, deshabilitados };
+}"""
+
 _JS_OPCIONES = "(el) => Array.from(el.options || []).map(o => ({value: o.value, text: o.textContent.trim()}))"
 # Un <select> oculto por select2/chosen sigue aplicando si su contenedor se ve.
 _JS_CONTENEDOR_VISIBLE = """(el) => {
@@ -466,6 +549,8 @@ class RubaServiceAutomation:
         self.ruba_id_descartado: Optional[str] = None
         self.aviso_recreado: Optional[str] = None
         self._paso_activo = PasoRuba.SESION
+        # Campos de bloques condicionales inactivos (seguro, medios aéreos en "No").
+        self._campos_inactivos: set = set()
 
     # ------------------------------------------------------------------
     # Orquestación
@@ -679,6 +764,7 @@ class RubaServiceAutomation:
         datos = self.payload["editar_general"]
         sel = self.sel["editar_general"]
         self._esperar_formulario_general(sel["calle"])
+        self._campos_inactivos.clear()  # reintento: se recalcula con el formulario nuevo
 
         if datos.get("localidad_autocomplete"):
             self._cargar_localidad(sel["localidad_autocomplete"], datos["localidad_autocomplete"])
@@ -698,6 +784,7 @@ class RubaServiceAutomation:
         self._cargar_personas_damnificadas(sel, datos)
 
         self._cargar_condicionales(datos.get("condicionales"))
+        self._cargar_medios_aereos(datos)
         self._cargar_vehiculos_accidente(self.payload.get("vehiculos_accidentes") or [])
         if self.payload.get("damnificados", {}).get("bienes"):
             self.advertencias.append(
@@ -728,6 +815,8 @@ class RubaServiceAutomation:
           compañía y póliza. Si RUBA no muestra el bloque, advertencia."""
         sel_compania, sel_poliza = sel["compania_seguro"], sel["numero_poliza"]
         if not datos.get("tiene_seguro"):
+            # Bloque inactivo: el pre-submit deshabilita sus inputs vacíos.
+            self._campos_inactivos.update(SEGURO_CAMPOS_RUBA)
             try:
                 liberados = self.page.evaluate(_JS_SEGURO_SIN_REQUIRED, list(SEGURO_CAMPOS_RUBA))
             except PlaywrightError as e:  # nunca frena la carga por el seguro
@@ -754,6 +843,50 @@ class RubaServiceAutomation:
                 "El parte tiene seguro pero RUBA no mostró 'Datos del Seguro' para este tipo de incidente: "
                 "compañía y póliza no se cargaron."
             )
+
+    def _cargar_medios_aereos(self, datos: Dict[str, Any]) -> None:
+        """"Vehículos Afectados / Medios aéreos" (formulario de Incendio).
+
+        Solo si el parte trae explícitamente apoyo aéreo (`medios_aereos`
+        con alguna cantidad > 0) el combo "Seleccionar Intervinientes" va en
+        "Sí" y se cargan las cantidades. Si no, va en "No" y los contadores
+        quedan vacíos y deshabilitados: Symfony/HTML5 no los valida."""
+        medios = datos.get("medios_aereos") or {}
+        cantidades = [_entero(medios.get(clave)) for clave in MEDIOS_AEREOS_CAMPOS_RUBA]
+        hay = any(cantidades)
+        try:
+            estado = self.page.evaluate(
+                _JS_MEDIOS_AEREOS, [list(MEDIOS_AEREOS_CAMPOS_RUBA.values()), hay, cantidades])
+        except PlaywrightError as e:  # nunca frena la carga por los medios aéreos
+            log.info("Paso 3: no se pudo revisar 'Medios aéreos' (%s).", e)
+            estado = None
+        if estado == "sin_campos":
+            return  # este tipo de incidente no tiene el bloque
+        if not hay:
+            self._campos_inactivos.update(MEDIOS_AEREOS_CAMPOS_RUBA.values())
+        if estado == "sin_combo":
+            log.info("Paso 3: RUBA no mostró el combo de medios aéreos; contadores %s.",
+                     "cargados" if hay else "deshabilitados")
+        else:
+            log.info("Paso 3: medios aéreos -> '%s' %s", estado, cantidades if hay else "")
+        if hay and estado == "sin_combo":
+            self.advertencias.append(
+                "El parte tiene medios aéreos pero RUBA no mostró 'Seleccionar Intervinientes': revisalo en RUBA.")
+
+    def _liberar_opcionales_pre_submit(self) -> None:
+        """Justo antes del submit: a los opcionales/condicionales VACÍOS se les
+        quita `required` y `pattern`; los de bloques inactivos (seguro o
+        medios aéreos en "No", o contenedor oculto) se deshabilitan para que
+        ni el navegador ni Symfony los marquen como inválidos."""
+        try:
+            resultado = self.page.evaluate(
+                _JS_LIBERAR_OPCIONALES, [list(CAMPOS_OPCIONALES_PRE_SUBMIT), sorted(self._campos_inactivos)])
+        except PlaywrightError as e:
+            log.info("No se pudieron liberar los opcionales antes del guardado (%s).", e)
+            return
+        if isinstance(resultado, dict) and (resultado.get("liberados") or resultado.get("deshabilitados")):
+            log.info("Pre-submit: required/pattern quitado en %s; deshabilitados %s",
+                     resultado.get("liberados"), resultado.get("deshabilitados"))
 
     def _cargar_localidad(self, selector: str, texto: str) -> None:
         """Localidad es un par Symfony: <input type=hidden id=..._localidad>
@@ -1390,6 +1523,7 @@ class RubaServiceAutomation:
         self._eliminar_vehiculos_sobrantes(filas)
 
         _sembrar_tab_activa(self.page)
+        self._liberar_opcionales_pre_submit()
         url_antes = self.page.url
         boton_guardar = ", ".join(filter(None, (sel.get("btn_guardar_cambios"), SEL_BTN_GUARDAR_CAMBIOS)))
         self._primero_visible(boton_guardar).click()
@@ -1402,7 +1536,7 @@ class RubaServiceAutomation:
         if errores:
             raise RubaAutomationError(
                 PasoRuba.VEHICULOS,
-                f"RUBA rechazó el guardado final: {errores} campos_invalidos={detectar_campos_invalidos(self.page)}",
+                f"RUBA rechazó el guardado final: {errores} campos_invalidos={detectar_campos_invalidos(self.page, CAMPOS_OPCIONALES_PRE_SUBMIT)}",
             )
         self.ruba_id_remoto = self.ruba_id_remoto or _extraer_id(self.page.url)
 
@@ -1814,6 +1948,7 @@ class RubaServiceAutomation:
         salió bien, redirige (302) a la pantalla siguiente. `destinos`
         restringe las pantallas válidas (ej. damnificados o participación)."""
         _sembrar_tab_activa(self.page)
+        self._liberar_opcionales_pre_submit()
         url_antes = self.page.url
         try:
             with self.page.expect_navigation(wait_until="domcontentloaded", timeout=self.timeout_navegacion_ms):
@@ -1832,7 +1967,7 @@ class RubaServiceAutomation:
             raise RubaAutomationError(
                 self._paso_en_curso(),
                 f"RUBA rechazó el guardado: {errores or 'sin errores visibles'} "
-                f"campos_invalidos={detectar_campos_invalidos(self.page)}",
+                f"campos_invalidos={detectar_campos_invalidos(self.page, CAMPOS_OPCIONALES_PRE_SUBMIT)}",
             )
         if destinos:
             raise RubaAutomationError(

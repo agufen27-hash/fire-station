@@ -12,6 +12,8 @@ PCS  Cabecera   N° parte C6 · Día J6 · Fecha T6
      Siniestro  Tipo D17 ("Tipo - Subtipo") · Localidad D19 · Calle D20 · Zona D21
      Operativa  Autorizó A23 · Descripción A26 · Operador 1 F31 · Operador 2 F32 ·
                 Reserva (apresto) B35:B47 y O35:O47 (13 + 13)
+     Resumen    Total en cuartel (apresto) A51 · Total en servicio E51 (ancla de
+                E51:H51) · Total general I51 · Confeccionó (validado con PIN) N51
 
 PCD2 Página S6 · Total páginas V6 · N° parte C6. Dos dotaciones por página
      (superior 1, 3, 5... / inferior 2, 4, 6...); con más de 2 dotaciones se
@@ -21,9 +23,10 @@ PCD2 Página S6 · Total páginas V6 · N° parte C6. Dos dotaciones por página
      Inferior: Dot A32 · Unidad C32 · Salida I32/L32 · Arribo O32 · Llegada R32/U32 ·
                Jefe B34 · Grado O34 · Chofer E37 · Embarcados E38:E47 · Firma P49
 
-TIPOGRAFÍA (app/reports/tipografia.py): todo dato escrito va en Aptos 12 pt
-(o Segoe UI / Helvetica si Aptos no está instalada); texto a la izquierda y
-números / fechas / horas centrados.
+TIPOGRAFÍA: todo dato escrito en las planillas Excel va en Arial 10 pt
+(la de las plantillas oficiales); texto a la izquierda y números / fechas /
+horas centrados (app/reports/tipografia.py decide qué es numérico). Los
+totales de la fila 51 de la PCS van además en negrita.
 
 PIE Y ENCABEZADO DE PÁGINA: el pie izquierdo lleva quién confeccionó la
 planilla (validado con PIN al guardarla) y la PCD2 lleva en el encabezado
@@ -59,7 +62,7 @@ from openpyxl.worksheet.worksheet import Worksheet
 from app.db import get_session
 from app.models import MEDIOS_CONTACTO, FuncionBase, Incidente, RolDotacion
 from app.paths import get_resource_path, get_writable_dir
-from app.reports.tipografia import TAMANO_PT, es_numerico, fuente_planillas
+from app.reports.tipografia import es_numerico
 
 # Las plantillas son de solo lectura (viajan embebidas en el bundle); las
 # planillas completadas son escribibles y viven al lado del .exe.
@@ -68,6 +71,10 @@ OUTPUT_DIR = get_writable_dir("output") / "planillas"
 
 PCS_TEMPLATE_NOMBRE = "PCS.xlsx"
 PCD2_TEMPLATE_NOMBRE = "PCD2.xlsx"
+
+# Tipografía de todo dato escrito en las planillas Excel (la de las plantillas).
+FUENTE_EXCEL = "Arial"
+TAMANO_EXCEL_PT = 10
 
 DIAS_SEMANA = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
 
@@ -82,6 +89,8 @@ MAPEO_PCS: Dict[str, Any] = {
     "tipo_siniestro": "D17", "localidad": "D19", "calle": "D20", "zona": "D21",
     "autorizo": "A23", "descripcion": "A26", "operador_1": "F31", "operador_2": "F32",
     "reserva": [f"B{f}" for f in range(35, 48)] + [f"O{f}" for f in range(35, 48)],  # 13 + 13
+    # Fila 51: "Total en Servicio" es el rango E51:H51, su celda escribible es E51.
+    "total_apresto": "A51", "total_servicio": "E51", "total_general": "I51", "confecciono": "N51",
 }
 
 MAPEO_PCD2: Dict[str, Any] = {
@@ -131,7 +140,7 @@ class EscritorVerificado:
             return f"la plantilla trae el rótulo '{str(valor).strip()}'"
         return None
 
-    def escribir(self, coordenada: Optional[str], valor: Any, campo: str) -> bool:
+    def escribir(self, coordenada: Optional[str], valor: Any, campo: str, negrita: bool = False) -> bool:
         if not coordenada or valor in (None, ""):
             return False
         problema = self._problema(coordenada)
@@ -140,7 +149,7 @@ class EscritorVerificado:
             return False
         celda = self.hoja[coordenada]
         celda.value = valor
-        _ajustar_formato(celda, valor)
+        _ajustar_formato(celda, valor, negrita)
         return True
 
     def escribir_lista(self, coordenadas: List[str], valores: List[str], campo: str) -> None:
@@ -161,15 +170,17 @@ def _mismo_color(a, b) -> bool:
     return a.type == "rgb" and a.rgb == b.rgb
 
 
-def _ajustar_formato(celda, valor: Any = None) -> None:
+def _ajustar_formato(celda, valor: Any = None, negrita: bool = False) -> None:
     """Solo en la planilla generada (la plantilla no se toca): tipografía
-    unificada (Aptos 12 pt; números/fechas/horas centrados, texto a la
-    izquierda), y el dato nunca queda invisible (letra del mismo color que
+    unificada (Arial 10 pt; números/fechas/horas centrados, texto a la
+    izquierda; `negrita` para los totales), y el dato nunca queda invisible (letra del mismo color que
     el relleno) ni cortado (si no entra en la celda, Excel achica la letra
     en vez de recortarla; los textos largos que ya ajustaban siguen igual)."""
     fuente = copy(celda.font)
-    fuente.name = fuente_planillas()
-    fuente.sz = TAMANO_PT
+    fuente.name = FUENTE_EXCEL
+    fuente.sz = TAMANO_EXCEL_PT
+    if negrita:
+        fuente.b = True
     if celda.fill.fill_type == "solid" and _mismo_color(celda.font.color, celda.fill.fgColor):
         fuente.color = Color(rgb="FF000000")
     celda.font = fuente
@@ -193,7 +204,7 @@ def _insertar_firma(escritor: EscritorVerificado, coordenada: str, ruta_firma: O
         return
     celda = escritor.hoja[coordenada]
     celda.alignment = Alignment(horizontal="center", vertical="bottom", wrap_text=True)
-    celda.font = Font(name=celda.font.name, size=7, italic=True)
+    celda.font = Font(name=FUENTE_EXCEL, size=TAMANO_EXCEL_PT, italic=True)
     imagen = ImagenExcel(ruta_firma)
     escala = min(ANCHO_MAX_FIRMA_PX / imagen.width, ALTO_MAX_FIRMA_PX / imagen.height, 1.0)
     imagen.width, imagen.height = int(imagen.width * escala), int(imagen.height * escala)
@@ -312,8 +323,8 @@ def _pie_y_encabezado(wb, autor: Optional[str], encabezado: Optional[str] = None
         for item, texto in ((hoja.oddFooter.left, autor), (hoja.oddHeader.right, encabezado)):
             if texto:
                 item.text = texto.replace("&", "&&")  # & es código de formato en Excel
-                item.font = f"{fuente_planillas()},Regular"
-                item.size = TAMANO_PT
+                item.font = f"{FUENTE_EXCEL},Regular"
+                item.size = TAMANO_EXCEL_PT
 
 
 def _una_hoja_por_pagina(wb) -> None:
@@ -397,6 +408,15 @@ def _completar_pcs(incidente: Incidente) -> ResultadoPlanilla:
     reserva = [b.personal.nombre_completo() for b in sorted(base, key=lambda b: b.orden)
                if b.funcion == FuncionBase.APRESTO.value]
     e.escribir_lista(m["reserva"], reserva, "Personal de reserva")
+
+    # Fila 51: apresto (quedaron en cuartel) + en servicio (salieron en las
+    # dotaciones) = total general; y quién confeccionó la planilla con su PIN.
+    en_apresto = len(reserva)
+    en_servicio = total_efectivos(_agrupar_dotaciones(incidente))
+    e.escribir(m["total_apresto"], en_apresto, "Total en cuartel (apresto)", negrita=True)
+    e.escribir(m["total_servicio"], en_servicio, "Total en servicio", negrita=True)
+    e.escribir(m["total_general"], en_apresto + en_servicio, "Total general", negrita=True)
+    e.escribir(m["confecciono"], _nombre(incidente.confecciono), "Confeccionó la planilla")
 
     ruta = _ruta_salida(incidente, "PCS")
     _pie_y_encabezado(wb, texto_autor(incidente))
