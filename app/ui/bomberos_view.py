@@ -3,10 +3,11 @@ Importación del 'Reporte de bomberos' de RUBA desde la página Personal y
 Unidades. El Excel lo elige SIEMPRE el usuario con QFileDialog (nunca una
 ruta fija); la lógica vive en app/services/ruba_importer.py.
 
-Qué hace: upsert de TODO el personal del reporte en la base (Id de RUBA ->
-id_ruba, Legajo, DNI, Apellido, Nombre, Jerarquía/Formación y Estado
-Activo/Reserva/Baja) y actualiza la copia local del padrón que usan los
-selectores de las dotaciones de RUBA.
+Qué hace: upsert de TODO el personal del reporte en la base (Id de RUBA,
+Legajo, DNI, Apellido, Nombre, fechas de nacimiento / ingreso / último
+ascenso, contacto, grupo sanguíneo, cargo, jerarquía, formación, estudios y
+situación de revista) sin tocar los PIN existentes, y actualiza la copia
+local del padrón que usan los selectores de las dotaciones de RUBA.
 """
 
 from __future__ import annotations
@@ -42,11 +43,17 @@ def importar_bomberos_desde_excel(parent: QWidget) -> bool:
         return False
     QApplication.restoreOverrideCursor()
 
-    texto = f"{resumen.total} bomberos importados ({resumen.nuevas} nuevos, {resumen.actualizadas} actualizados)."
+    texto = resumen.texto_personal() + "."
+    if resumen.nuevas:
+        texto += "\nLos dados de alta tienen el PIN de fábrica y se les pedirá cambiarlo al usarlo."
     if activos is not None:
         texto += f"\nPadrón de RUBA: {activos} activos (los selectores de la planilla ya lo toman)."
     if resumen.avisos:
-        texto += "\n\nAvisos:\n• " + "\n• ".join(resumen.avisos)
+        texto += "\n\nAvisos:\n• " + "\n• ".join(resumen.avisos[:15])
+        if len(resumen.avisos) > 15:
+            texto += f"\n• … y {len(resumen.avisos) - 15} más"
+    if resumen.ignoradas or resumen.avisos:
+        texto += "\n\nEl detalle fila por fila quedó en logs/app.log."
     QMessageBox.information(parent, "Personal importado", texto)
     return True
 

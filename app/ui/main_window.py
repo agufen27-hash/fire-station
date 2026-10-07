@@ -11,18 +11,22 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 import re
 import shutil
+import threading
+import time as reloj
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from PySide6.QtCore import QThread, QTimer, Qt
+from PySide6.QtCore import QEventLoop, QFileSystemWatcher, QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QColor, QIcon, QIntValidator, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QButtonGroup,
+    QProgressDialog,
     QCheckBox,
     QComboBox,
     QCompleter,
@@ -54,7 +58,7 @@ from PySide6.QtWidgets import (
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 
-from app.core.catalogos import obtener_padron
+from app.core.catalogos import obtener_padron, ruta_padron_por_defecto
 from app.core.horarios import fecha_fin_ajustada
 from app import __version__
 from app.paths import ICONO_APP, LOGO_INSTITUCIONAL, ruta_recurso_existente
@@ -68,6 +72,8 @@ from app.models import (
     CategoriaIncidente,
     DamnificadoCivil,
     DotacionSalida,
+    ESTADOS_RUBA_EN_PROCESO,
+    ESTADOS_RUBA_PENDIENTES,
     EstadoOperativo,
     EstadoRuba,
     FuncionBase,
@@ -96,20 +102,22 @@ from app.services.ruba_payload import (
     persona_desde_personal,
 )
 from app.services.ruba_helpers import cargar_credenciales
-from app.services.ruba_service import RubaLoteWorker, lanzar_lote
+from app.services.ruba_queue_worker import ColaRuba
+from app.services.ruba_validator import SemaforoRuba, revisar_parte_para_ruba, validar_incidente_para_ruba
 from app.ui.history_window import MOTIVO_PARTE_CERRADO, HistoryWindow
 from app.ui.autor_dialog import pedir_autor
 from app.services import cartografia
 from app.ui.widgets.map_widget import MapWidget, OperationsMapWindow
 from app.ui.damnificados_widgets import PanelDamnificados
 from app.services.personal_info import mandos_del_padron, padron_activo
+from app.services.personal_service import verificar_pin_personal
+from app.ui.pin_dialogs import DialogoResetPinMaestra
 from app.ui.dotaciones_widgets import PanelDotaciones, PanelPersonalBase, personas_repetidas
 from app.ui.participacion_widgets import HorarioServicio, SelectorBombero
 from app.ui.bomberos_view import importar_bomberos_desde_excel
 from app.ui.personnel_window import LegajoPrivadoWidget
 from app.ui import theme
 from app.ui.map_dialog import DialogoMarcarMapa, parsear_par
-from app.ui.ruba_progreso_dialog import DialogoLoteRuba
 from app.ui.servicio_en_curso import TarjetaServicioEnCurso, resumen_de
 from app.ui.siniestro_widgets import FORM_ACCIDENTE, PanelDatosEspecificos
 from app.ui.unidades_view import PanelUnidades
@@ -139,6 +147,28 @@ IDX_MAPA = 3
 IDX_DOTACIONES = 4
 IDX_DOCUMENTACION = 5
 IDX_CONFIGURACION = 6
+
+# Estado reactivo: chequeo de internet cada 4 min (en un QThread) y retardo
+# para agrupar los avisos del QFileSystemWatcher del padrón.
+INTERVALO_CHEQUEO_CONEXION_MS = 4 * 60 * 1000
+RETARDO_RECARGA_PADRON_MS = 1500
+# Semáforo Pre-RUBA del formulario: se recalcula al salir de cada campo.
+RETARDO_SEMAFORO_MS = 400
+# Respaldo al cerrar: si tarda más que esto, se muestra el aviso "Resguardando…";
+# pasado el tope, se cierra igual (el respaldo de esa vez queda descartado).
+AVISO_RESPALDO_MS = 500
+TOPE_RESPALDO_SEG = 60
+
+
+class ChipClickable(QLabel):
+    """Chip de la barra superior que además responde al clic."""
+
+    clicked = Signal()
+
+    def mousePressEvent(self, evento) -> None:  # noqa: N802 - override de Qt
+        if evento.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(evento)
 
 ITEMS_NAV = [
     (IDX_DASHBOARD, "📊  Inicio"),
@@ -215,9 +245,20 @@ class MainWindow(QMainWindow):
         # mantener vivas las referencias mientras el hilo corre, o Qt puede
         # destruir el QThread en medio de la carga y crashear la app. Hay un
         # solo lote a la vez (una sola sesión de navegador).
-        self._lote_ruba: Optional[Tuple[QThread, RubaLoteWorker, DialogoLoteRuba]] = None
+        # Cola de sincronización en segundo plano (app/services/ruba_queue_worker.py).
+        self._cola_ruba = ColaRuba(self)
+        self._cerrar_al_terminar_cola = False
+        self._respaldo_hecho = False  # closeEvent puede llegar dos veces (cola de RUBA): respaldar una sola
+        self._aviso_navegador_mostrado = False
+        self._semaforo: SemaforoRuba = SemaforoRuba()
         self._hilo_conectividad: Optional[Tuple[QThread, ConectividadWorker]] = None
-        self._cantidad_pendientes_inicio = 0
+        # Estado RUBA reactivo: pendientes recalculados de la base en cada
+        # cambio (_refrescar_estado_ruba) y última conectividad conocida
+        # (None = todavía no se chequeó).
+        self._pendientes_ruba = 0
+        self._errores_ruba = 0
+        self._hay_internet: Optional[bool] = None
+        self._ultimo_lote_ruba: Optional[str] = None
         # Servicio EN_CURSO reabierto en el formulario (None = alta nueva).
         self._incidente_en_edicion: Optional[int] = None
         # True si lo que está en el formulario es un servicio CERRADO abierto
@@ -238,7 +279,7 @@ class MainWindow(QMainWindow):
 
         # Aviso discreto (oculto salvo que haga falta) de "hay salidas
         # pendientes de sincronizar con RUBA y hay internet" -- ver
-        # _verificar_pendientes_ruba_al_inicio().
+        # _refrescar_estado_ruba().
         self._boton_sync_pendientes = QPushButton(self)
         self._boton_sync_pendientes.setVisible(False)
         self._boton_sync_pendientes.clicked.connect(self._sincronizar_todos_pendientes)
@@ -246,7 +287,39 @@ class MainWindow(QMainWindow):
 
         self._actualizar_dashboard()
 
-        QTimer.singleShot(800, self._verificar_pendientes_ruba_al_inicio)
+        self._refrescar_estado_ruba()
+        QTimer.singleShot(800, self._chequear_conectividad)
+        # Chequeo de conectividad periódico (en un QThread: nunca bloquea la UI).
+        self._timer_conectividad = QTimer(self)
+        self._timer_conectividad.setInterval(INTERVALO_CHEQUEO_CONEXION_MS)
+        self._timer_conectividad.timeout.connect(self._chequear_conectividad)
+        self._timer_conectividad.start()
+
+        self._iniciar_vigilancia_padron()
+
+        # Cola de RUBA: señales -> UI, y retomar lo que quedó pendiente al cerrar.
+        cola = self._cola_ruba
+        cola.encolado.connect(self._on_cola_encolado)
+        cola.iniciado.connect(self._on_cola_iniciado)
+        cola.detalle.connect(self._on_cola_detalle)
+        cola.sincronizado.connect(self._on_cola_sincronizado)
+        cola.advertencia.connect(self._on_cola_advertencia)
+        cola.error.connect(self._on_cola_error)
+        cola.reintento_programado.connect(self._on_cola_reintento)
+        cola.navegador_faltante.connect(self._on_cola_sin_navegador)
+        cola.estados_cambiados.connect(self._on_cola_estados_cambiados)
+        cola.inactiva.connect(self._on_cola_inactiva)
+        QTimer.singleShot(1500, self._retomar_cola_ruba)
+
+        # Semáforo Pre-RUBA del formulario (recalculo diferido al cambiar de campo).
+        self._retardo_semaforo = QTimer(self)
+        self._retardo_semaforo.setSingleShot(True)
+        self._retardo_semaforo.setInterval(RETARDO_SEMAFORO_MS)
+        self._retardo_semaforo.timeout.connect(self._actualizar_semaforo)
+        app_qt = QApplication.instance()
+        if app_qt is not None:
+            app_qt.focusChanged.connect(self._programar_semaforo)
+        self.panel_dotaciones.llegadas_cambiadas.connect(self._programar_semaforo)
 
         # Cronómetro de los servicios en curso (una sola señal por segundo).
         self._reloj = QTimer(self)
@@ -284,6 +357,7 @@ class MainWindow(QMainWindow):
         self._pagina_historial.editar_solicitado.connect(self.editar_servicio)
         self._pagina_historial.eliminar_solicitado.connect(self.eliminar_servicio)
         self._pagina_historial.estados_cambiados.connect(self._actualizar_dashboard)
+        self._pagina_historial.estados_cambiados.connect(self._refrescar_estado_ruba)
         self._pagina_mapa = OperationsMapWindow(self)
         self._pagina_dotaciones = self._crear_pagina_dotaciones()
         self._pagina_documentacion = self._crear_pagina_documentacion()
@@ -326,9 +400,17 @@ class MainWindow(QMainWindow):
         self._chip_borrador = self._crear_chip("", "info", barra)
         self._chip_padron = self._crear_chip("", "neutro", barra)
         self._chip_ruba = self._crear_chip("RUBA · verificando…", "neutro", barra)
-        for chip in (self._chip_borrador, self._chip_padron, self._chip_ruba):
+        # Semáforo Pre-RUBA del parte abierto (solo en el formulario): clic = detalle.
+        self._chip_semaforo = ChipClickable("", barra)
+        self._chip_semaforo.setObjectName("chip")
+        self._chip_semaforo.setFixedHeight(24)
+        self._chip_semaforo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._chip_semaforo.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._chip_semaforo.clicked.connect(self._mostrar_detalle_semaforo)
+        for chip in (self._chip_borrador, self._chip_semaforo, self._chip_padron, self._chip_ruba):
             layout.addWidget(chip, 0, Qt.AlignmentFlag.AlignVCenter)
         self._chip_borrador.setVisible(False)
+        self._chip_semaforo.setVisible(False)
         return barra
 
     @staticmethod
@@ -343,6 +425,9 @@ class MainWindow(QMainWindow):
     def _actualizar_chips(self) -> None:
         en_formulario = self._stack.currentIndex() == IDX_FORMULARIO
         self._chip_borrador.setVisible(en_formulario)
+        self._chip_semaforo.setVisible(en_formulario)
+        if en_formulario and hasattr(self, "_retardo_semaforo"):
+            self._retardo_semaforo.start()
         if en_formulario:
             if self._incidente_en_edicion is not None and self._edicion_de_cerrado:
                 self._chip_borrador.setText(f"✏️ Modo edición · N° {self.label_numero_parte.text()}")
@@ -630,7 +715,7 @@ class MainWindow(QMainWindow):
                 Incidente.estado_ruba == EstadoRuba.SINCRONIZADO.value
             ).count()
             pendientes = session.query(Incidente).filter(
-                Incidente.estado_ruba.in_([EstadoRuba.PENDIENTE.value, EstadoRuba.ERROR.value]),
+                Incidente.estado_ruba.in_(ESTADOS_RUBA_PENDIENTES),
                 Incidente.estado_operativo == EstadoOperativo.CERRADO.value,
             ).count()
             resumenes_en_curso = [
@@ -1180,6 +1265,10 @@ class MainWindow(QMainWindow):
             errores.append("Seleccioná la Categoría del incidente.")
         if falta_calle:
             errores.append("Completá la Calle/Altura del siniestro.")
+        medios = (self.panel_datos_especificos.datos() or {}).get("medios_aereos")
+        if medios and medios.get("intervinieron") and not any(
+                medios.get(c) for c in ("aviones", "avionetas", "helicopteros", "otros")):
+            errores.append("Medios aéreos en 'Sí': indicá al menos una cantidad (o elegí 'No').")
         errores.extend(self._validar_participacion())
         return errores
 
@@ -1588,6 +1677,7 @@ class MainWindow(QMainWindow):
 
         resumen += ("\n\nQuedó PENDIENTE de carga en RUBA: cargalo desde Estadísticas "
                     "(🚀 Cargar Seleccionados a RUBA).")
+        self._refrescar_estado_ruba()  # antes del mensaje modal: el chip ya muestra el nuevo pendiente
         (QMessageBox.warning if problemas else QMessageBox.information)(self, "Siniestro guardado", resumen)
 
         self._limpiar_formulario()
@@ -1602,6 +1692,7 @@ class MainWindow(QMainWindow):
         _, numero_parte = resultado
         self._limpiar_formulario()
         self._actualizar_dashboard()
+        self._refrescar_estado_ruba()
         self._ir_a_pagina(IDX_DASHBOARD)
         theme.set_tono(self.statusBar(), "neutro")
         self.statusBar().showMessage(
@@ -1610,21 +1701,102 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # noqa: N802 - override de Qt
         """Si hay una actualización descargada y verificada, se instala al
-        cerrar (el instalador espera a que este proceso termine)."""
+        cerrar (el instalador espera a que este proceso termine).
+
+        Cola de RUBA: lo que queda EN_COLA se retoma al volver a abrir. Si un
+        parte se está cargando en este momento, se ofrece esperar a que
+        termine (el QThread no se puede cortar a mitad de Playwright)."""
+        if self._cola_ruba.activa and not self._cerrar_al_terminar_cola:
+            if self._cola_ruba.cargando is not None:
+                respuesta = QMessageBox.question(
+                    self, "Carga en RUBA en curso",
+                    "Hay un parte cargándose en RUBA en este momento.\n\n"
+                    "¿Cerrar Fire Station cuando termine ese parte? Los que siguen en la cola "
+                    "se retoman la próxima vez que abras la app.",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes,
+                )
+                if respuesta != QMessageBox.StandardButton.Yes:
+                    event.ignore()
+                    return
+            if not self._cola_ruba.detener(espera_ms=4000):
+                self._cerrar_al_terminar_cola = True
+                theme.set_tono(self.statusBar(), "alerta")
+                self.statusBar().showMessage("Fire Station se cierra al terminar el parte que se está cargando en RUBA…")
+                event.ignore()
+                return
+        # Cierre confirmado: respaldo de la base ANTES de aceptar (y antes del
+        # instalador de actualizaciones, que espera a que este proceso termine).
+        if not self._respaldo_hecho:
+            self._respaldo_hecho = True
+            self._respaldar_al_cerrar()
         if self.controlador_actualizaciones is not None:
             self.controlador_actualizaciones.al_cerrar()
+        self._timer_conectividad.stop()
+        event.accept()
         super().closeEvent(event)
+
+    def _respaldar_al_cerrar(self) -> None:
+        """Respaldo sincrónico de la base al salir (app/core/backup_service.py).
+
+        Corre en un hilo aparte mientras este espera: así la ventana se sigue
+        repintando y, si demora más de AVISO_RESPALDO_MS, se muestra
+        "Resguardando base de datos antes de salir...". Nunca lanza ni deja la
+        app colgada: ante cualquier error (o si pasa TOPE_RESPALDO_SEG) se
+        registra en logs/app.log y el cierre sigue."""
+        try:
+            import app.db as base
+            from app.core.backup_service import realizar_backup_cierre
+
+            ruta_db = base.engine.url.database
+            if not ruta_db or ruta_db == ":memory:":
+                return
+            resultado: Dict[str, bool] = {}
+            hilo = threading.Thread(target=lambda: resultado.setdefault("ok", realizar_backup_cierre(ruta_db)),
+                                    name="respaldo-cierre", daemon=True)
+            hilo.start()
+            inicio = reloj.monotonic()
+            aviso: Optional[QProgressDialog] = None
+            while hilo.is_alive():
+                transcurrido = reloj.monotonic() - inicio
+                if aviso is None and transcurrido * 1000 >= AVISO_RESPALDO_MS:
+                    aviso = QProgressDialog("Resguardando base de datos antes de salir...", "", 0, 0, self)
+                    aviso.setWindowTitle("Fire Station")
+                    aviso.setCancelButton(None)
+                    aviso.setWindowModality(Qt.WindowModality.ApplicationModal)
+                    aviso.setMinimumDuration(0)
+                    aviso.show()
+                if transcurrido >= TOPE_RESPALDO_SEG:
+                    logging.getLogger("app.core.backup_service").error(
+                        "Respaldo de cierre: superó %s s; se cierra sin esperar.", TOPE_RESPALDO_SEG)
+                    break
+                QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents, 50)
+                hilo.join(0.02)
+            if aviso is not None:
+                aviso.close()
+            if resultado.get("ok") is False:
+                print("[Respaldo] No se pudo respaldar la base al cerrar: ver logs/app.log")
+        except Exception:  # noqa: BLE001 - el respaldo nunca traba el cierre
+            logging.getLogger("app.core.backup_service").exception("Respaldo de cierre: error inesperado en la UI")
 
     # -- Editar / eliminar desde el Historial ----------------------------------
 
     def _incidente_en_sincronizacion(self, incidente_id: int) -> bool:
-        """True si ese servicio se está cargando en RUBA o espera en la cola."""
-        return self._lote_ruba is not None and incidente_id in self._lote_ruba[1].incidente_ids
+        """True si ese servicio se está cargando en RUBA ahora mismo. Si solo
+        esperaba en la cola, se lo saca (vuelve a NO_SINCRONIZADO) para que se
+        pueda editar o eliminar."""
+        if self._cola_ruba.cargando == incidente_id:
+            return True
+        if self._cola_ruba.contiene(incidente_id):
+            self._cola_ruba.quitar(incidente_id)
+            self.statusBar().showMessage("El parte se sacó de la cola de RUBA para poder modificarlo.", 8000)
+            self._refrescar_estado_ruba()
+        return False
 
     def carga_ruba_en_curso(self) -> bool:
-        """True mientras corre un lote de carga a RUBA (lo consulta, p. ej., el
-        auto-updater antes de cerrar la app para instalar)."""
-        return self._lote_ruba is not None
+        """True mientras la cola está cargando un parte en RUBA (lo consulta,
+        p. ej., el auto-updater antes de cerrar la app para instalar)."""
+        return self._cola_ruba.cargando is not None
 
     def _formulario_con_datos_sin_guardar(self) -> bool:
         """Heurística: el formulario tiene un servicio NUEVO a medio cargar."""
@@ -1739,6 +1911,7 @@ class MainWindow(QMainWindow):
             self._limpiar_formulario()
         self._pagina_historial.refrescar()
         self._actualizar_dashboard()
+        self._refrescar_estado_ruba()
         theme.set_tono(self.statusBar(), "neutro")
         self.statusBar().showMessage(f"Parte N° {numero_parte} eliminado del historial local.", 10000)
 
@@ -1967,57 +2140,164 @@ class MainWindow(QMainWindow):
     # -- Sincronización con RUBA en segundo plano (Fase 3) ----------------------
 
     def _cargar_lote_ruba(self, incidente_ids: List[int]) -> None:
-        """Carga secuencial en RUBA (Historial -> 🚀, ↻ RUBA de una fila, o el
-        aviso de pendientes al arrancar). Un QThread con UN navegador para
-        todo el lote; diálogo modal con progreso "k de N" y Cancelar."""
+        """Encola partes para RUBA (Historial -> 🚀, ↻ RUBA de una fila, o el
+        aviso de pendientes). La carga corre en la cola de segundo plano: el
+        operador sigue trabajando. Antes, el Semáforo Pre-RUBA revisa cada
+        parte SIN abrir Chromium: los que tienen datos faltantes no se
+        encolan (se avisa cuáles y qué les falta)."""
         if not incidente_ids:
             return
-        if self._lote_ruba is not None:
-            QMessageBox.information(self, "Carga en RUBA en curso",
-                                    "Ya hay una carga en RUBA en curso. Esperá a que termine.")
-            return
-        dialogo = DialogoLoteRuba(len(incidente_ids), self)
+        listos: List[int] = []
+        incompletos: List[Tuple[str, SemaforoRuba]] = []
+        with get_session() as session:
+            numeros = {i: (inc.numero_parte if inc else f"#{i}") for i in incidente_ids
+                       for inc in [session.get(Incidente, i)]}
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            for incidente_id in incidente_ids:
+                semaforo = validar_incidente_para_ruba(incidente_id)
+                if semaforo.listo:
+                    listos.append(incidente_id)
+                else:
+                    incompletos.append((numeros[incidente_id], semaforo))
+        finally:
+            QApplication.restoreOverrideCursor()
 
-        def conectar(worker: RubaLoteWorker) -> None:
-            # Slots de QObjects del hilo de la UI (nunca lambdas sueltas).
-            dialogo.conectar(worker)
-            worker.item_ok.connect(self._on_lote_item_ok)
-            worker.item_error.connect(self._on_lote_item_error)
-            worker.terminado.connect(self._on_lote_terminado)
+        if incompletos:
+            detalle = "\n\n".join(
+                f"🔴 Parte N° {numero}:\n" + "\n".join(f"   • {f}" for f in sem.faltantes[:8])
+                + (f"\n   • … y {len(sem.faltantes) - 8} más" if len(sem.faltantes) > 8 else "")
+                for numero, sem in incompletos[:6])
+            if len(incompletos) > 6:
+                detalle += f"\n\n… y {len(incompletos) - 6} parte(s) más con datos faltantes."
+            caja = QMessageBox(self)
+            caja.setIcon(QMessageBox.Icon.Warning)
+            caja.setWindowTitle("Semáforo Pre-RUBA: faltan datos")
+            caja.setText(f"{len(incompletos)} parte(s) no están listos para RUBA: abrir el navegador con "
+                         "ellos solo haría perder tiempo (RUBA rechazaría el guardado).")
+            caja.setInformativeText("Completalos desde el Historial (✏️ Editar) y volvé a cargarlos.")
+            caja.setDetailedText(detalle)
+            boton_listos = None
+            if listos:
+                boton_listos = caja.addButton(f"Encolar solo los listos ({len(listos)})",
+                                              QMessageBox.ButtonRole.AcceptRole)
+            caja.addButton("Cancelar", QMessageBox.ButtonRole.RejectRole)
+            caja.exec()
+            if boton_listos is None or caja.clickedButton() is not boton_listos:
+                return
 
-        hilo, worker = lanzar_lote(list(incidente_ids), conectar)
-        self._lote_ruba = (hilo, worker, dialogo)
-        hilo.finished.connect(self._olvidar_lote_ruba)
-        self._pagina_historial.set_carga_en_curso(True)
+        encolados = self._cola_ruba.encolar(listos)
         theme.set_tono(self.statusBar(), "neutro")
-        self.statusBar().showMessage(f"Cargando {len(incidente_ids)} parte(s) en RUBA…")
-        self._set_chip_ruba("cargando…", "info", f"{len(incidente_ids)} parte(s) en cola")
-        dialogo.show()  # modal (ApplicationModal) sin bloquear el event loop: la carga sigue en su hilo
-
-    def _on_lote_item_ok(self, incidente_id: int, numero_parte: str, ruba_id_remoto: str, url_final: str) -> None:
-        self.statusBar().showMessage(f"Siniestro N° {numero_parte} cargado en RUBA (ID {ruba_id_remoto or '—'}).")
+        if encolados:
+            self.statusBar().showMessage(
+                f"{len(encolados)} parte(s) encolado(s) para RUBA: la carga sigue en segundo plano.", 10000)
+        else:
+            self.statusBar().showMessage("No había partes nuevos para encolar (ya cargados o en la cola).", 8000)
         self._pagina_historial.refrescar()
+        self._refrescar_estado_ruba()
 
-    def _on_lote_item_error(self, incidente_id: int, numero_parte: str, mensaje_error: str, captura: str) -> None:
-        # El detalle completo ya quedó en incidentes.ruba_error_log (y la captura
-        # en logs/screenshots/); acá solo se deja constancia en consola.
-        print(f"[RUBA] Falló la carga del siniestro {numero_parte}: {mensaje_error} {captura}")
+    def _retomar_cola_ruba(self) -> None:
+        retomados, reintentos = self._cola_ruba.retomar()
+        if retomados or reintentos:
+            self.statusBar().showMessage(
+                f"Cola de RUBA retomada: {retomados} parte(s) en cola"
+                + (", con reintentos automáticos pendientes." if reintentos else "."), 10000)
+        self._refrescar_estado_ruba()
+
+    # -- Señales de la cola de RUBA ---------------------------------------------------
+
+    def _on_cola_encolado(self, incidente_id: int, numero: str) -> None:
+        self.statusBar().showMessage(f"Parte N° {numero} encolado para RUBA.", 6000)
+
+    def _on_cola_iniciado(self, incidente_id: int, numero: str) -> None:
+        self._set_chip_ruba("cargando…", "info", f"Cargando el Parte N° {numero} en RUBA "
+                            f"({self._cola_ruba.pendientes} en la cola).")
+
+    def _on_cola_detalle(self, incidente_id: int, texto: str) -> None:
+        self.statusBar().showMessage(texto, 8000)
+
+    def _on_cola_sincronizado(self, incidente_id: int, numero: str, ruba_id: str) -> None:
+        theme.set_tono(self.statusBar(), "ok")
+        texto = f"Parte N° {numero} sincronizado con éxito en RUBA (ID {ruba_id or '—'})."
+        self._ultimo_lote_ruba = texto
+        self.statusBar().showMessage(texto, 12000)
+
+    def _on_cola_advertencia(self, incidente_id: int, numero: str, aviso: str) -> None:
+        print(f"[RUBA] Parte N° {numero}: {aviso}")
+
+    def _on_cola_error(self, incidente_id: int, numero: str, mensaje: str, captura: str) -> None:
+        # El detalle completo queda en ruba_error_log (Historial -> ⚠ Log).
+        theme.set_tono(self.statusBar(), "error")
+        texto = f"Parte N° {numero}: no se pudo cargar en RUBA ({mensaje.splitlines()[0][:160]})."
+        self._ultimo_lote_ruba = texto
+        self.statusBar().showMessage(texto, 15000)
+        print(f"[RUBA] {texto} {captura}")
+
+    def _on_cola_reintento(self, incidente_id: int, numero: str, segundos: int, motivo: str) -> None:
+        theme.set_tono(self.statusBar(), "alerta")
+        minutos = max(1, round(segundos / 60))
+        texto = f"Parte N° {numero}: sin conexión con RUBA. Reintento programado en {minutos} min."
+        self._ultimo_lote_ruba = texto
+        self.statusBar().showMessage(texto, 15000)
+
+    def _on_cola_sin_navegador(self, mensaje: str) -> None:
+        if self._aviso_navegador_mostrado:
+            return
+        self._aviso_navegador_mostrado = True
+        QMessageBox.warning(self, "Falta un navegador para RUBA", mensaje)
+
+    def _on_cola_estados_cambiados(self) -> None:
         self._pagina_historial.refrescar()
+        self._refrescar_estado_ruba()
 
-    def _on_lote_terminado(self, ok: int, errores: int, omitidos: int, sin_procesar: int) -> None:
-        tono = "error" if errores else ("alerta" if sin_procesar else "ok")
-        theme.set_tono(self.statusBar(), tono)
-        texto = f"RUBA: {ok} cargado(s), {errores} con error, {omitidos} omitido(s)"
-        if sin_procesar:
-            texto += f", {sin_procesar} sin procesar (cancelado)"
-        self.statusBar().showMessage(texto + ".", 15000)
-        self._set_chip_ruba("error de carga" if errores else "sincronizado", "error" if errores else "ok", texto)
-
-    def _olvidar_lote_ruba(self) -> None:
-        self._lote_ruba = None
-        self._pagina_historial.set_carga_en_curso(False)
-        self._pagina_historial.refrescar()
+    def _on_cola_inactiva(self) -> None:
         self._actualizar_dashboard()
+        self._refrescar_estado_ruba()
+        if self._cerrar_al_terminar_cola:
+            self.close()
+
+    # -- Semáforo Pre-RUBA del formulario ------------------------------------------
+
+    def _programar_semaforo(self, *_args) -> None:
+        if self._stack.currentIndex() == IDX_FORMULARIO:
+            self._retardo_semaforo.start()
+
+    def _actualizar_semaforo(self) -> None:
+        """Arma el payload del formulario (sin abrir nada) y pinta el chip."""
+        if self._stack.currentIndex() != IDX_FORMULARIO:
+            return
+        try:
+            semaforo = revisar_parte_para_ruba(self.obtener_payload_servicio())
+        except Exception as e:  # noqa: BLE001 - un formulario a medio cargar no rompe la UI
+            semaforo = SemaforoRuba(faltantes=[f"El parte todavía no se puede armar ({type(e).__name__}: {e})"])
+        self._semaforo = semaforo
+        chip = self._chip_semaforo
+        if semaforo.listo:
+            chip.setText("🟢 Listo para RUBA" + (f" · {len(semaforo.avisos)} aviso(s)" if semaforo.avisos else ""))
+            theme.set_tono(chip, "alerta" if semaforo.avisos else "ok")
+            chip.setToolTip("Con los datos actuales RUBA aceptaría el parte."
+                            + ("\n\nAvisos:\n" + "\n".join(f"• {a}" for a in semaforo.avisos)
+                               if semaforo.avisos else ""))
+        else:
+            chip.setText(f"🔴 Faltan datos para RUBA ({len(semaforo.faltantes)})")
+            theme.set_tono(chip, "error")
+            chip.setToolTip("Clic para ver el detalle.\n\n" + "\n".join(f"• {f}" for f in semaforo.faltantes[:15])
+                            + (f"\n• … y {len(semaforo.faltantes) - 15} más" if len(semaforo.faltantes) > 15 else ""))
+        self._ajustar_chip(chip)
+
+    def _mostrar_detalle_semaforo(self) -> None:
+        self._actualizar_semaforo()
+        semaforo = self._semaforo
+        if semaforo.listo and not semaforo.avisos:
+            QMessageBox.information(self, "Semáforo Pre-RUBA", "🟢 El parte está listo para RUBA.")
+            return
+        partes = []
+        if semaforo.faltantes:
+            partes.append("🔴 Faltan para RUBA:\n" + "\n".join(f"• {f}" for f in semaforo.faltantes))
+        if semaforo.avisos:
+            partes.append("⚠ Avisos (no frenan la carga):\n" + "\n".join(f"• {a}" for a in semaforo.avisos))
+        (QMessageBox.warning if semaforo.faltantes else QMessageBox.information)(
+            self, "Semáforo Pre-RUBA", "\n\n".join(partes))
 
     # -- Página: Personal y Unidades (CRUD completo: alta, edición, baja y eliminación) --
 
@@ -2514,8 +2794,25 @@ class MainWindow(QMainWindow):
         boton_ingresar.clicked.connect(self._intentar_ingresar_legajo)
         form.addRow(boton_ingresar)
 
+        # PIN olvidado: sin él no se entra al legajo, así que el reseteo con
+        # la clave maestra también tiene que estar acá afuera.
+        boton_reset = QPushButton("¿Olvidó el PIN? Resetear con Clave Maestra", caja)
+        boton_reset.clicked.connect(self._resetear_pin_desde_acceso)
+        form.addRow(boton_reset)
+
         layout.addWidget(caja)
         return pagina
+
+    def _resetear_pin_desde_acceso(self) -> None:
+        indice = self._combo_legajo_bombero.currentIndex()
+        if indice < 0:
+            QMessageBox.warning(self, "Seleccioná un bombero", "Elegí de la lista a quién se le resetea el PIN.")
+            return
+        dialogo = DialogoResetPinMaestra(self._combo_legajo_bombero.itemData(indice),
+                                         self._combo_legajo_bombero.itemText(indice), self)
+        if dialogo.exec() == QDialog.DialogCode.Accepted:
+            self._entry_legajo_pin.clear()
+            QMessageBox.information(self, "PIN reseteado", "El PIN temporal quedó guardado.")
 
     def _cargar_pagina_documentacion(self) -> None:
         # Volver siempre a la pantalla de acceso: navegar afuera del legajo
@@ -2525,16 +2822,16 @@ class MainWindow(QMainWindow):
 
         with get_session() as session:
             personal = session.query(Personal).order_by(Personal.apellido, Personal.nombre).all()
-            datos = [(p.id, p.nombre_completo(), p.pin) for p in personal]
+            datos = [(p.id, p.nombre_completo()) for p in personal]
 
         self._combo_legajo_bombero.blockSignals(True)
         self._combo_legajo_bombero.clear()
-        for personal_id, texto, pin in datos:
-            self._combo_legajo_bombero.addItem(texto, (personal_id, pin))
+        for personal_id, texto in datos:
+            self._combo_legajo_bombero.addItem(texto, personal_id)
         self._combo_legajo_bombero.setCurrentIndex(-1)
         self._combo_legajo_bombero.blockSignals(False)
 
-        completer = QCompleter([texto for _, texto, _ in datos], self._combo_legajo_bombero)
+        completer = QCompleter([texto for _, texto in datos], self._combo_legajo_bombero)
         completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
         completer.setFilterMode(Qt.MatchFlag.MatchContains)
         self._combo_legajo_bombero.setCompleter(completer)
@@ -2545,8 +2842,9 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Seleccioná un bombero", "Elegí un bombero de la lista antes de ingresar.")
             return
 
-        personal_id, pin_real = self._combo_legajo_bombero.itemData(indice)
-        if self._entry_legajo_pin.text() != pin_real:
+        personal_id = self._combo_legajo_bombero.itemData(indice)
+        if not verificar_pin_personal(personal_id, self._entry_legajo_pin.text()):
+            self._entry_legajo_pin.clear()
             QMessageBox.warning(self, "PIN incorrecto", "El PIN de seguridad no es correcto.")
             return
 
@@ -2657,8 +2955,10 @@ class MainWindow(QMainWindow):
         return caja
 
     def _reiniciar_partes(self) -> None:
-        if self._lote_ruba is not None:
-            QMessageBox.information(self, "Carga en RUBA en curso", "Esperá a que termine la carga en RUBA.")
+        if self._cola_ruba.activa:
+            QMessageBox.information(self, "Cola de RUBA activa",
+                                    "Hay partes en la cola de RUBA o con reintentos pendientes: "
+                                    "esperá a que termine antes de reiniciar.")
             return
         with get_session() as session:
             cantidad = session.query(Incidente).count()
@@ -2881,52 +3181,155 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Error al guardar", str(e))
             return
         self._recargar_mapas()
+        self._refrescar_estado_ruba()
         QMessageBox.information(self, "Configuración guardada", "Los cambios se guardaron correctamente.")
 
-    # -- Aviso de sincronización pendiente al arranque (Fase 4) ------------------
+    # -- Estado de RUBA y conectividad (reactivo) ----------------------------------
 
-    def _verificar_pendientes_ruba_al_inicio(self) -> None:
-        """Chequea la conexión (para el chip de RUBA) y, si hay salidas
-        pendientes y hay internet, ofrece sincronizarlas."""
+    @staticmethod
+    def _contar_pendientes_ruba() -> Dict[str, int]:
+        """Partes CERRADOS por estado de RUBA (todo lo que no es SINCRONIZADO)."""
         with get_session() as session:
-            pendientes = (
-                session.query(Incidente)
-                .filter(Incidente.estado_ruba.in_([EstadoRuba.PENDIENTE.value, EstadoRuba.ERROR.value]))
-                .filter(Incidente.estado_operativo == EstadoOperativo.CERRADO.value)
-                .count()
-            )
-        self._cantidad_pendientes_inicio = pendientes
+            filas = (session.query(Incidente.estado_ruba)
+                     .filter(Incidente.estado_operativo == EstadoOperativo.CERRADO.value)
+                     .filter(Incidente.estado_ruba.in_(ESTADOS_RUBA_PENDIENTES)).all())
+        conteo: Dict[str, int] = {}
+        for (estado,) in filas:
+            conteo[estado] = conteo.get(estado, 0) + 1
+        return conteo
+
+    def _refrescar_estado_ruba(self) -> None:
+        """Recalcula de la base los partes pendientes de RUBA y actualiza en el
+        acto el chip y el botón "Sincronizar N pendiente(s)". Usa la última
+        conectividad conocida (no sale a la red). Mientras corre un lote no
+        pisa el chip "cargando…" ni muestra el botón."""
+        try:
+            conteo = self._contar_pendientes_ruba()
+        except Exception as e:  # noqa: BLE001 - un refresco visual nunca rompe la UI
+            print(f"[RUBA] No se pudieron contar los pendientes: {e}")
+            return
+        pendientes = sum(conteo.values())
+        errores = conteo.get(EstadoRuba.ERROR.value, 0)
+        reintentando = conteo.get(EstadoRuba.ERROR_REINTENTO.value, 0)
+        en_cola = sum(conteo.get(e, 0) for e in ESTADOS_RUBA_EN_PROCESO)
+        sin_encolar = conteo.get(EstadoRuba.NO_SINCRONIZADO.value, 0) + errores
+        self._pendientes_ruba, self._errores_ruba = pendientes, errores
+        en_lote = self._cola_ruba.cargando is not None
+        detalle = f"{pendientes} pendiente(s)" + "".join(
+            f", {n} {texto}" for n, texto in ((en_cola, "en cola"), (reintentando, "reintentando"),
+                                             (errores, "con error")) if n)
+        tooltip = "\n".join(filter(None, (
+            f"Partes cerrados sin sincronizar: {detalle}." if pendientes else "Todos los partes cerrados están en RUBA.",
+            f"Último evento: {self._ultimo_lote_ruba}" if self._ultimo_lote_ruba else "",
+        )))
+
+        if en_lote:
+            self._set_chip_ruba(f"cargando… · {en_cola} en cola", "info", tooltip)
+        else:
+            credenciales = cargar_credenciales()
+            if self._hay_internet is None:
+                self._set_chip_ruba(f"verificando… · {detalle}" if pendientes else "verificando…", "neutro", tooltip)
+            elif not self._hay_internet:
+                self._set_chip_ruba(f"sin conexión · {detalle}" if pendientes else "sin conexión", "error",
+                                    "No hay salida a internet: las cargas quedan pendientes.\n" + tooltip)
+            elif not (credenciales.get("usuario") and credenciales.get("clave")):
+                self._set_chip_ruba("sin credenciales", "alerta", "Cargá usuario y clave en Configuración.\n" + tooltip)
+            elif pendientes:
+                self._set_chip_ruba(f"en línea · {detalle}", "error" if errores else "alerta", tooltip)
+            else:
+                self._set_chip_ruba("en línea · al día", "ok", tooltip)
+
+        # El botón ofrece solo lo que todavía no está en manos de la cola.
+        mostrar_boton = bool(sin_encolar) and bool(self._hay_internet)
+        if mostrar_boton:
+            self._boton_sync_pendientes.setText(f"⇪ Sincronizar {sin_encolar} pendiente(s) con RUBA")
+        self._boton_sync_pendientes.setVisible(mostrar_boton)
+
+    def _chequear_conectividad(self) -> None:
+        """Lanza el chequeo de internet en un QThread (al arrancar y cada
+        INTERVALO_CHEQUEO_CONEXION_MS). Si ya hay uno en vuelo, no apila otro."""
+        if self._hilo_conectividad is not None:
+            return
         hilo, worker = lanzar_chequeo_conectividad()
         self._hilo_conectividad = (hilo, worker)
         worker.resultado.connect(self._on_resultado_conectividad)
-        hilo.finished.connect(lambda: setattr(self, "_hilo_conectividad", None))
+        hilo.finished.connect(self._olvidar_chequeo_conectividad)
+
+    def _olvidar_chequeo_conectividad(self) -> None:
+        self._hilo_conectividad = None
 
     def _on_resultado_conectividad(self, hay_internet: bool) -> None:
-        credenciales = cargar_credenciales()
-        if not hay_internet:
-            self._set_chip_ruba("sin conexión", "error", "No hay salida a internet: las cargas quedan pendientes.")
+        volvio = hay_internet and self._hay_internet is False
+        self._hay_internet = hay_internet
+        if volvio:
+            # Monitor de red: la conexión volvió -> los reintentos de RUBA no esperan su turno.
+            adelantados = self._cola_ruba.reintentar_ahora()
+            if adelantados:
+                self.statusBar().showMessage(
+                    f"Volvió la conexión: se reintentan {adelantados} parte(s) pendientes de RUBA.", 10000)
+        self._refrescar_estado_ruba()
+
+    # -- Padrón: recarga en caliente si cambia el Excel ------------------------------
+
+    def _iniciar_vigilancia_padron(self) -> None:
+        """QFileSystemWatcher sobre data/Reporte de bomberos.xlsx y su carpeta.
+        Excel (y la importación desde Personal) suelen REEMPLAZAR el archivo
+        -- borrar + renombrar --, y Qt deja de vigilar un archivo borrado: la
+        carpeta permite volver a engancharlo. Los avisos se agrupan con un
+        retardo corto (un guardado de Excel dispara varios) y solo se recarga
+        si cambió la firma (fecha de modificación + tamaño) del archivo: así
+        la base SQLite y los demás archivos de data/ no provocan recargas."""
+        self._ruta_padron = ruta_padron_por_defecto()
+        self._firma_padron = self._firma_archivo(self._ruta_padron)
+        self._vigia_padron = QFileSystemWatcher(self)
+        self._vigia_padron.addPath(str(self._ruta_padron.parent))
+        self._vigilar_archivo_padron()
+        self._retardo_padron = QTimer(self)
+        self._retardo_padron.setSingleShot(True)
+        self._retardo_padron.setInterval(RETARDO_RECARGA_PADRON_MS)
+        self._retardo_padron.timeout.connect(self._on_padron_modificado)
+        self._vigia_padron.fileChanged.connect(self._programar_recarga_padron)
+        self._vigia_padron.directoryChanged.connect(self._programar_recarga_padron)
+
+    def _programar_recarga_padron(self, _ruta: str = "") -> None:
+        self._retardo_padron.start()  # reinicia la cuenta: agrupa ráfagas de avisos
+
+    def _vigilar_archivo_padron(self) -> None:
+        ruta = str(self._ruta_padron)
+        if self._ruta_padron.is_file() and ruta not in self._vigia_padron.files():
+            self._vigia_padron.addPath(ruta)
+
+    @staticmethod
+    def _firma_archivo(ruta: Path) -> Optional[Tuple[float, int]]:
+        try:
+            datos = ruta.stat()
+        except OSError:
+            return None
+        return datos.st_mtime, datos.st_size
+
+    def _on_padron_modificado(self) -> None:
+        self._vigilar_archivo_padron()  # reemplazado en caliente: volver a engancharlo
+        firma = self._firma_archivo(self._ruta_padron)
+        if firma == self._firma_padron:
             return
-        if not (credenciales.get("usuario") and credenciales.get("clave")):
-            self._set_chip_ruba("sin credenciales", "alerta", "Cargá usuario y clave en Configuración.")
-        else:
-            pendientes = self._cantidad_pendientes_inicio
-            self._set_chip_ruba(
-                f"en línea · {pendientes} pendiente(s)" if pendientes else "en línea",
-                "alerta" if pendientes else "ok",
-            )
-        if not self._cantidad_pendientes_inicio:
+        self._firma_padron = firma
+        if firma is None:
+            self.statusBar().showMessage(
+                "El Excel del padrón ya no está en data/: se mantiene el padrón cargado.", 10000)
             return
-        self._boton_sync_pendientes.setText(
-            f"⇪ Sincronizar {self._cantidad_pendientes_inicio} pendiente(s) con RUBA"
-        )
-        self._boton_sync_pendientes.setVisible(True)
+        cantidad_antes = len(self._padron)
+        self._refrescar_padron_despacho(releer_excel=True)
+        self._actualizar_chips()
+        self.statusBar().showMessage(
+            f"Padrón recargado automáticamente: {len(self._padron)} bombero(s) activo(s) "
+            f"(antes {cantidad_antes}).", 10000)
 
     def _sincronizar_todos_pendientes(self) -> None:
         self._boton_sync_pendientes.setVisible(False)
         with get_session() as session:
             pendientes = (
                 session.query(Incidente)
-                .filter(Incidente.estado_ruba.in_([EstadoRuba.PENDIENTE.value, EstadoRuba.ERROR.value]))
+                .filter(Incidente.estado_ruba.in_([EstadoRuba.NO_SINCRONIZADO.value, EstadoRuba.ERROR.value]))
                 .filter(Incidente.estado_operativo == EstadoOperativo.CERRADO.value)
                 .all()
             )

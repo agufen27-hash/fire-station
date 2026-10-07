@@ -26,6 +26,7 @@ from typing import Iterator, Optional
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.core.security import PIN_DEFAULT, es_hash, hash_pin
 from app.models import Base, CategoriaIncidente, Contacto, Incidente, Movil, Personal, TipoIncidente
 from app.paths import get_writable_dir
 
@@ -311,6 +312,10 @@ def _sembrar_personal(session: Session) -> None:
 # valores nuevos quedan NULL) siempre que la columna sea nullable, como es
 # el caso acá.
 COLUMNAS_NUEVAS_INCIDENTES = {
+    # Cola de sincronización con RUBA (app/services/ruba_queue_worker.py).
+    "reintentos_ruba": "INTEGER NOT NULL DEFAULT 0",
+    "ultimo_error_ruba": "TEXT",
+    "proximo_reintento_ruba": "DATETIME",
     "ruba_sincronizado_en": "DATETIME",  # carga en lote a RUBA desde el Historial
     "ruta_imagen_mapa": "VARCHAR(255)",   # imagen de "📍 Marcar en Mapa"
     "latitud": "REAL",
@@ -354,12 +359,26 @@ COLUMNAS_NUEVAS_DOTACION_SALIDA = {
 # tiene filas) para que las filas de `personal` cargadas antes de la Fase 8
 # queden con un valor válido en vez de romper la migración.
 COLUMNAS_NUEVAS_PERSONAL = {
-    "pin": "VARCHAR(10) NOT NULL DEFAULT '5903'",
+    # El DEFAULT en claro solo existe un instante: _migrar_pines_a_hash() lo
+    # convierte a hash en el mismo init_db().
+    "pin": "VARCHAR(255) NOT NULL DEFAULT '5903'",
     "grupo_sanguineo": "VARCHAR(10)",
     "antiguedad_fecha": "DATE",
     "ruta_firma": "VARCHAR(255)",
     "estado": "VARCHAR(20) NOT NULL DEFAULT 'Activo'",
     "id_ruba": "INTEGER",
+    # Padrón completo del 'Reporte de bomberos' de RUBA (ruba_importer.py).
+    "fecha_nacimiento": "DATE",
+    "sexo": "VARCHAR(20)",
+    "domicilio": "VARCHAR(200)",
+    "email": "VARCHAR(120)",
+    "factor_rh": "VARCHAR(20)",
+    "cargo": "VARCHAR(120)",
+    "formacion": "VARCHAR(40)",
+    "nivel_educativo": "VARCHAR(80)",
+    "titulo_obtenido": "VARCHAR(160)",
+    "situacion_revista": "VARCHAR(60)",
+    "fecha_ultimo_ascenso": "DATE",
 }
 
 COLUMNAS_NUEVAS_MOVILES = {
@@ -409,11 +428,44 @@ def _migrar_columnas(nombre_tabla: str, columnas_nuevas: dict[str, str]) -> None
             conexion.execute(text(f"ALTER TABLE {nombre_tabla} ADD COLUMN {nombre} {tipo_sql}"))
 
 
+def _migrar_pines_a_hash() -> int:
+    """Convierte en caliente los PIN legados en texto plano (<= 10
+    caracteres o sin '$') al formato 'salt$hash'. Idempotente: los que ya
+    son hash no se tocan. SQLite no impone el largo de VARCHAR, así que la
+    columna existente no necesita ALTER. Devuelve cuántos migró."""
+    if "personal" not in inspect(engine).get_table_names():
+        return 0
+    with engine.begin() as conexion:
+        filas = conexion.execute(text("SELECT id, pin FROM personal")).all()
+        legados = [(id_, pin) for id_, pin in filas if not es_hash(pin)]
+        for id_, pin in legados:
+            conexion.execute(text("UPDATE personal SET pin = :pin WHERE id = :id"),
+                             {"pin": hash_pin((pin or "").strip() or PIN_DEFAULT), "id": id_})
+    if legados:
+        logging.getLogger(__name__).info("PIN migrados a hash: %s", len(legados))
+    return len(legados)
+
+
+def _normalizar_estados_ruba() -> None:
+    """Estados de RUBA al arrancar:
+      - 'PENDIENTE' (anterior a la cola) -> 'NO_SINCRONIZADO'.
+      - 'SINCRONIZANDO' huérfano (la app se cerró a mitad de una carga) ->
+        'EN_COLA': la cola lo retoma y, si RUBA ya había creado el incidente,
+        sigue sobre ese mismo ID (ruba_id_remoto)."""
+    if "incidentes" not in inspect(engine).get_table_names():
+        return
+    with engine.begin() as conexion:
+        conexion.execute(text("UPDATE incidentes SET estado_ruba = 'NO_SINCRONIZADO' WHERE estado_ruba = 'PENDIENTE'"))
+        conexion.execute(text("UPDATE incidentes SET estado_ruba = 'EN_COLA' WHERE estado_ruba = 'SINCRONIZANDO'"))
+
+
 def init_db() -> None:
     Base.metadata.create_all(engine)  # crea salidas_unidad, documentos_personal, damnificados_civiles si faltan
     _migrar_columnas("incidentes", COLUMNAS_NUEVAS_INCIDENTES)
+    _normalizar_estados_ruba()
     _migrar_columnas("dotacion_salida", COLUMNAS_NUEVAS_DOTACION_SALIDA)
     _migrar_columnas("personal", COLUMNAS_NUEVAS_PERSONAL)
+    _migrar_pines_a_hash()
     _migrar_columnas("salidas_unidad", COLUMNAS_NUEVAS_SALIDA_UNIDAD)
     _migrar_columnas("moviles", COLUMNAS_NUEVAS_MOVILES)
     _migrar_columnas("damnificados_civiles", COLUMNAS_NUEVAS_DAMNIFICADOS_CIVILES)

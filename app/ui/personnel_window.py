@@ -24,7 +24,6 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
-    QLineEdit,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -49,6 +48,7 @@ from app.models import (
 from app.paths import get_writable_dir
 from app.reports.excel_generator import abrir_para_impresion
 from app.ui import theme
+from app.ui.pin_dialogs import DialogoCambioPin, DialogoResetPinMaestra
 from app.ui.widgets import FirmaPad
 
 ROL_ETIQUETA = {
@@ -155,8 +155,12 @@ class LegajoPrivadoWidget(QWidget):
         boton_firmar.clicked.connect(self._abrir_dialogo_firma)
         boton_pin = QPushButton("Cambiar PIN", caja_firma)
         boton_pin.clicked.connect(self._abrir_dialogo_pin)
+        boton_reset_pin = QPushButton("Resetear PIN con Clave Maestra", caja_firma)
+        boton_reset_pin.setToolTip("Fija un PIN temporal sin conocer el anterior (requiere la clave maestra del cuartel)")
+        boton_reset_pin.clicked.connect(self._abrir_dialogo_reset_pin)
         fila_botones_firma.addWidget(boton_firmar)
         fila_botones_firma.addWidget(boton_pin)
+        fila_botones_firma.addWidget(boton_reset_pin)
         layout_firma.addLayout(fila_botones_firma)
 
         fila_superior.addWidget(caja_ficha, 2)
@@ -461,44 +465,19 @@ class LegajoPrivadoWidget(QWidget):
         QMessageBox.information(self, "Firma registrada", "La firma se guardó correctamente en el legajo.")
 
     def _abrir_dialogo_pin(self) -> None:
+        """Cambio por el propio bombero: el diálogo exige el PIN actual."""
         if self._personal_id is None:
             return
+        if DialogoCambioPin(self._personal_id, self).exec() == QDialog.DialogCode.Accepted:
+            QMessageBox.information(self, "PIN actualizado", "El PIN de seguridad se actualizó correctamente.")
 
-        dialogo = QDialog(self)
-        dialogo.setWindowTitle("Cambiar PIN de Seguridad")
-        layout = QFormLayout(dialogo)
-        entry_nuevo = QLineEdit(dialogo)
-        entry_nuevo.setEchoMode(QLineEdit.EchoMode.Password)
-        entry_nuevo.setMaxLength(10)
-        entry_repetir = QLineEdit(dialogo)
-        entry_repetir.setEchoMode(QLineEdit.EchoMode.Password)
-        entry_repetir.setMaxLength(10)
-        layout.addRow("PIN nuevo", entry_nuevo)
-        layout.addRow("Repetir PIN", entry_repetir)
-
-        fila_botones = QHBoxLayout()
-        boton_cancelar = QPushButton("Cancelar", dialogo)
-        boton_guardar = QPushButton("Guardar", dialogo)
-        boton_guardar.setObjectName("botonGuardar")
-        boton_guardar.clicked.connect(dialogo.accept)
-        boton_cancelar.clicked.connect(dialogo.reject)
-        fila_botones.addWidget(boton_cancelar)
-        fila_botones.addWidget(boton_guardar)
-        layout.addRow(fila_botones)
-
-        if dialogo.exec() != QDialog.DialogCode.Accepted:
+    def _abrir_dialogo_reset_pin(self) -> None:
+        """Reseteo sin conocer el PIN anterior, autorizado con la clave maestra."""
+        if self._personal_id is None:
             return
-
-        nuevo = entry_nuevo.text().strip()
-        if not nuevo or not nuevo.isdigit():
-            QMessageBox.warning(self, "PIN inválido", "El PIN tiene que ser numérico.")
-            return
-        if nuevo != entry_repetir.text().strip():
-            QMessageBox.warning(self, "No coincide", "Los dos PIN ingresados no coinciden.")
-            return
-
         with get_session() as session:
-            p = session.get(Personal, self._personal_id)
-            p.pin = nuevo
-
-        QMessageBox.information(self, "PIN actualizado", "El PIN de seguridad se actualizó correctamente.")
+            persona = session.get(Personal, self._personal_id)
+            nombre = persona.nombre_completo() if persona is not None else "este bombero"
+        dialogo = DialogoResetPinMaestra(self._personal_id, nombre, self)
+        if dialogo.exec() == QDialog.DialogCode.Accepted:
+            QMessageBox.information(self, "PIN reseteado", "El PIN temporal quedó guardado.")

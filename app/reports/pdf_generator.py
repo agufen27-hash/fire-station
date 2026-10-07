@@ -13,9 +13,10 @@ son exactamente la misma lógica que ya arma correctamente las Dotaciones,
 sus horarios propios (Fase 7) y su firma electrónica (Fase 8); no tiene
 sentido duplicarla acá.
 
-Tipografía unificada (app/reports/tipografia.py): Aptos 12 pt (o Segoe UI /
-Helvetica), texto a la izquierda y números / fechas / horas centrados. El
-pie lleva quién confeccionó la planilla (validado con PIN).
+Tipografía unificada con las planillas Excel (commit 9b45bcd): Arial 10 pt
+-- FUENTE_EXCEL / TAMANO_EXCEL_PT de excel_generator, que salen de
+app/reports/tipografia.py --, texto a la izquierda y números / fechas /
+horas centrados. El pie lleva quién confeccionó la planilla (validado con PIN).
 """
 
 from __future__ import annotations
@@ -31,6 +32,8 @@ from app.db import get_session
 from app.models import Incidente
 from app.paths import get_writable_dir
 from app.reports.excel_generator import (
+    FUENTE_EXCEL,
+    TAMANO_EXCEL_PT,
     _agrupar_dotaciones,
     _formatear_fecha,
     _formatear_hora,
@@ -39,7 +42,7 @@ from app.reports.excel_generator import (
     texto_autor,
     total_efectivos,
 )
-from app.reports.tipografia import TAMANO_PT, es_numerico, familia_css, fuente_planillas
+from app.reports.tipografia import es_numerico, familia_css
 
 OUTPUT_DIR = get_writable_dir("output") / "informes"
 
@@ -59,7 +62,7 @@ def _estilo_base() -> str:
     familia = familia_css()
     return (
         "<style>"
-        f"body, p, div, td, span {{ font-family: {familia}; font-size: {TAMANO_PT}pt; text-align: left; }}"
+        f"body, p, div, td, span {{ font-family: {familia}; font-size: {TAMANO_EXCEL_PT}pt; text-align: left; }}"
         f"h3 {{ font-family: {familia}; }}"
         "td.num { text-align: center; }"
         "</style>"
@@ -196,7 +199,7 @@ def generar_informe_pdf(incidente_id: int) -> Path:
         ruta_salida = _ruta_salida_pdf(incidente)
 
     documento = QTextDocument()
-    documento.setDefaultFont(QFont(fuente_planillas(), TAMANO_PT))
+    documento.setDefaultFont(QFont(FUENTE_EXCEL, TAMANO_EXCEL_PT))
     documento.setHtml(html)
 
     impresora = QPrinter(QPrinter.PrinterMode.HighResolution)

@@ -3,6 +3,8 @@ Confirmación de autoría de una planilla: al finalizar (guardar un servicio
 cerrado) se elige el bombero/operador que la confeccionó y éste confirma con
 su PIN personal (el mismo del legajo y de la firma de dotación). Sin PIN
 correcto no se persiste nada. El nombre queda en el pie de las planillas.
+Si el PIN validado es todavía el de fábrica, se obliga a definir uno propio
+antes de continuar.
 """
 
 from __future__ import annotations
@@ -21,9 +23,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app.core.security import es_pin_default
 from app.db import get_session
 from app.models import Personal
+from app.services.personal_service import verificar_pin_personal
 from app.ui import theme
+from app.ui.pin_dialogs import DialogoCambioPin
 
 
 class DialogoAutorPin(QDialog):
@@ -51,7 +56,6 @@ class DialogoAutorPin(QDialog):
         with get_session() as session:
             personas = (session.query(Personal).filter(Personal.activo.is_(True))
                         .order_by(Personal.apellido, Personal.nombre).all())
-            self._pines = {p.id: p.pin for p in personas}
             for p in personas:
                 self.combo_responsable.addItem(p.nombre_completo(), p.id)
         indice = self.combo_responsable.findData(preseleccion) if preseleccion is not None else -1
@@ -91,11 +95,18 @@ class DialogoAutorPin(QDialog):
         if personal_id is None:
             self._error("Elegí un responsable de la lista.")
             return
-        if self.entry_pin.text() != self._pines.get(personal_id):
+        pin = self.entry_pin.text()
+        if not verificar_pin_personal(personal_id, pin):
             self.entry_pin.clear()
             self.entry_pin.setFocus()
             self._error("PIN incorrecto.")
             return
+        if es_pin_default(pin):
+            cambio = DialogoCambioPin(personal_id, self, pin_actual=pin, obligatorio=True)
+            if cambio.exec() != QDialog.DialogCode.Accepted:
+                self.entry_pin.clear()
+                self._error("Tenés que definir un PIN propio para confirmar la planilla.")
+                return
         self.personal_id = personal_id
         self.accept()
 

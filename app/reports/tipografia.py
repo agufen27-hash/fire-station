@@ -1,27 +1,27 @@
 """
-Tipografía unificada de las planillas (PCS / PCD2 / Informe PDF):
+Tipografía unificada de las planillas oficiales (PCS / PCD2 en Excel) y del
+Informe Técnico en PDF:
 
-- Texto y descripciones: 'Aptos' 12 pt, alineado a la IZQUIERDA.
-- Números, fechas y horas: 'Aptos' 12 pt, CENTRADOS.
+- Fuente: Arial 10 pt (la de las plantillas oficiales del cuerpo). Excel
+  la toma de FUENTE_PLANILLAS / TAMANO_PT a través de
+  app/reports/excel_generator.py (FUENTE_EXCEL, TAMANO_EXCEL_PT) y el PDF
+  de app/reports/pdf_generator.py, así ambos documentos coinciden.
+- Texto y descripciones: alineado a la IZQUIERDA.
+- Números, fechas y horas: CENTRADOS (`es_numerico` decide qué es qué).
 
-Aptos viene con Office 365 reciente; si no está instalada se usa Segoe UI
-(Windows) y, como último recurso, Helvetica. La detección mira las carpetas
-de fuentes del sistema y del usuario, así no depende de que exista una
-QApplication (los generadores también corren desde scripts).
+Arial viene con Windows; en el PDF (QTextDocument) la pila CSS cae en
+Helvetica / sans-serif si no estuviera instalada.
 """
 
 from __future__ import annotations
 
-import os
 import re
 from datetime import date, datetime, time
-from functools import lru_cache
-from pathlib import Path
 from typing import Any
 
-TAMANO_PT = 12
-PREFERIDAS = (("Aptos", "aptos"), ("Segoe UI", "segoeui"), ("Helvetica", "helvetica"))
-FALLBACK_FINAL = "Helvetica"
+FUENTE_PLANILLAS = "Arial"
+TAMANO_PT = 10
+FALLBACKS_CSS = ("Helvetica",)
 
 # "12/03/2026", "08:45", "003/2026", "12", "4,5 ha", "-31.5, -64.2"
 _ES_NUMERICO = re.compile(
@@ -30,38 +30,14 @@ _ES_NUMERICO = re.compile(
 )
 
 
-def _carpetas_fuentes() -> list:
-    carpetas = []
-    windir = os.environ.get("WINDIR")
-    if windir:
-        carpetas.append(Path(windir) / "Fonts")
-    local = os.environ.get("LOCALAPPDATA")
-    if local:
-        carpetas.append(Path(local) / "Microsoft" / "Windows" / "Fonts")
-    carpetas += [Path("/usr/share/fonts"), Path.home() / ".fonts", Path("/Library/Fonts"),
-                 Path("/System/Library/Fonts")]
-    return [c for c in carpetas if c.is_dir()]
-
-
-@lru_cache(maxsize=1)
 def fuente_planillas() -> str:
-    """Primera fuente instalada de PREFERIDAS (Aptos -> Segoe UI -> Helvetica)."""
-    archivos = set()
-    for carpeta in _carpetas_fuentes():
-        try:
-            archivos.update(f.name.lower() for f in carpeta.rglob("*") if f.suffix.lower() in (".ttf", ".otf", ".ttc"))
-        except OSError:
-            continue
-    for familia, prefijo in PREFERIDAS:
-        if any(nombre.startswith(prefijo) for nombre in archivos):
-            return familia
-    return FALLBACK_FINAL
+    """Familia de las planillas y del PDF (Arial)."""
+    return FUENTE_PLANILLAS
 
 
 def familia_css() -> str:
-    """Pila CSS para QTextDocument: la elegida y los fallbacks."""
-    familias = dict.fromkeys([fuente_planillas(), *(f for f, _ in PREFERIDAS)])
-    return ", ".join(f"'{f}'" for f in familias) + ", sans-serif"
+    """Pila CSS para QTextDocument: Arial y sus fallbacks."""
+    return ", ".join(f"'{f}'" for f in (FUENTE_PLANILLAS, *FALLBACKS_CSS)) + ", sans-serif"
 
 
 def es_numerico(valor: Any) -> bool:

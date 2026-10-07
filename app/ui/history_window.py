@@ -55,7 +55,7 @@ from sqlalchemy.orm import joinedload
 
 from app.core.horarios import duracion as duracion_servicio
 from app.db import get_session
-from app.models import DotacionSalida, EstadoRuba, Incidente, SalidaUnidad, TipoIncidente
+from app.models import ESTADOS_RUBA_EN_PROCESO, DotacionSalida, EstadoRuba, Incidente, SalidaUnidad, TipoIncidente
 from app.reports.excel_generator import generar_e_imprimir_pcd2, generar_e_imprimir_pcs, resumen_advertencias
 from app.reports.pdf_generator import generar_e_imprimir_informe_pdf
 from app.services.ruba_service import desmarcar_sincronizado_manual, marcar_sincronizado_manual
@@ -201,7 +201,19 @@ class HistoryWindow(QWidget):
         boton_actualizar.clicked.connect(self.refrescar)
         fila.addWidget(boton_actualizar)
 
+        boton_reporte = QPushButton("📑 Reporte gerencial", self)
+        boton_reporte.setObjectName("botonAhora")
+        boton_reporte.setToolTip("Exporta a Excel asistencias y horas por bombero y salidas y horas por móvil "
+                                 "entre dos fechas")
+        boton_reporte.clicked.connect(self._abrir_reporte_gerencial)
+        fila.addWidget(boton_reporte)
+
         return fila
+
+    def _abrir_reporte_gerencial(self) -> None:
+        from app.ui.reports_window import abrir_reporte_gerencial
+
+        abrir_reporte_gerencial(self)
 
     def _crear_barra_lote(self) -> QHBoxLayout:
         fila = QHBoxLayout()
@@ -380,6 +392,9 @@ class HistoryWindow(QWidget):
             "ruba_error_log": inc.ruba_error_log,
             "ruba_id_remoto": inc.ruba_id_remoto,
             "ruba_sincronizado_en": inc.ruba_sincronizado_en,
+            "ultimo_error_ruba": inc.ultimo_error_ruba,
+            "reintentos_ruba": inc.reintentos_ruba or 0,
+            "proximo_reintento_ruba": inc.proximo_reintento_ruba,
             "en_curso": inc.en_curso,
             "carga_manual": bool(inc.ruba_carga_manual),
             "horas": horas,
@@ -388,8 +403,9 @@ class HistoryWindow(QWidget):
 
     @staticmethod
     def seleccionable(datos: dict) -> bool:
-        """Solo lo que todavía no está en RUBA y ya se cerró."""
-        return datos["estado_ruba"] != EstadoRuba.SINCRONIZADO.value and not datos["en_curso"]
+        """Solo lo que todavía no está en RUBA, ya se cerró y no está en la cola."""
+        return (datos["estado_ruba"] != EstadoRuba.SINCRONIZADO.value and not datos["en_curso"]
+                and datos["estado_ruba"] not in ESTADOS_RUBA_EN_PROCESO)
 
     def _poblar_tabla(self, filas: List[dict]) -> None:
         self.tabla.blockSignals(True)
@@ -507,7 +523,10 @@ class HistoryWindow(QWidget):
     def _texto_estado(estado: str) -> str:
         return {
             EstadoRuba.SINCRONIZADO.value: "✅ Cargado en RUBA",
-            EstadoRuba.PENDIENTE.value: "🕒 Pendiente",
+            EstadoRuba.NO_SINCRONIZADO.value: "🕒 No sincronizado",
+            EstadoRuba.EN_COLA.value: "⏳ En cola",
+            EstadoRuba.SINCRONIZANDO.value: "🔄 Sincronizando…",
+            EstadoRuba.ERROR_REINTENTO.value: "📡 Reintento automático",
             EstadoRuba.ERROR.value: "❌ Error",
         }.get(estado, estado)
 
@@ -515,7 +534,10 @@ class HistoryWindow(QWidget):
     def _color_estado(estado: str) -> QColor:
         return QColor(theme.color({
             EstadoRuba.SINCRONIZADO.value: "verde_texto",
-            EstadoRuba.PENDIENTE.value: "ambar",
+            EstadoRuba.NO_SINCRONIZADO.value: "ambar",
+            EstadoRuba.EN_COLA.value: "azul",
+            EstadoRuba.SINCRONIZANDO.value: "azul",
+            EstadoRuba.ERROR_REINTENTO.value: "ambar",
             EstadoRuba.ERROR.value: "rojo",
         }.get(estado, "texto_secundario")))
 
@@ -530,8 +552,18 @@ class HistoryWindow(QWidget):
             return ("Cargado en RUBA" + (f" el {cuando:%d/%m/%Y %H:%M}" if cuando else "")
                     + (f" (ID {datos['ruba_id_remoto']})" if datos.get("ruba_id_remoto") else "")
                     + ". Parte cerrado: no se edita ni se elimina.")
+        if estado == EstadoRuba.EN_COLA.value:
+            return "En la cola de RUBA: se carga en segundo plano. Editarlo lo saca de la cola."
+        if estado == EstadoRuba.SINCRONIZANDO.value:
+            return "Cargándose en RUBA ahora mismo (en segundo plano)."
+        if estado == EstadoRuba.ERROR_REINTENTO.value:
+            cuando = datos.get("proximo_reintento_ruba")
+            return (f"Falló por conexión ({datos.get('ultimo_error_ruba') or 'sin detalle'}).\n"
+                    f"Reintento automático N° {datos.get('reintentos_ruba', 0)}"
+                    + (f" programado para las {cuando:%H:%M}" if cuando else "")
+                    + ", o apenas vuelva internet.")
         if estado == EstadoRuba.ERROR.value:
-            log_error = (datos.get("ruba_error_log") or "").strip()
+            log_error = (datos.get("ultimo_error_ruba") or datos.get("ruba_error_log") or "").strip()
             return "Falló la carga en RUBA:\n" + (log_error.splitlines()[0] if log_error else "(sin detalle)") \
                 + "\n\nBotón ⚠ Log: detalle completo."
         return "Pendiente de carga en RUBA: tildalo y usá 🚀 Cargar Seleccionados."

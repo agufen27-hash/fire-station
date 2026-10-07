@@ -7,6 +7,11 @@ Widgets del formulario de siniestro que dependen del catálogo de RUBA:
   radios salen de `selectores.editar_general.condicionales` en
   config/ruba_mapping.json; el valor guardado es el código oficial de RUBA.
 
+En los tres formularios de Incendio se suma el bloque "Medios aéreos"
+(¿intervinieron? Sí/No + aviones, avionetas, helicópteros y otros). No es
+un campo del mapping: se guarda aparte en datos_especificos["medios_aereos"]
+y ruba_payload lo convierte en `editar_general.medios_aereos`.
+
 Si el mapping no trae opciones para un combo (`<campo>_opciones`), el combo
 queda deshabilitado con un aviso: no se inventan códigos de RUBA. Si trae
 `<campo>_default`, el combo lo anuncia ("si queda vacío: Soleado"): la
@@ -118,6 +123,12 @@ ETIQUETAS_OPCION = {
     "plastica": "Plástica",
 }
 
+# Bloque "Medios aéreos": solo en los formularios de Incendio.
+FORMULARIOS_CON_MEDIOS_AEREOS = (FORM_FORESTAL, FORM_ESTRUCTURAL, FORM_INCENDIO)
+MEDIOS_AEREOS = (("aviones", "Aviones"), ("avionetas", "Avionetas"),
+                 ("helicopteros", "Helicópteros"), ("otros", "Otros"))
+MAX_MEDIOS_AEREOS = 99
+
 TEXTO_SIN_OPCIONES = "Sin opciones oficiales en ruba_mapping.json"
 TEXTO_SELECCIONAR = "— Seleccionar —"
 VALOR_VACIO_NUMERICO = -1  # los spin boxes arrancan acá y muestran "—" (= sin dato)
@@ -228,6 +239,13 @@ class _PaginaFormulario(QWidget):
             grid.addWidget(self._crear_widget(campo, mapping), fila, 1)
             fila += 1
 
+        # Medios aéreos (Incendios): fuera de self._widgets, así valores()
+        # no los mezcla con los campos condicionales del mapping.
+        self.combo_medios_aereos: Optional[QComboBox] = None
+        self._spins_medios_aereos: Dict[str, QSpinBox] = {}
+        if formulario in FORMULARIOS_CON_MEDIOS_AEREOS:
+            self._crear_medios_aereos(grid, fila)
+
         # "<campo>_otro": texto libre habilitado solo con la opción Otro/Otros.
         for clave, widget in self._widgets.items():
             combo = self._widgets.get(clave[: -len("_otro")]) if clave.endswith("_otro") else None
@@ -237,6 +255,65 @@ class _PaginaFormulario(QWidget):
                 combo.currentIndexChanged.connect(
                     lambda _i, c=combo, t=widget, cod=codigos_otro: self._habilitar_otro(c, t, cod))
                 self._habilitar_otro(combo, widget, codigos_otro)
+
+    def _crear_medios_aereos(self, grid: QGridLayout, fila: int) -> None:
+        grid.addWidget(QLabel("¿Intervención de medios aéreos?", self), fila, 0)
+        combo = QComboBox(self)
+        combo.addItem("No", False)
+        combo.addItem("Sí", True)
+        combo.setObjectName(f"{self.formulario}__medios_aereos")
+        combo.setToolTip("Con 'Sí' se cargan en RUBA las cantidades; con 'No' el bloque va vacío.")
+        grid.addWidget(combo, fila, 1)
+        self.combo_medios_aereos = combo
+
+        contenedor = QWidget(self)
+        cantidades = QHBoxLayout(contenedor)
+        cantidades.setContentsMargins(0, 0, 0, 0)
+        cantidades.setSpacing(10)
+        for clave, etiqueta in MEDIOS_AEREOS:
+            spin = QSpinBox(contenedor)
+            spin.setRange(0, MAX_MEDIOS_AEREOS)
+            spin.setObjectName(f"{self.formulario}__medios_aereos_{clave}")
+            cantidades.addWidget(QLabel(etiqueta, contenedor))
+            cantidades.addWidget(spin)
+            self._spins_medios_aereos[clave] = spin
+        cantidades.addStretch(1)
+        grid.addWidget(contenedor, fila + 1, 0, 1, self.COLUMNAS)
+
+        combo.currentIndexChanged.connect(lambda _i: self._habilitar_medios_aereos())
+        self._habilitar_medios_aereos()
+
+    def _habilitar_medios_aereos(self) -> None:
+        """Las cantidades solo se editan con "Sí"; con "No" quedan en 0."""
+        intervinieron = bool(self.combo_medios_aereos and self.combo_medios_aereos.currentData())
+        for spin in self._spins_medios_aereos.values():
+            spin.setEnabled(intervinieron)
+            if not intervinieron:
+                spin.setValue(0)
+
+    def medios_aereos(self) -> Optional[Dict[str, Any]]:
+        """{"intervinieron", "aviones", "avionetas", "helicopteros", "otros"}
+        o None si este formulario no tiene el bloque."""
+        if self.combo_medios_aereos is None:
+            return None
+        intervinieron = bool(self.combo_medios_aereos.currentData())
+        return {"intervinieron": intervinieron,
+                **{clave: (spin.value() if intervinieron else 0)
+                   for clave, spin in self._spins_medios_aereos.items()}}
+
+    def set_medios_aereos(self, datos: Optional[Dict[str, Any]]) -> None:
+        """Inversa de `medios_aereos()`; None o vacío = "No" con todo en 0."""
+        if self.combo_medios_aereos is None:
+            return
+        datos = datos or {}
+        self.combo_medios_aereos.setCurrentIndex(self.combo_medios_aereos.findData(bool(datos.get("intervinieron"))))
+        self._habilitar_medios_aereos()
+        if datos.get("intervinieron"):
+            for clave, spin in self._spins_medios_aereos.items():
+                try:
+                    spin.setValue(min(max(int(datos.get(clave) or 0), 0), MAX_MEDIOS_AEREOS))
+                except (TypeError, ValueError):
+                    spin.setValue(0)
 
     @staticmethod
     def _habilitar_otro(combo: QComboBox, texto: QLineEdit, codigos_otro: set) -> None:
@@ -319,6 +396,7 @@ class _PaginaFormulario(QWidget):
                 for boton in widget.buttons():
                     boton.setChecked(False)
                 widget.setExclusive(True)
+        self.set_medios_aereos(None)
 
     def widget(self, clave: str) -> Any:
         return self._widgets[clave]
@@ -386,7 +464,11 @@ class PanelDatosEspecificos(QStackedWidget):
         pagina = self.currentWidget()
         if not isinstance(pagina, _PaginaFormulario):
             return None
-        return {"formulario": pagina.formulario, "campos": pagina.valores()}
+        datos: Dict[str, Any] = {"formulario": pagina.formulario, "campos": pagina.valores()}
+        medios = pagina.medios_aereos()
+        if medios is not None:
+            datos["medios_aereos"] = medios
+        return datos
 
     def limpiar(self) -> None:
         for pagina in self._paginas.values():
@@ -396,7 +478,9 @@ class PanelDatosEspecificos(QStackedWidget):
         """Repone lo guardado (llamar después de elegir Tipo/Subtipo)."""
         self.limpiar()
         if datos and datos.get("formulario") in self._paginas:
-            self._paginas[datos["formulario"]].cargar(datos.get("campos"))
+            pagina = self._paginas[datos["formulario"]]
+            pagina.cargar(datos.get("campos"))
+            pagina.set_medios_aereos(datos.get("medios_aereos"))
 
 
 # -- Opciones de género (damnificados) --------------------------------------------

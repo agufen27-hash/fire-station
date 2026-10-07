@@ -13,7 +13,8 @@ no hay un segundo mapeo de nombres en el medio.
       "inicializacion":         {numero_parte, tipo_incidente, categoria_incidente, hay_participaciones},
       "editar_general":         {localidad_autocomplete, calle, altura, tipo_zona, latitud, longitud, *_solicitante,
                                  descripcion, civiles_*, compania_seguro, numero_poliza,
-                                 condicionales: {formulario, campos} | None},
+                                 condicionales: {formulario, campos} | None,
+                                 medios_aereos: {aviones, avionetas, helicopteros, otros} | None},
       "damnificados":           {heridos: [{nombre, apellido, dni, genero}], fallecidos: [...],
                                  bienes: [{tipo, descripcion, titular, seguro}],
                                  bomberos: [{bombero: PERSONA, detalle_atencion}]},
@@ -52,7 +53,7 @@ from dataclasses import dataclass, field
 from datetime import date, time
 from typing import Any, Dict, List, Optional
 
-from app.core.catalogos import formulario_para, leer_mapping
+from app.core.catalogos import FORM_ESTRUCTURAL, FORM_FORESTAL, FORM_INCENDIO, formulario_para, leer_mapping
 from app.core.horarios import fecha_fin_ajustada
 from app.models import CondicionDamnificado, FuncionBase, Incidente, Personal, RolDotacion
 
@@ -346,7 +347,7 @@ def _condicionales(datos_especificos: Optional[Dict[str, Any]], tipo_id: Optiona
     vehículos van aparte, en `vehiculos_accidentes`). Sin bloque guardado
     se deduce el formulario del Tipo/Subtipo con campos vacíos: la
     automatización completa los obligatorios con su `<campo>_default`."""
-    bloque = {k: v for k, v in (datos_especificos or {}).items() if k != "vehiculos"}
+    bloque = {k: v for k, v in (datos_especificos or {}).items() if k not in ("vehiculos", "medios_aereos")}
     if not bloque.get("formulario"):
         formulario = formulario_para(tipo_id, subtipo_codigo)
         if formulario is None:
@@ -354,6 +355,36 @@ def _condicionales(datos_especificos: Optional[Dict[str, Any]], tipo_id: Optiona
         bloque = {"formulario": formulario, "campos": {}}
     bloque.setdefault("campos", {})
     return bloque
+
+
+FORMULARIOS_CON_MEDIOS_AEREOS = (FORM_FORESTAL, FORM_ESTRUCTURAL, FORM_INCENDIO)
+CLAVES_MEDIOS_AEREOS = ("aviones", "avionetas", "helicopteros", "otros")
+
+
+def _cantidad(valor: Any) -> int:
+    try:
+        return max(int(valor or 0), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _medios_aereos(datos_especificos: Optional[Dict[str, Any]], tipo_id: Optional[int] = None,
+                   subtipo_codigo: Optional[str] = None) -> Optional[Dict[str, int]]:
+    """Medios aéreos de un Incendio (datos_especificos["medios_aereos"],
+    ver app/ui/siniestro_widgets.py) con la forma que espera
+    RubaServiceAutomation._cargar_medios_aereos: {aviones, avionetas,
+    helicopteros, otros}. None (-> combo en "No", contadores deshabilitados)
+    si no es un Incendio, si no intervinieron o si todas las cantidades
+    son 0: RUBA no acepta "Sí" sin ningún medio."""
+    datos = datos_especificos or {}
+    formulario = datos.get("formulario") or formulario_para(tipo_id, subtipo_codigo)
+    medios = datos.get("medios_aereos")
+    if formulario not in FORMULARIOS_CON_MEDIOS_AEREOS or not isinstance(medios, dict):
+        return None
+    if not medios.get("intervinieron"):
+        return None
+    cantidades = {clave: _cantidad(medios.get(clave)) for clave in CLAVES_MEDIOS_AEREOS}
+    return cantidades if any(cantidades.values()) else None
 
 
 def construir_payload(d: DatosServicio) -> Dict[str, Any]:
@@ -411,6 +442,8 @@ def construir_payload(d: DatosServicio) -> Dict[str, Any]:
             # automatización busca el bloque "Datos del Seguro" en RUBA.
             "tiene_seguro": bool(opcional(d.seguro_compania) or opcional(d.seguro_poliza)),
             "condicionales": _condicionales(d.datos_especificos, d.tipo_id, d.categoria_codigo),
+            # Incendios: con apoyo aéreo real el combo va en "Sí" con las cantidades.
+            "medios_aereos": _medios_aereos(d.datos_especificos, d.tipo_id, d.categoria_codigo),
         },
         "damnificados": {
             "heridos": damnificados_de(CondicionDamnificado.HERIDO.value),

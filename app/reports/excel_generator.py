@@ -24,8 +24,9 @@ PCD2 Página S6 · Total páginas V6 · N° parte C6. Dos dotaciones por página
                Jefe B34 · Grado O34 · Chofer E37 · Embarcados E38:E47 · Firma P49
 
 TIPOGRAFÍA: todo dato escrito en las planillas Excel va en Arial 10 pt
-(la de las plantillas oficiales); texto a la izquierda y números / fechas /
-horas centrados (app/reports/tipografia.py decide qué es numérico). Los
+(la de las plantillas oficiales, definida en app/reports/tipografia.py y
+compartida con el Informe PDF); texto a la izquierda y números / fechas /
+horas centrados (tipografia.es_numerico decide qué es numérico). Los
 totales de la fila 51 de la PCS van además en negrita.
 
 PIE Y ENCABEZADO DE PÁGINA: el pie izquierdo lleva quién confeccionó la
@@ -62,7 +63,7 @@ from openpyxl.worksheet.worksheet import Worksheet
 from app.db import get_session
 from app.models import MEDIOS_CONTACTO, FuncionBase, Incidente, RolDotacion
 from app.paths import get_resource_path, get_writable_dir
-from app.reports.tipografia import es_numerico
+from app.reports.tipografia import FUENTE_PLANILLAS, TAMANO_PT, es_numerico
 
 # Las plantillas son de solo lectura (viajan embebidas en el bundle); las
 # planillas completadas son escribibles y viven al lado del .exe.
@@ -72,9 +73,10 @@ OUTPUT_DIR = get_writable_dir("output") / "planillas"
 PCS_TEMPLATE_NOMBRE = "PCS.xlsx"
 PCD2_TEMPLATE_NOMBRE = "PCD2.xlsx"
 
-# Tipografía de todo dato escrito en las planillas Excel (la de las plantillas).
-FUENTE_EXCEL = "Arial"
-TAMANO_EXCEL_PT = 10
+# Tipografía de todo dato escrito en las planillas Excel (la de las plantillas):
+# la misma que usa el Informe PDF (app/reports/tipografia.py).
+FUENTE_EXCEL = FUENTE_PLANILLAS
+TAMANO_EXCEL_PT = TAMANO_PT
 
 DIAS_SEMANA = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
 

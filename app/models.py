@@ -33,6 +33,8 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
+from app.core.security import PIN_DEFAULT, hash_pin
+
 
 class Base(DeclarativeBase):
     pass
@@ -44,9 +46,32 @@ class Base(DeclarativeBase):
 # ---------------------------------------------------------------------------
 
 class EstadoRuba(str, enum.Enum):
-    PENDIENTE = "PENDIENTE"
+    """Ciclo de sincronización de un parte con RUBA (ver
+    app/services/ruba_queue_worker.py):
+
+      NO_SINCRONIZADO -> EN_COLA -> SINCRONIZANDO -> SINCRONIZADO
+      SINCRONIZANDO -> ERROR_REINTENTO: caída de red, reintento automático
+                       con retroceso exponencial (vuelve a EN_COLA).
+      SINCRONIZANDO -> ERROR: datos incompletos o rechazo de RUBA; lo
+                       corrige el operador y lo vuelve a encolar.
+    """
+    NO_SINCRONIZADO = "NO_SINCRONIZADO"
+    EN_COLA = "EN_COLA"
+    SINCRONIZANDO = "SINCRONIZANDO"
     SINCRONIZADO = "SINCRONIZADO"
+    ERROR_REINTENTO = "ERROR_REINTENTO"
     ERROR = "ERROR"
+    # Alias histórico: el código anterior a la cola usa PENDIENTE; vale lo mismo
+    # que NO_SINCRONIZADO (las filas viejas con 'PENDIENTE' las migra app/db.py).
+    PENDIENTE = "NO_SINCRONIZADO"
+
+
+# Todo lo que todavía no está en RUBA (para contadores y filtros).
+ESTADOS_RUBA_PENDIENTES = (EstadoRuba.NO_SINCRONIZADO.value, EstadoRuba.EN_COLA.value,
+                           EstadoRuba.SINCRONIZANDO.value, EstadoRuba.ERROR_REINTENTO.value,
+                           EstadoRuba.ERROR.value)
+# En manos de la cola: no se editan, eliminan ni vuelven a encolar.
+ESTADOS_RUBA_EN_PROCESO = (EstadoRuba.EN_COLA.value, EstadoRuba.SINCRONIZANDO.value)
 
 
 class EstadoOperativo(str, enum.Enum):
@@ -128,7 +153,8 @@ class Personal(Base):
     activo: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
     # -- Fase 8: legajo digital, firma electrónica y PIN personal -----------
-    pin: Mapped[str] = mapped_column(String(10), default="5903", nullable=False)
+    # Hash PBKDF2 "salt$hash" (app/core/security.py), nunca el PIN en claro.
+    pin: Mapped[str] = mapped_column(String(255), default=lambda: hash_pin(PIN_DEFAULT), nullable=False)
     grupo_sanguineo: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
     antiguedad_fecha: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     ruta_firma: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
@@ -144,6 +170,22 @@ class Personal(Base):
     # Fase 11: Id interno de RUBA (columna "Id" del Reporte de bomberos),
     # para cruzar con el padrón oficial. NULL para personal cargado a mano.
     id_ruba: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+
+    # Datos del 'Reporte de bomberos' de RUBA (app/services/ruba_importer.py).
+    # La fecha de ingreso se guarda en `antiguedad_fecha` (es la misma fecha).
+    fecha_nacimiento: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    sexo: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    domicilio: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    email: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    factor_rh: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)   # "Positivo" / "Negativo"
+    cargo: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    formacion: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)   # Bombero / Aspirante / Cadete
+    nivel_educativo: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
+    titulo_obtenido: Mapped[Optional[str]] = mapped_column(String(160), nullable=True)
+    # Texto tal cual lo informa RUBA ("Activo", "Licencia por estudio"...);
+    # `estado` es su versión normalizada (Activo / Licencia / Reserva / Baja).
+    situacion_revista: Mapped[Optional[str]] = mapped_column(String(60), nullable=True)
+    fecha_ultimo_ascenso: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
 
     def nombre_completo(self) -> str:
         return f"{self.apellido}, {self.nombre}"
@@ -281,6 +323,12 @@ class Incidente(Base):
     # Marcado a mano como "ya cargado en RUBA" desde Estadísticas (se cargó en
     # el portal sin la automatización). Es el único SINCRONIZADO reversible.
     ruba_carga_manual: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Cola de sincronización: reintentos automáticos por caída de red, el
+    # último error en una línea (el detalle completo sigue en ruba_error_log)
+    # y cuándo toca el próximo intento (ERROR_REINTENTO).
+    reintentos_ruba: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    ultimo_error_ruba: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    proximo_reintento_ruba: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     # Quién confeccionó / cerró la planilla (validado con su PIN) y cuándo.
     confecciono_personal_id: Mapped[Optional[int]] = mapped_column(ForeignKey("personal.id"), nullable=True)
     confeccionado_en: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)

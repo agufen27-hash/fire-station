@@ -380,7 +380,8 @@ QTimeEdit:disabled, QDateEdit:disabled, QTextEdit:disabled {{
     background-color: {p.panel};
     border-color: {p.borde_suave};
 }}
-QLineEdit[invalido="true"], QComboBox[invalido="true"] {{
+QLineEdit[invalido="true"], QComboBox[invalido="true"],
+QTimeEdit[invalido="true"], QDateEdit[invalido="true"] {{
     border: 1px solid {p.rojo};
     background-color: {_rgba(p.rojo, 0.08)};
 }}
