@@ -233,8 +233,9 @@ def main() -> None:
         "--add-data", f"{config_example}{sep}data",
         "--add-data", f"{BASE_DIR / 'config' / 'ruba_mapping.json'}{sep}config",
     ]
-    for carpeta in carpetas_chromium:
-        comando += ["--add-data", f"{carpeta}{sep}ms-playwright/{carpeta.name}"]
+    # NOTA: NO pasamos carpetas_chromium a PyInstaller por --add-data
+    # para evitar bloqueos de I/O masivos en COLLECT en Windows.
+    # Las copiamos directamente abajo con shutil.copytree.
     comando.append(str(BASE_DIR / "run.py"))
 
     print("\nComando de PyInstaller:")
@@ -244,6 +245,17 @@ def main() -> None:
     resultado = subprocess.run(comando, cwd=BASE_DIR)
     if resultado.returncode != 0:
         sys.exit(resultado.returncode)
+
+    # Copia directa y limpia de Chromium a dist/FireStation/_internal/ms-playwright
+    destino_pw = DIST_DIR / NOMBRE_APP / "_internal" / "ms-playwright"
+    print(f"\nCopiando Chromium directamente a {destino_pw}...")
+    for carpeta in carpetas_chromium:
+        dest_carpeta = destino_pw / carpeta.name
+        if dest_carpeta.exists():
+            shutil.rmtree(dest_carpeta)
+        shutil.copytree(carpeta, dest_carpeta)
+        print(f"  OK: {carpeta.name}")
+
     verificar_chromium_embebido(DIST_DIR / NOMBRE_APP)
 
     print()
