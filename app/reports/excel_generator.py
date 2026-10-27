@@ -60,6 +60,7 @@ from openpyxl.drawing.image import Image as ImagenExcel
 from openpyxl.styles import Alignment, Color, Font
 from openpyxl.worksheet.worksheet import Worksheet
 
+from app.core.horarios import fecha_fin_ajustada
 from app.db import get_session
 from app.models import MEDIOS_CONTACTO, FuncionBase, Incidente, RolDotacion
 from app.paths import get_resource_path, get_writable_dir
@@ -145,11 +146,15 @@ class EscritorVerificado:
     def escribir(self, coordenada: Optional[str], valor: Any, campo: str, negrita: bool = False) -> bool:
         if not coordenada or valor in (None, ""):
             return False
+        celda = self.hoja[coordenada]
+        if not isinstance(celda, MergedCell) and str(celda.value or "").startswith("="):
+            # Fórmula de la plantilla (p. ej. I51 = A51 + E51): se respeta, solo se unifica el formato.
+            _ajustar_formato(celda, valor, negrita)
+            return True
         problema = self._problema(coordenada)
         if problema:
             self.advertencias.append(f"{self.planilla} {coordenada} ({campo}): {problema} — no se escribió.")
             return False
-        celda = self.hoja[coordenada]
         celda.value = valor
         _ajustar_formato(celda, valor, negrita)
         return True
@@ -287,6 +292,7 @@ def _agrupar_dotaciones(incidente: Incidente) -> List[Dict[str, Any]]:
         filas = sorted(su.dotacion, key=lambda f: f.id)
         jefe = next((f.personal for f in filas if f.rol == RolDotacion.A_CARGO.value), None)
         chofer = su.chofer or next((f.personal for f in filas if f.rol == RolDotacion.CHOFER.value), None)
+        fecha_salida = su.fecha_salida or incidente.fecha_salida or incidente.fecha
         dotaciones.append({
             "numero": numero,
             "movil": su.movil.nombre_identificador if su.movil else None,
@@ -294,8 +300,10 @@ def _agrupar_dotaciones(incidente: Incidente) -> List[Dict[str, Any]]:
             "a_cargo": _nombre(jefe),
             "grado": su.jefe_grado or (jefe.jerarquia if jefe else None),
             "bomberos": [f.personal.nombre_completo() for f in filas if f.rol == RolDotacion.BOMBERO.value],
-            "fecha": su.fecha_salida or incidente.fecha_salida or incidente.fecha,
-            "fecha_regreso": su.fecha_llegada or incidente.fecha_llegada,
+            "fecha": fecha_salida,
+            # Cruce de medianoche (23:30 -> 01:15): el regreso es al día siguiente.
+            "fecha_regreso": fecha_fin_ajustada(fecha_salida, su.hora_salida,
+                                                su.fecha_llegada or incidente.fecha_llegada, su.hora_regreso),
             "hora_salida": su.hora_salida, "hora_arribo": su.hora_arribo, "hora_regreso": su.hora_regreso,
             "ruta_firma": su.ruta_firma_auditoria,
             "firma_validada_en": su.firma_validada_en,
