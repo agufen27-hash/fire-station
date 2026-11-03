@@ -116,7 +116,7 @@ from app.ui.pin_dialogs import DialogoResetPinMaestra
 from app.ui.dotaciones_widgets import PanelDotaciones, PanelPersonalBase, personas_repetidas
 from app.ui.participacion_widgets import HorarioServicio, SelectorBombero
 from app.ui.bomberos_view import importar_bomberos_desde_excel
-from app.ui.personnel_window import LegajoPrivadoWidget
+from app.ui.personnel_window import BotonSyncCloud, LegajoPrivadoWidget
 from app.ui import theme
 from app.ui.map_dialog import DialogoMarcarMapa, parsear_par
 from app.ui.servicio_en_curso import TarjetaServicioEnCurso, resumen_de
@@ -2356,6 +2356,9 @@ class MainWindow(QMainWindow):
         fila_botones.addStretch(1)
         fila_botones.addWidget(boton_importar_padron)
         fila_botones.addWidget(boton_importar_unidades)
+        # Fuera de _botones_abm: se OCULTA (no solo se deshabilita) si no es ADMIN.
+        self._boton_sync_cloud = BotonSyncCloud(pagina)
+        fila_botones.addWidget(self._boton_sync_cloud)
         layout.addLayout(fila_botones)
 
         # Una tabla a la vez, a todo el ancho (antes iban lado a lado y se
@@ -2981,6 +2984,8 @@ class MainWindow(QMainWindow):
             self._chip_operador.setText(f"👤 {self._operador_nombre} · {nombre_rol}")
             self._chip_operador.setToolTip("Clic para cerrar la sesión de operador (vence sola a los 30 min).")
             theme.set_tono(self._chip_operador, "ok" if self._permisos.configurar else "info")
+
+        self._boton_sync_cloud.set_rol(rol)
 
         puede_abm = self._permisos.editar_padron
         for boton in self._botones_abm:

@@ -50,6 +50,56 @@ from app.reports.excel_generator import abrir_para_impresion
 from app.ui import theme
 from app.ui.pin_dialogs import DialogoCambioPin, DialogoResetPinMaestra
 from app.ui.widgets import FirmaPad
+from app.core.roles import ROL_ADMIN, normalizar_rol
+from app.workers.supabase_worker import SyncSupabaseWorker
+
+
+class BotonSyncCloud(QPushButton):
+    """'Sincronizar a Cloud' (botonera de Personal): sube el padrón a
+    Supabase en un SyncSupabaseWorker. Solo visible para rol ADMIN
+    (`set_rol`, lo llama MainWindow._aplicar_permisos)."""
+
+    TEXTO = "☁️ Sincronizar a Cloud"
+    TEXTO_OCUPADO = "Sincronizando..."
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(self.TEXTO, parent)
+        self.setToolTip("Sube el padrón completo a la nube (bot de WhatsApp / Power BI). Solo Administrador.")
+        self._worker: Optional[SyncSupabaseWorker] = None
+        self._es_admin = False
+        self.clicked.connect(self._sincronizar)
+        self.set_rol(None)
+
+    def set_rol(self, rol: Optional[str]) -> None:
+        self._es_admin = normalizar_rol(rol) == ROL_ADMIN
+        self.setVisible(self._es_admin)
+        self.setEnabled(self._es_admin and self._worker is None)
+
+    def _sincronizar(self) -> None:
+        if self._worker is not None or not self._es_admin:
+            return
+        self.setEnabled(False)
+        self.setText(self.TEXTO_OCUPADO)
+        worker = self._worker = SyncSupabaseWorker(self)
+        worker.terminado.connect(self._al_terminar)
+        worker.error.connect(self._al_fallar)
+        worker.finished.connect(self._liberar)
+        worker.start()
+
+    def _al_terminar(self, cantidad: int) -> None:
+        QMessageBox.information(self, "Sincronización completa",
+                                f"Se sincronizaron {cantidad} bomberos correctamente en la nube.")
+
+    def _al_fallar(self, mensaje: str) -> None:
+        QMessageBox.critical(self, "Error al sincronizar", "No se pudo sincronizar con la nube:\n\n" + mensaje)
+
+    def _liberar(self) -> None:
+        if self._worker is not None:
+            self._worker.deleteLater()
+            self._worker = None
+        self.setText(self.TEXTO)
+        self.setEnabled(self._es_admin)
+
 
 ROL_ETIQUETA = {
     RolDotacion.A_CARGO.value: "Jefe de Dotación",

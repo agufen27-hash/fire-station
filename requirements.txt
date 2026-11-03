@@ -18,6 +18,9 @@ playwright==1.47.0
 # Certificados HTTPS actualizados (ruteo OSRM: en PCs con la raíz de Windows vencida)
 certifi==2026.05.20
 
+# Puente cloud: API REST de Supabase (app/services/supabase_client.py)
+requests==2.34.2
+
 # Utilidades de fecha/hora
 python-dateutil==2.9.0.post0
 
