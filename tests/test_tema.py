@@ -13,6 +13,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 import app.db as db
+from app.core.catalogos import obtener_padron
 from app.ui import theme
 
 
@@ -70,6 +71,9 @@ def test_preferencia_de_tema_persistente(tmp_path, monkeypatch):
 def test_ventana_conserva_object_names_y_valida_en_linea(qapp, base_temporal, monkeypatch):
     from app.ui import main_window as mw
 
+    # Preferencia aislada: sin esto el combo arranca con el tema guardado en
+    # el data/config.json real de la máquina (si es "claro", no hay cambio).
+    monkeypatch.setattr(theme, "tema_guardado", lambda: "oscuro")
     theme.aplicar_tema(qapp, "oscuro")
     ventana = mw.MainWindow()
     assert ventana.boton_limpiar.objectName() == "botonLimpiar"
@@ -86,7 +90,8 @@ def test_ventana_conserva_object_names_y_valida_en_linea(qapp, base_temporal, mo
     ventana._ir_a_pagina(mw.IDX_FORMULARIO)
     assert not ventana._chip_borrador.isHidden()
     assert ventana.label_numero_parte.text() in ventana._chip_borrador.text()
-    assert "48 activos" in ventana._chip_padron.text()
+    assert f"{len(obtener_padron())} activos" in ventana._chip_padron.text()
+    assert ventana._chip_padron.text().startswith("Padrón: ")
 
     # Cambio de tema en caliente desde Configuración
     monkeypatch.setattr(theme, "guardar_tema", lambda nombre: None)
@@ -95,29 +100,20 @@ def test_ventana_conserva_object_names_y_valida_en_linea(qapp, base_temporal, mo
     ventana.close()
 
 
-def test_reintento_desde_historial_usa_el_lote(qapp, base_temporal, monkeypatch):
-    from types import SimpleNamespace
-
-    from PySide6.QtCore import QThread
-
+def test_reintento_desde_historial_usa_la_cola(qapp, base_temporal, monkeypatch):
+    """↻ RUBA de una fila del Historial encola el parte en la ColaRuba de
+    segundo plano (sin diálogo modal); se pueden sumar más mientras corre."""
+    from app.services.ruba_validator import SemaforoRuba
     from app.ui import main_window as mw
 
     ventana = mw.MainWindow()
-    lanzados = []
-
-    def lanzar_lote(ids, conectar=None):
-        lanzados.append(ids)
-        return QThread(), SimpleNamespace(incidente_ids=ids)  # sin arrancar: solo el cableado
-
-    monkeypatch.setattr(mw, "lanzar_lote", lanzar_lote)
+    encolados = []
+    # Sin hilo real ni Chromium: solo el cableado Historial -> MainWindow -> cola.
+    monkeypatch.setattr(mw, "validar_incidente_para_ruba", lambda i: SemaforoRuba())
+    monkeypatch.setattr(ventana._cola_ruba, "encolar", lambda ids, *a, **k: encolados.append(list(ids)) or list(ids))
     ventana._pagina_historial._reintentar_ruba(7, "007/2026")
-    assert lanzados == [[7]]
-    assert ventana.carga_ruba_en_curso() and ventana._incidente_en_sincronizacion(7)
-    dialogo = ventana._lote_ruba[2]
-    assert dialogo.isModal()
-    ventana._pagina_historial._reintentar_ruba(8, "008/2026")  # con un lote corriendo no se lanza otro
-    assert lanzados == [[7]]
-    dialogo.on_terminado(0, 0, 0, 0)
-    dialogo.close()
-    ventana._olvidar_lote_ruba()
+    assert encolados == [[7]]
+    ventana._pagina_historial._reintentar_ruba(8, "008/2026")  # la cola acepta más mientras trabaja
+    assert encolados == [[7], [8]]
+    assert not ventana._cola_ruba.activa  # el encolado simulado no arrancó ningún QThread
     ventana.close()

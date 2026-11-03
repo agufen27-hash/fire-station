@@ -15,9 +15,11 @@ sesión alcanza. Este módulo no depende de Qt ni de Playwright.
 from __future__ import annotations
 
 import json
+import os
 import re
 import unicodedata
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -244,8 +246,21 @@ def importar_padron(origen: Path) -> PadronPersonal:
         temporal = destino.with_suffix(".importando.xlsx")
         shutil.copy2(origen, temporal)
         temporal.replace(destino)
+    # copy2 conserva la fecha del archivo de origen: se pisa con "ahora" para
+    # que la fecha de la copia local sea la de la importación (fecha_padron()).
+    os.utime(destino, None)
     obtener_padron.cache_clear()
     return padron
+
+
+def fecha_padron(ruta: Optional[Path] = None) -> Optional[datetime]:
+    """Fecha del padrón local: la de la última importación desde la app (o
+    la del archivo, si se copió a mano en data/). None si no hay padrón."""
+    ruta = ruta or ruta_padron_por_defecto()
+    try:
+        return datetime.fromtimestamp(ruta.stat().st_mtime)
+    except OSError:
+        return None
 
 
 # ---------------------------------------------------------------------------

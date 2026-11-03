@@ -42,6 +42,7 @@ from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import (
     QComboBox,
     QCompleter,
+    QDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -61,6 +62,7 @@ from app.services.personal_service import verificar_pin_personal
 from app.ui import theme
 from app.ui.damnificados_widgets import _ajustar_alto, _boton_quitar, _tabla
 from app.ui.participacion_widgets import HorarioServicio, SelectorBombero, texto_bombero, texto_movil
+from app.ui.pin_dialogs import DialogoResetPinMaestra
 from app.ui.widgets import DateField, TimeField
 
 COL_BOMBERO, COL_QUITAR = range(2)
@@ -336,6 +338,12 @@ class TarjetaUnidad(QFrame):
         self.boton_firmar.setObjectName("botonAhora")
         self.boton_firmar.clicked.connect(self._validar_desde_ui)
         fila_firma.addWidget(self.boton_firmar)
+        # PIN olvidado: reseteo con clave maestra sin salir de la planilla.
+        self.boton_reset_pin = QPushButton("¿Olvidó su PIN? (Clave Maestra)", self)
+        self.boton_reset_pin.setFlat(True)
+        self.boton_reset_pin.setAutoDefault(False)
+        self.boton_reset_pin.clicked.connect(self._resetear_pin_jefe)
+        fila_firma.addWidget(self.boton_reset_pin)
         self.label_firma = QLabel("Sin firmar", self)
         self.label_firma.setObjectName("badgeSinFirmar")
         fila_firma.addWidget(self.label_firma)
@@ -556,6 +564,27 @@ class TarjetaUnidad(QFrame):
             self.label_firma.setText(f"✖ {motivo}")
             self.label_firma.setObjectName("badgeSinFirmar")
             theme.repulir(self.label_firma)
+
+    def _resetear_pin_jefe(self) -> None:
+        """Reseteo con clave maestra para el Jefe elegido. Si sale bien la
+        tarjeta queda como estaba (sin firmar), con el PIN vacío y el foco
+        listo para firmar con el PIN temporal."""
+        id_ruba = self.selector_jefe.id_ruba()
+        personal_id = self._resolver_personal(id_ruba) if id_ruba is not None else None
+        if personal_id is None:
+            motivo = "Primero elegí el Jefe de Dotación." if id_ruba is None else "El Jefe no tiene legajo local."
+            self.label_firma.setText(f"✖ {motivo}")
+            self.label_firma.setObjectName("badgeSinFirmar")
+            theme.repulir(self.label_firma)
+            return
+        dialogo = DialogoResetPinMaestra(personal_id, self.selector_jefe.text().strip(), self)
+        if dialogo.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.entry_pin.clear()
+        self.label_firma.setText("PIN actualizado: firmá con el PIN temporal")
+        self.label_firma.setObjectName("badgeSinFirmar")
+        theme.repulir(self.label_firma)
+        self.entry_pin.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def validar_pin(self, pin: str) -> Optional[str]:
         """Valida el PIN del Jefe de Dotación contra su legajo. Devuelve None

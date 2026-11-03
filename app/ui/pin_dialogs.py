@@ -11,7 +11,9 @@ from __future__ import annotations
 
 from typing import Optional
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
@@ -22,6 +24,8 @@ from PySide6.QtWidgets import (
 )
 
 from app.core.security import LARGO_MAX_PIN, PIN_DEFAULT, segundos_bloqueo_maestra
+from app.db import get_session
+from app.models import Personal
 from app.services.personal_service import PinError, cambiar_pin, resetear_pin_con_clave_maestra
 from app.ui import theme
 
@@ -119,26 +123,55 @@ class DialogoCambioPin(_DialogoPinBase):
 class DialogoResetPinMaestra(_DialogoPinBase):
     """Reseteo con la clave maestra del cuartel: fija un PIN temporal sin
     conocer el anterior. Vacío = PIN de fábrica (se fuerza a cambiarlo en el
-    próximo uso). `pin_resultante` queda con el PIN fijado."""
+    próximo uso). `pin_resultante` queda con el PIN fijado.
 
-    def __init__(self, personal_id: int, nombre: str, parent: Optional[QWidget] = None) -> None:
+    Con `personal_id` el bombero queda preseleccionado y bloqueado en el
+    combo (no se puede resetear el PIN de otro compañero por error) y el foco
+    va directo a la clave maestra. Sin él, se elige del padrón activo."""
+
+    def __init__(self, personal_id: Optional[int] = None, nombre: str = "",
+                 parent: Optional[QWidget] = None) -> None:
+        quien = nombre or "un bombero"
         super().__init__(
             "Resetear PIN con Clave Maestra",
-            f"Resetear el PIN de {nombre}. Ingresá la clave maestra del cuartel y un PIN temporal. "
+            f"Resetear el PIN de {quien}. Ingresá la clave maestra del cuartel y un PIN temporal. "
             f"Si dejás el PIN temporal vacío vuelve al de fábrica ({PIN_DEFAULT}) y el bombero va a "
             "tener que cambiarlo la próxima vez que lo use.",
             "Resetear PIN", parent)
-        self._personal_id = personal_id
         self.pin_resultante: Optional[str] = None
+        self.combo_bombero = QComboBox(self)
+        with get_session() as session:
+            personas = (session.query(Personal).filter(Personal.activo.is_(True))
+                        .order_by(Personal.apellido, Personal.nombre).all())
+            for p in personas:
+                self.combo_bombero.addItem(p.nombre_completo(), p.id)
+        if personal_id is not None:
+            indice = self.combo_bombero.findData(personal_id)
+            if indice < 0:  # legajo inactivo: igual se puede resetear el suyo
+                self.combo_bombero.addItem(nombre or f"Legajo {personal_id}", personal_id)
+                indice = self.combo_bombero.count() - 1
+            self.combo_bombero.setCurrentIndex(indice)
+            self.combo_bombero.setEnabled(False)
+        else:
+            self.combo_bombero.setCurrentIndex(-1)
+        self.form.addRow("Bombero", self.combo_bombero)
         self.entry_maestra = _campo_secreto(self, largo=128, ayuda="Clave maestra del cuartel")
         self.entry_temporal = _campo_secreto(self, ayuda=f"Vacío = {PIN_DEFAULT}")
         self.entry_repetir = _campo_secreto(self)
         self.form.addRow("Clave maestra", self.entry_maestra)
         self.form.addRow("PIN temporal", self.entry_temporal)
         self.form.addRow("Repetir PIN", self.entry_repetir)
-        self.entry_maestra.setFocus()
+        (self.entry_maestra if personal_id is not None else self.combo_bombero).setFocus(
+            Qt.FocusReason.OtherFocusReason)
+
+    @property
+    def personal_id(self) -> Optional[int]:
+        return self.combo_bombero.currentData() if self.combo_bombero.currentIndex() >= 0 else None
 
     def _confirmar(self) -> None:
+        if self.personal_id is None:
+            self._error("Elegí de la lista a quién se le resetea el PIN.")
+            return
         espera = segundos_bloqueo_maestra()
         if espera:
             self._error(f"Demasiados intentos fallidos. Esperá {espera} s y probá de nuevo.")
@@ -149,7 +182,7 @@ class DialogoResetPinMaestra(_DialogoPinBase):
             return
         try:
             self.pin_resultante = resetear_pin_con_clave_maestra(
-                self._personal_id, self.entry_maestra.text(), temporal)
+                self.personal_id, self.entry_maestra.text(), temporal)
         except PinError as e:
             campo = self.entry_maestra if "maestra" in str(e).lower() else self.entry_temporal
             self._error(str(e), campo)

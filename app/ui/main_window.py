@@ -58,7 +58,7 @@ from PySide6.QtWidgets import (
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 
-from app.core.catalogos import obtener_padron, ruta_padron_por_defecto
+from app.core.catalogos import fecha_padron, obtener_padron, ruta_padron_por_defecto
 from app.core.horarios import fecha_fin_ajustada
 from app import __version__
 from app.paths import ICONO_APP, LOGO_INSTITUCIONAL, ruta_recurso_existente
@@ -105,12 +105,13 @@ from app.services.ruba_helpers import cargar_credenciales
 from app.services.ruba_queue_worker import ColaRuba
 from app.services.ruba_validator import SemaforoRuba, revisar_parte_para_ruba, validar_incidente_para_ruba
 from app.ui.history_window import MOTIVO_PARTE_CERRADO, HistoryWindow
-from app.ui.autor_dialog import pedir_autor
+from app.ui.autor_dialog import pedir_autor, pedir_operador
 from app.services import cartografia
 from app.ui.widgets.map_widget import MapWidget, OperationsMapWindow
 from app.ui.damnificados_widgets import PanelDamnificados
 from app.services.personal_info import mandos_del_padron, padron_activo
-from app.services.personal_service import verificar_pin_personal
+from app.core.roles import NOMBRES_ROL, Permisos, permisos_de
+from app.services.personal_service import rol_de, verificar_pin_personal
 from app.ui.pin_dialogs import DialogoResetPinMaestra
 from app.ui.dotaciones_widgets import PanelDotaciones, PanelPersonalBase, personas_repetidas
 from app.ui.participacion_widgets import HorarioServicio, SelectorBombero
@@ -120,7 +121,8 @@ from app.ui import theme
 from app.ui.map_dialog import DialogoMarcarMapa, parsear_par
 from app.ui.servicio_en_curso import TarjetaServicioEnCurso, resumen_de
 from app.ui.siniestro_widgets import FORM_ACCIDENTE, PanelDatosEspecificos
-from app.ui.unidades_view import PanelUnidades
+from app.ui.roles_widgets import PanelUsuariosRoles
+from app.ui.unidades_view import COL_ACCIONES as COL_UNIDAD_ACCIONES, PanelUnidades
 from app.services.ruba_importer import (
     ESTADO_MOVIL_EN_SERVICIO, ESTADO_MOVIL_FUERA_DE_SERVICIO, clave_movil, normalizar_dominio,
 )
@@ -158,6 +160,8 @@ RETARDO_SEMAFORO_MS = 400
 # pasado el tope, se cierra igual (el respaldo de esa vez queda descartado).
 AVISO_RESPALDO_MS = 500
 TOPE_RESPALDO_SEG = 60
+# RBAC: la sesión del operador identificado (chip 👤) vence sola.
+DURACION_SESION_OPERADOR_MS = 30 * 60 * 1000
 
 
 class ChipClickable(QLabel):
@@ -259,6 +263,16 @@ class MainWindow(QMainWindow):
         self._errores_ruba = 0
         self._hay_internet: Optional[bool] = None
         self._ultimo_lote_ruba: Optional[str] = None
+        # RBAC (app/core/roles.py): operador identificado con PIN en el chip 👤.
+        # Sin operador rige BOMBERO; la sesión vence a los 30 min.
+        self._operador_id: Optional[int] = None
+        self._operador_nombre = ""
+        self._permisos: Permisos = permisos_de(None)
+        self._botones_abm: List[QPushButton] = []
+        self._legajo_por_privilegio = False
+        self._timer_sesion_operador = QTimer(self)
+        self._timer_sesion_operador.setSingleShot(True)
+        self._timer_sesion_operador.timeout.connect(lambda: self._cerrar_sesion_operador(vencida=True))
         # Servicio EN_CURSO reabierto en el formulario (None = alta nueva).
         self._incidente_en_edicion: Optional[int] = None
         # True si lo que está en el formulario es un servicio CERRADO abierto
@@ -375,6 +389,7 @@ class MainWindow(QMainWindow):
             self._stack.addWidget(pagina)
 
         self._stack.currentChanged.connect(self._on_pagina_cambiada)
+        self._aplicar_permisos()
 
     def _crear_barra_institucional(self) -> QFrame:
         barra = QFrame(self)
@@ -399,7 +414,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._chip_en_curso, 0, Qt.AlignmentFlag.AlignVCenter)
         self._chip_borrador = self._crear_chip("", "info", barra)
         self._chip_padron = self._crear_chip("", "neutro", barra)
-        self._chip_ruba = self._crear_chip("RUBA · verificando…", "neutro", barra)
+        self._chip_ruba = self._crear_chip("RUBA: verificando…", "neutro", barra)
         # Semáforo Pre-RUBA del parte abierto (solo en el formulario): clic = detalle.
         self._chip_semaforo = ChipClickable("", barra)
         self._chip_semaforo.setObjectName("chip")
@@ -407,7 +422,15 @@ class MainWindow(QMainWindow):
         self._chip_semaforo.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._chip_semaforo.setCursor(Qt.CursorShape.PointingHandCursor)
         self._chip_semaforo.clicked.connect(self._mostrar_detalle_semaforo)
-        for chip in (self._chip_borrador, self._chip_semaforo, self._chip_padron, self._chip_ruba):
+        # Operador identificado (RBAC): clic = identificarse / cerrar sesión.
+        self._chip_operador = ChipClickable("", barra)
+        self._chip_operador.setObjectName("chip")
+        self._chip_operador.setFixedHeight(24)
+        self._chip_operador.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._chip_operador.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._chip_operador.clicked.connect(self._on_chip_operador)
+        for chip in (self._chip_borrador, self._chip_semaforo, self._chip_padron, self._chip_ruba,
+                     self._chip_operador):
             layout.addWidget(chip, 0, Qt.AlignmentFlag.AlignVCenter)
         self._chip_borrador.setVisible(False)
         self._chip_semaforo.setVisible(False)
@@ -438,18 +461,23 @@ class MainWindow(QMainWindow):
             else:
                 self._chip_borrador.setText(f"Nuevo · N° {self.label_numero_parte.text()}")
                 theme.set_tono(self._chip_borrador, "info")
+        # Fecha del último padrón importado (fecha de la copia local en data/).
+        fecha = fecha_padron()
+        texto_fecha = f"{fecha:%d/%m/%Y}" if fecha else "sin fecha registrada"
         if self._padron:
-            self._chip_padron.setText(f"Padrón · {len(self._padron)} activos")
-            theme.set_tono(self._chip_padron, "ok")
+            self._chip_padron.setText(f"Padrón: {texto_fecha} · {len(self._padron)} activos")
+            theme.set_tono(self._chip_padron, "ok" if fecha else "alerta")
         else:
-            self._chip_padron.setText("Padrón · no disponible")
+            self._chip_padron.setText("Padrón: no disponible")
             theme.set_tono(self._chip_padron, "alerta")
-        self._chip_padron.setToolTip("\n".join(self._avisos_catalogos) or "data/Reporte de bomberos.xlsx")
+        origen = (f"Último padrón importado el {fecha:%d/%m/%Y %H:%M} (data/Reporte de bomberos.xlsx)."
+                  if fecha else "No hay data/Reporte de bomberos.xlsx: importalo desde Personal y Unidades.")
+        self._chip_padron.setToolTip("\n".join([origen, *self._avisos_catalogos]))
         for chip in (self._chip_borrador, self._chip_padron):
             self._ajustar_chip(chip)
 
     def _set_chip_ruba(self, texto: str, tono: str, tooltip: str = "") -> None:
-        self._chip_ruba.setText(f"RUBA · {texto}")
+        self._chip_ruba.setText(f"RUBA: {texto}")
         self._chip_ruba.setToolTip(tooltip)
         theme.set_tono(self._chip_ruba, tono)
         self._ajustar_chip(self._chip_ruba)
@@ -2210,7 +2238,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Parte N° {numero} encolado para RUBA.", 6000)
 
     def _on_cola_iniciado(self, incidente_id: int, numero: str) -> None:
-        self._set_chip_ruba("cargando…", "info", f"Cargando el Parte N° {numero} en RUBA "
+        self._set_chip_ruba("Sincronizando", "info", f"Cargando el Parte N° {numero} en RUBA "
                             f"({self._cola_ruba.pendientes} en la cola).")
 
     def _on_cola_detalle(self, incidente_id: int, texto: str) -> None:
@@ -2320,7 +2348,8 @@ class MainWindow(QMainWindow):
         boton_importar_unidades = QPushButton("📥 Importar Unidades desde Excel (RUBA)", pagina)
         boton_importar_unidades.setToolTip(
             "Elegí el 'Reporte de vehiculos' exportado de RUBA (.xlsx) desde cualquier carpeta")
-        boton_importar_unidades.clicked.connect(lambda: self._panel_unidades.importar_desde_excel())
+        boton_importar_unidades.clicked.connect(self._importar_unidades)
+        self._botones_abm = [boton_nuevo_bombero, boton_nueva_unidad, boton_importar_padron, boton_importar_unidades]
         fila_botones.addWidget(boton_nuevo_bombero)
         fila_botones.addWidget(boton_nueva_unidad)
         fila_botones.addWidget(self._crear_boton_refrescar(pagina))
@@ -2404,7 +2433,14 @@ class MainWindow(QMainWindow):
             boton_eliminar.setObjectName("botonQuitarFila")
             boton_eliminar.clicked.connect(fn_eliminar)
             fila.addWidget(boton_eliminar)
+        self._aplicar_permiso_acciones(contenedor)
         return contenedor
+
+    def _aplicar_permiso_acciones(self, contenedor: Optional[QWidget]) -> None:
+        if contenedor is None:
+            return
+        contenedor.setEnabled(self._permisos.editar_padron)
+        contenedor.setToolTip("" if self._permisos.editar_padron else "Solo Administrador")
 
     def _cargar_pagina_dotaciones(self) -> None:
         self._panel_unidades.recargar()
@@ -2441,12 +2477,19 @@ class MainWindow(QMainWindow):
             "Editar", lambda _=False, mid=movil_id: self._dialogo_unidad(mid),
             "Dar de baja" if activo else "Reactivar",
             lambda _=False, mid=movil_id: self._alternar_movil(mid),
-            lambda _=False, mid=movil_id: self._panel_unidades.eliminar(mid),
+            lambda _=False, mid=movil_id: self._permitido("editar_padron", "Eliminar unidades")
+            and self._panel_unidades.eliminar(mid),
         )
+
+    def _importar_unidades(self) -> None:
+        if self._permitido("editar_padron", "Importar unidades"):
+            self._panel_unidades.importar_desde_excel()
 
     def _importar_padron_bomberos(self) -> None:
         """Diálogo + importación en app/ui/bomberos_view.py; acá solo se
         refrescan la tabla de personal y el chip del padrón."""
+        if not self._permitido("editar_padron", "Importar el padrón"):
+            return
         if not importar_bomberos_desde_excel(self):
             return
         # _cargar_pagina_dotaciones -> _refrescar_padron_despacho reparte el
@@ -2454,6 +2497,8 @@ class MainWindow(QMainWindow):
         self._cargar_pagina_dotaciones()
 
     def _alternar_movil(self, movil_id: int) -> None:
+        if not self._permitido("editar_padron", "Dar de baja unidades"):
+            return
         with get_session() as session:
             movil = session.get(Movil, movil_id)
             movil.activo = not movil.activo
@@ -2461,6 +2506,8 @@ class MainWindow(QMainWindow):
         self._cargar_pagina_dotaciones()
 
     def _alternar_personal(self, personal_id: int) -> None:
+        if not self._permitido("editar_padron", "Dar de baja personal"):
+            return
         with get_session() as session:
             persona = session.get(Personal, personal_id)
             persona.activo = not persona.activo
@@ -2477,6 +2524,8 @@ class MainWindow(QMainWindow):
     def _eliminar_personal(self, personal_id: int) -> None:
         """Solo se elimina quien no figura en ningún servicio ni legajo: si
         no, se perdería historia (planillas, RUBA) -> se ofrece la baja."""
+        if not self._permitido("editar_padron", "Eliminar personal"):
+            return
         with get_session() as session:
             persona = session.get(Personal, personal_id)
             if persona is None:
@@ -2526,6 +2575,8 @@ class MainWindow(QMainWindow):
 
     def _dialogo_bombero(self, personal_id: Optional[int] = None) -> bool:
         """Alta o edición de un bombero. True si se guardaron cambios."""
+        if not self._permitido("editar_padron", "Editar el padrón"):
+            return False
         datos_previos = None
         if personal_id is not None:
             with get_session() as session:
@@ -2633,6 +2684,8 @@ class MainWindow(QMainWindow):
         """Alta / edición de una unidad con todos los datos del 'Reporte de
         vehiculos' de RUBA: ID RUBA, identificador, Nº Móvil, tipo, marca,
         modelo, año y dominio."""
+        if not self._permitido("editar_padron", "Editar unidades"):
+            return
         previo: Dict[str, Any] = {}
         with get_session() as session:
             if movil_id is not None:
@@ -2794,6 +2847,13 @@ class MainWindow(QMainWindow):
         boton_ingresar.clicked.connect(self._intentar_ingresar_legajo)
         form.addRow(boton_ingresar)
 
+        # RBAC: Jefatura / Admin identificados abren cualquier legajo sin su PIN.
+        self._label_acceso_privilegiado = QLabel("", caja)
+        self._label_acceso_privilegiado.setWordWrap(True)
+        self._label_acceso_privilegiado.setProperty("muted", True)
+        self._label_acceso_privilegiado.hide()
+        form.addRow(self._label_acceso_privilegiado)
+
         # PIN olvidado: sin él no se entra al legajo, así que el reseteo con
         # la clave maestra también tiene que estar acá afuera.
         boton_reset = QPushButton("¿Olvidó el PIN? Resetear con Clave Maestra", caja)
@@ -2843,13 +2903,105 @@ class MainWindow(QMainWindow):
             return
 
         personal_id = self._combo_legajo_bombero.itemData(indice)
-        if not verificar_pin_personal(personal_id, self._entry_legajo_pin.text()):
+        pin = self._entry_legajo_pin.text()
+        por_privilegio = not pin and self._permisos.ver_legajos_ajenos
+        if not por_privilegio and not verificar_pin_personal(personal_id, pin):
             self._entry_legajo_pin.clear()
             QMessageBox.warning(self, "PIN incorrecto", "El PIN de seguridad no es correcto.")
             return
 
+        # Su propio legajo (con PIN, o el del operador) es editable; uno ajeno
+        # abierto por rol queda en solo lectura salvo para ADMIN.
+        propio = not por_privilegio or personal_id == self._operador_id
+        self._legajo_por_privilegio = por_privilegio
+        self._legajo_privado.set_permisos(solo_lectura=not propio and not self._permisos.editar_padron,
+                                          editar_datos=self._permisos.editar_padron)
         self._legajo_privado.mostrar(personal_id)
         self._stack_documentacion.setCurrentIndex(1)
+
+    # -- RBAC: operador identificado y permisos ------------------------------------
+
+    def _permitido(self, permiso: str, accion: str) -> bool:
+        """Guarda de cada acción protegida (además de los botones deshabilitados)."""
+        if getattr(self._permisos, permiso):
+            return True
+        QMessageBox.warning(self, "Permiso insuficiente",
+                            f"{accion} requiere rol Administrador. Identificate como operador "
+                            "desde el chip 👤 de la barra superior.")
+        return False
+
+    def _on_chip_operador(self) -> None:
+        if self._operador_id is None:
+            personal_id = pedir_operador(self)
+            if personal_id is not None:
+                self._iniciar_sesion_operador(personal_id)
+            return
+        respuesta = QMessageBox.question(
+            self, "Sesión de operador", f"{self._operador_nombre} está identificado como operador.\n"
+            "¿Cerrar la sesión? Se vuelve a los permisos de Bombero.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
+        if respuesta == QMessageBox.StandardButton.Yes:
+            self._cerrar_sesion_operador()
+
+    def _iniciar_sesion_operador(self, personal_id: int) -> None:
+        with get_session() as session:
+            persona = session.get(Personal, personal_id)
+            self._operador_nombre = persona.nombre_completo() if persona is not None else ""
+        self._operador_id = personal_id
+        self._timer_sesion_operador.start(DURACION_SESION_OPERADOR_MS)
+        self._aplicar_permisos()
+        theme.set_tono(self.statusBar(), "ok")
+        self.statusBar().showMessage(f"Operador: {self._operador_nombre}.", 6000)
+
+    def _cerrar_sesion_operador(self, vencida: bool = False) -> None:
+        if self._operador_id is None:
+            return
+        self._operador_id = None
+        self._operador_nombre = ""
+        self._timer_sesion_operador.stop()
+        self._aplicar_permisos()
+        if self._legajo_por_privilegio:  # el legajo ajeno abierto por rol no queda a la vista
+            self._legajo_por_privilegio = False
+            self._stack_documentacion.setCurrentIndex(0)
+        theme.set_tono(self.statusBar(), "info")
+        self.statusBar().showMessage(
+            "La sesión de operador venció." if vencida else "Sesión de operador cerrada.", 6000)
+
+    def _aplicar_permisos(self) -> None:
+        """Recalcula el rol del operador (pudo cambiar en "Usuarios y Roles")
+        y habilita / bloquea la UI según sus permisos."""
+        rol = rol_de(self._operador_id) if self._operador_id is not None else None
+        self._permisos = permisos_de(rol)
+        if self._operador_id is None:
+            self._chip_operador.setText("👤 Identificarse")
+            self._chip_operador.setToolTip("Sin operador: permisos de Bombero. Clic para identificarte con tu PIN.")
+            theme.set_tono(self._chip_operador, "neutro")
+        else:
+            nombre_rol = NOMBRES_ROL[rol].split(" (")[0]
+            self._chip_operador.setText(f"👤 {self._operador_nombre} · {nombre_rol}")
+            self._chip_operador.setToolTip("Clic para cerrar la sesión de operador (vence sola a los 30 min).")
+            theme.set_tono(self._chip_operador, "ok" if self._permisos.configurar else "info")
+
+        puede_abm = self._permisos.editar_padron
+        for boton in self._botones_abm:
+            boton.setEnabled(puede_abm)
+            boton.setToolTip("" if puede_abm else "Solo Administrador")
+        for tabla, columna in ((self._tabla_personal_dotacion, COL_PERSONAL_ACCIONES),
+                               (self._panel_unidades.tabla, COL_UNIDAD_ACCIONES)):
+            for fila in range(tabla.rowCount()):
+                self._aplicar_permiso_acciones(tabla.cellWidget(fila, columna))
+
+        for widget in self._widgets_config_criticos:
+            widget.setEnabled(self._permisos.configurar)
+        self._label_config_bloqueada.setVisible(not self._permisos.configurar)
+        if self._stack.currentIndex() == IDX_CONFIGURACION:
+            self._cargar_pagina_configuracion()
+
+        self._label_acceso_privilegiado.setVisible(self._permisos.ver_legajos_ajenos)
+        self._label_acceso_privilegiado.setText(
+            "Como Administrador podés abrir cualquier legajo dejando el PIN vacío."
+            if self._permisos.editar_padron else
+            "Como Jefatura podés abrir cualquier legajo dejando el PIN vacío (solo lectura).")
 
     # -- Página: Configuración ------------------------------------------------------
 
@@ -2926,13 +3078,28 @@ class MainWindow(QMainWindow):
         boton_guardar_config.setObjectName("botonGuardar")
         boton_guardar_config.clicked.connect(self._guardar_configuracion)
 
+        # RBAC: configuración crítica solo para ADMIN. "Usuarios y Roles" no
+        # depende del rol: lo autoriza la cuenta de RUBA / clave maestra.
+        self._label_config_bloqueada = QLabel(
+            "🔒 Credenciales RUBA, datos del cuartel, mapa y mantenimiento: solo Administrador. "
+            "Identificate desde el chip 👤 de la barra superior.", contenido)
+        self._label_config_bloqueada.setWordWrap(True)
+        theme.set_tono(self._label_config_bloqueada, "alerta")
+        self._panel_roles = PanelUsuariosRoles(contenido)
+        self._panel_roles.roles_cambiados.connect(self._aplicar_permisos)
+        caja_mantenimiento = self._crear_caja_mantenimiento(contenido)
+        self._widgets_config_criticos: List[QWidget] = [
+            caja_ruba, caja_cuartel, caja_mapa, caja_mantenimiento, boton_guardar_config]
+
+        layout.addWidget(self._label_config_bloqueada)
         layout.addWidget(caja_ruba)
         layout.addWidget(caja_cuartel)
+        layout.addWidget(self._panel_roles)
         layout.addWidget(caja_rutas)
         layout.addWidget(caja_mapa)
         layout.addWidget(caja_apariencia)
         layout.addWidget(caja_acerca)
-        layout.addWidget(self._crear_caja_mantenimiento(contenido))
+        layout.addWidget(caja_mantenimiento)
         layout.addWidget(boton_guardar_config, 0, Qt.AlignmentFlag.AlignLeft)
         layout.addStretch(1)
 
@@ -2955,6 +3122,8 @@ class MainWindow(QMainWindow):
         return caja
 
     def _reiniciar_partes(self) -> None:
+        if not self._permitido("configurar", "Reiniciar partes"):
+            return
         if self._cola_ruba.activa:
             QMessageBox.information(self, "Cola de RUBA activa",
                                     "Hay partes en la cola de RUBA o con reintentos pendientes: "
@@ -3134,7 +3303,8 @@ class MainWindow(QMainWindow):
         ruba = datos.get("ruba", {})
         cuartel = datos.get("cuartel", {})
         self._entry_ruba_usuario.setText(ruba.get("usuario", ""))
-        self._entry_ruba_clave.setText(ruba.get("clave", ""))
+        # La clave de RUBA solo se precarga para ADMIN (Guardar está bloqueado para el resto).
+        self._entry_ruba_clave.setText(ruba.get("clave", "") if self._permisos.configurar else "")
         self._entry_ruba_url_login.setText(ruba.get("url_login", ""))
         self._entry_ruba_url_incidentes.setText(ruba.get("url_incidentes", ""))
         self._entry_cuartel_nombre.setText(cuartel.get("nombre", ""))
@@ -3145,8 +3315,11 @@ class MainWindow(QMainWindow):
         self._label_ruta_plantillas.setText(str(TEMPLATES_DIR))
         self._label_ruta_salida.setText(str(OUTPUT_DIR))
         self._cargar_config_mapa()
+        self._panel_roles.refrescar()
 
     def _guardar_configuracion(self) -> None:
+        if not self._permitido("configurar", "Guardar la configuración"):
+            return
         calibracion = self._calibracion_de_formulario()
         if not calibracion.es_valida():
             QMessageBox.warning(
@@ -3223,21 +3396,31 @@ class MainWindow(QMainWindow):
             f"Último evento: {self._ultimo_lote_ruba}" if self._ultimo_lote_ruba else "",
         )))
 
-        if en_lote:
-            self._set_chip_ruba(f"cargando… · {en_cola} en cola", "info", tooltip)
+        # Badge de estado de la cola (visible para todos los roles). Prioridad:
+        # sincronizando (azul) > con error (rojo) > pendientes (amarillo) > al día (verde).
+        # La conectividad y las credenciales se agregan como sufijo / tooltip.
+        if self._hay_internet is None:
+            conexion = "Conexión: verificando…"
         else:
-            credenciales = cargar_credenciales()
-            if self._hay_internet is None:
-                self._set_chip_ruba(f"verificando… · {detalle}" if pendientes else "verificando…", "neutro", tooltip)
-            elif not self._hay_internet:
-                self._set_chip_ruba(f"sin conexión · {detalle}" if pendientes else "sin conexión", "error",
-                                    "No hay salida a internet: las cargas quedan pendientes.\n" + tooltip)
-            elif not (credenciales.get("usuario") and credenciales.get("clave")):
-                self._set_chip_ruba("sin credenciales", "alerta", "Cargá usuario y clave en Configuración.\n" + tooltip)
-            elif pendientes:
-                self._set_chip_ruba(f"en línea · {detalle}", "error" if errores else "alerta", tooltip)
-            else:
-                self._set_chip_ruba("en línea · al día", "ok", tooltip)
+            conexion = "Conexión: en línea" if self._hay_internet else "Conexión: sin internet"
+        tooltip = f"{conexion}\n{tooltip}"
+        credenciales = cargar_credenciales()
+        sufijo = ""
+        if self._hay_internet is False:
+            sufijo = " · sin conexión"
+        elif not (credenciales.get("usuario") and credenciales.get("clave")):
+            sufijo = " · sin credenciales"
+            tooltip = "Cargá usuario y clave en Configuración.\n" + tooltip
+        otros = pendientes - errores
+        if en_lote:
+            self._set_chip_ruba(f"Sincronizando · {en_cola} en cola", "info", tooltip)
+        elif errores:
+            extra = f" · {otros} pendiente(s)" if otros else ""
+            self._set_chip_ruba(f"{errores} con error{extra}{sufijo}", "error", tooltip)
+        elif pendientes:
+            self._set_chip_ruba(f"{pendientes} pendiente(s){sufijo}", "alerta", tooltip)
+        else:
+            self._set_chip_ruba(f"Al día{sufijo}", "ok", tooltip)
 
         # El botón ofrece solo lo que todavía no está en manos de la cola.
         mostrar_boton = bool(sin_encolar) and bool(self._hay_internet)

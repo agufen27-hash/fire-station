@@ -79,7 +79,26 @@ class LegajoPrivadoWidget(QWidget):
         super().__init__(parent)
         self._personal_id: Optional[int] = None
         self._numero_legajo: Optional[str] = None
+        # RBAC (app/core/roles.py): JEFATURA viendo un legajo ajeno -> solo
+        # lectura; editar datos personales es edición del padrón (solo ADMIN).
+        self._solo_lectura = False
+        self._puede_editar_datos = True
         self._construir_ui()
+
+    def set_permisos(self, *, solo_lectura: bool, editar_datos: bool) -> None:
+        """Llamar antes de `mostrar()`. Solo lectura oculta firma, PIN,
+        reseteo, alta y baja de documentos; deja ver ficha, historial y abrir
+        / descargar documentos."""
+        self._solo_lectura = solo_lectura
+        self._puede_editar_datos = editar_datos and not solo_lectura
+        self.boton_editar.setVisible(self._puede_editar_datos)
+        for boton in (self.boton_firmar, self.boton_pin, self.boton_reset_pin, self.boton_agregar_doc):
+            boton.setVisible(not solo_lectura)
+        self.label_solo_lectura.setVisible(solo_lectura)
+
+    @property
+    def solo_lectura(self) -> bool:
+        return self._solo_lectura
 
     def _construir_ui(self) -> None:
         # Con scroll, como el resto de las páginas: sin él, en pantallas bajas
@@ -102,8 +121,13 @@ class LegajoPrivadoWidget(QWidget):
         boton_volver = QPushButton("← Volver", self)
         boton_volver.clicked.connect(self.volver_solicitado.emit)
         fila_acciones.addWidget(boton_volver)
+        self.label_solo_lectura = QLabel("🔒 Solo lectura (Jefatura)", self)
+        theme.set_tono(self.label_solo_lectura, "info")
+        self.label_solo_lectura.setObjectName("chip")
+        self.label_solo_lectura.hide()
+        fila_acciones.addWidget(self.label_solo_lectura)
         fila_acciones.addStretch(1)
-        boton_editar = QPushButton("✏️ Editar datos personales", self)
+        boton_editar = self.boton_editar = QPushButton("✏️ Editar datos personales", self)
         boton_editar.setObjectName("botonAhora")
         boton_editar.setToolTip("DNI, teléfono, jerarquía, grupo sanguíneo, antigüedad y estado")
         boton_editar.clicked.connect(
@@ -150,12 +174,12 @@ class LegajoPrivadoWidget(QWidget):
         )
         layout_firma.addWidget(self._label_firma_actual, 1)
         fila_botones_firma = QHBoxLayout()
-        boton_firmar = QPushButton("Firmar / Re-firmar", caja_firma)
+        boton_firmar = self.boton_firmar = QPushButton("Firmar / Re-firmar", caja_firma)
         boton_firmar.setObjectName("botonAhora")
         boton_firmar.clicked.connect(self._abrir_dialogo_firma)
-        boton_pin = QPushButton("Cambiar PIN", caja_firma)
+        boton_pin = self.boton_pin = QPushButton("Cambiar PIN", caja_firma)
         boton_pin.clicked.connect(self._abrir_dialogo_pin)
-        boton_reset_pin = QPushButton("Resetear PIN con Clave Maestra", caja_firma)
+        boton_reset_pin = self.boton_reset_pin = QPushButton("Resetear PIN con Clave Maestra", caja_firma)
         boton_reset_pin.setToolTip("Fija un PIN temporal sin conocer el anterior (requiere la clave maestra del cuartel)")
         boton_reset_pin.clicked.connect(self._abrir_dialogo_reset_pin)
         fila_botones_firma.addWidget(boton_firmar)
@@ -196,7 +220,7 @@ class LegajoPrivadoWidget(QWidget):
         self._tabla_documentos.setMinimumHeight(120)
         theme.estilizar_tabla(self._tabla_documentos)
         layout_documentos.addWidget(self._tabla_documentos)
-        boton_agregar_doc = QPushButton("+ Agregar Documento", caja_documentos)
+        boton_agregar_doc = self.boton_agregar_doc = QPushButton("+ Agregar Documento", caja_documentos)
         boton_agregar_doc.setObjectName("botonAhora")
         boton_agregar_doc.clicked.connect(self._agregar_documento)
         layout_documentos.addWidget(boton_agregar_doc)
@@ -330,10 +354,13 @@ class LegajoPrivadoWidget(QWidget):
             fila_botones.addWidget(boton_abrir)
             fila_botones.addWidget(boton_descargar)
             fila_botones.addWidget(boton_eliminar)
+            boton_eliminar.setVisible(not self._solo_lectura)
             self._tabla_documentos.setCellWidget(fila_idx, 3, widget)
         self._tabla_documentos.resizeRowsToContents()
 
     def _agregar_documento(self) -> None:
+        if self._solo_lectura:  # RBAC: Jefatura viendo un legajo ajeno
+            return
         if self._personal_id is None or self._numero_legajo is None:
             return
 
@@ -395,6 +422,8 @@ class LegajoPrivadoWidget(QWidget):
         QMessageBox.information(self, "Descargado", f"Se guardó en:\n{destino_texto}")
 
     def _eliminar_documento(self, documento_id: int, ruta: Path) -> None:
+        if self._solo_lectura:  # RBAC: Jefatura viendo un legajo ajeno
+            return
         respuesta = QMessageBox.question(
             self, "Eliminar documento",
             "¿Eliminar este documento del legajo? Esta acción no se puede deshacer.",
@@ -412,6 +441,8 @@ class LegajoPrivadoWidget(QWidget):
     # -- Firma digital y PIN -------------------------------------------------------
 
     def _abrir_dialogo_firma(self) -> None:
+        if self._solo_lectura:  # RBAC: Jefatura viendo un legajo ajeno
+            return
         if self._personal_id is None or self._numero_legajo is None:
             return
 
@@ -466,6 +497,8 @@ class LegajoPrivadoWidget(QWidget):
 
     def _abrir_dialogo_pin(self) -> None:
         """Cambio por el propio bombero: el diálogo exige el PIN actual."""
+        if self._solo_lectura:  # RBAC: Jefatura viendo un legajo ajeno
+            return
         if self._personal_id is None:
             return
         if DialogoCambioPin(self._personal_id, self).exec() == QDialog.DialogCode.Accepted:
@@ -473,6 +506,8 @@ class LegajoPrivadoWidget(QWidget):
 
     def _abrir_dialogo_reset_pin(self) -> None:
         """Reseteo sin conocer el PIN anterior, autorizado con la clave maestra."""
+        if self._solo_lectura:  # RBAC: Jefatura viendo un legajo ajeno
+            return
         if self._personal_id is None:
             return
         with get_session() as session:

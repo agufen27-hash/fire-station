@@ -28,8 +28,31 @@ def padron() -> PadronPersonal:
     return obtener_padron()
 
 
-def test_padron_tiene_48_bomberos_activos(padron):
-    assert len(padron) == 48
+def _activos_en_excel(ruta) -> int:
+    """Cuenta independiente de la de leer_padron_personal: filas del Excel
+    real cuya columna de situación/estado dice 'Activo' (sin leer la lógica
+    del lector), así el test sigue el padrón del cuartel sin un número fijo."""
+    from openpyxl import load_workbook
+
+    hoja = load_workbook(ruta, read_only=True, data_only=True).active
+    filas = list(hoja.iter_rows(values_only=True))
+    for i, fila in enumerate(filas[:15]):
+        textos = [str(c or "").strip().lower() for c in fila]
+        columna = next((j for j, t in enumerate(textos) if t in ("estado", "situación de revista",
+                                                                 "situacion de revista", "situación")), None)
+        if columna is not None:
+            return sum(1 for f in filas[i + 1:] if str(f[columna] or "").strip().lower() == "activo")
+    pytest.skip("No se encontró la columna de estado en el Reporte de bomberos real.")
+
+
+def test_padron_cantidad_coincide_con_el_excel_real(padron):
+    from app.core.catalogos import ruta_padron_por_defecto
+
+    ruta = ruta_padron_por_defecto()
+    if not ruta.exists():
+        pytest.skip("Sin data/Reporte de bomberos.xlsx en esta máquina.")
+    assert len(padron) > 0
+    assert len(padron) == _activos_en_excel(ruta)
 
 
 def test_padron_tipos_consistentes(padron):
@@ -38,20 +61,22 @@ def test_padron_tipos_consistentes(padron):
         assert isinstance(b.id_ruba, int) and b.id_ruba > 0
         assert isinstance(b.apellido, str) and b.apellido == b.apellido.strip().upper() and b.apellido
         assert isinstance(b.nombre, str) and b.nombre
-        assert isinstance(b.dni, str) and b.dni.isdigit() and 7 <= len(b.dni) <= 8
+        # RUBA puede exportar un activo sin DNI cargado (celda vacía): queda "".
+        assert isinstance(b.dni, str) and (b.dni == "" or (b.dni.isdigit() and 7 <= len(b.dni) <= 8))
         assert b.legajo is None or (isinstance(b.legajo, str) and "/" not in b.legajo)
         assert b.cargo is None or (isinstance(b.cargo, str) and b.cargo.upper() != "NO POSEE")
         assert b.clasificacion in (CLASIFICACION_BOMBERO, CLASIFICACION_ASPIRANTE)
 
 
 def test_padron_ids_y_dnis_unicos(padron):
-    assert len({b.id_ruba for b in padron}) == 48
-    assert len({b.dni for b in padron}) == 48
+    assert len({b.id_ruba for b in padron}) == len(padron)
+    con_dni = [b.dni for b in padron if b.dni]
+    assert len(set(con_dni)) == len(con_dni)
 
 
 def test_padron_es_serializable(padron):
     datos = json.loads(json.dumps(padron.to_list(), ensure_ascii=False))
-    assert len(datos) == 48
+    assert len(datos) == len(padron)
     assert set(datos[0]) == {"id_ruba", "apellido", "nombre", "dni", "legajo", "cargo", "clasificacion", "formacion"}
 
 
@@ -59,7 +84,7 @@ def test_clasificacion_cubre_a_todos(padron):
     bomberos = padron.por_clasificacion(CLASIFICACION_BOMBERO)
     aspirantes = padron.por_clasificacion(CLASIFICACION_ASPIRANTE)
     assert bomberos and aspirantes
-    assert len(bomberos) + len(aspirantes) == 48
+    assert len(bomberos) + len(aspirantes) == len(padron)
 
 
 def test_busqueda_por_id_y_dni(padron):

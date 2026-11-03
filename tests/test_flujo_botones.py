@@ -16,10 +16,11 @@ from sqlalchemy.orm import sessionmaker
 
 import app.db as db
 from app.core.catalogos import obtener_padron
-from app.models import EstadoRuba, Incidente
+from app.models import EstadoRuba, Incidente, Personal
 from app.services import ruba_automation as ra
 from app.services import ruba_service
 from app.ui.ruba_progreso_dialog import DialogoLoteRuba
+from app.ui.siniestro_widgets import FORM_ESTRUCTURAL
 from tests.ayudas import cargar_servicio_basico
 from tests.fake_ruba import FakeRuba
 
@@ -50,6 +51,10 @@ def entorno(qapp, tmp_path, monkeypatch, padron):
     avisos = []
     monkeypatch.setattr(mw.QMessageBox, "information", lambda *a, **k: avisos.append(("info", a[2])))
     monkeypatch.setattr(mw.QMessageBox, "warning", lambda *a, **k: avisos.append(("warning", a[2])))
+    # Autoría con PIN al finalizar: el diálogo modal colgaría el test (offscreen).
+    with db.get_session() as session:
+        autor_id = session.query(Personal.id).order_by(Personal.id).first()[0]
+    monkeypatch.setattr(mw, "pedir_autor", lambda *a, **k: autor_id)
 
     # La automatización real, apuntada al RUBA falso.
     sitio = FakeRuba([(b.id_ruba, f"{b.apellido}, {b.nombre} (DNI {b.dni})") for b in padron]).iniciar()
@@ -74,6 +79,10 @@ def _cargar(ventana, padron, calle="Belgrano 58"):
     from app.ui import main_window as mw
 
     cargar_servicio_basico(ventana, mw, padron, calle=calle)
+    # Incendio de vivienda: sin "Tipo de lugar" el Semáforo Pre-RUBA no lo
+    # deja encolar y _cargar_lote_ruba abriría un QMessageBox modal (cuelga).
+    pagina = ventana.panel_datos_especificos.pagina(FORM_ESTRUCTURAL)
+    pagina.widget("tipo_lugar").setCurrentIndex(pagina.widget("tipo_lugar").findData("1"))
 
 
 def _esperar(condicion, segundos=90):
@@ -86,8 +95,23 @@ def _esperar(condicion, segundos=90):
     return False
 
 
-def _dialogo(ventana):
-    return next(w for w in ventana.findChildren(DialogoLoteRuba))
+def _con_internet(monkeypatch):
+    """El worker de la cola consulta internet real antes de abrir Chromium:
+    acá el RUBA es local (FakeRuba), así que se simula la conexión."""
+    from app.services import ruba_queue_worker
+
+    monkeypatch.setattr(ruba_queue_worker, "hay_conexion_internet", lambda *a, **k: True)
+
+
+def _senales_cola(ventana):
+    """Registra lo que emite la ColaRuba (corre en su QThread; las señales
+    llegan al hilo de la UI mientras _esperar procesa eventos)."""
+    eventos = {"sincronizado": [], "error": [], "inactiva": 0}
+    cola = ventana._cola_ruba
+    cola.sincronizado.connect(lambda i, n, r: eventos["sincronizado"].append(i))
+    cola.error.connect(lambda i, n, m, c: eventos["error"].append((i, m)))
+    cola.inactiva.connect(lambda: eventos.__setitem__("inactiva", eventos["inactiva"] + 1))
+    return eventos
 
 
 def _guardar_local(ventana, padron, calle="Belgrano 58"):
@@ -105,34 +129,43 @@ def test_formulario_sin_boton_ruba_y_guardado_queda_pendiente(entorno, padron):
     incidente_id = _guardar_local(ventana, padron)
     with db.get_session() as session:
         assert session.get(Incidente, incidente_id).estado_ruba == EstadoRuba.PENDIENTE.value
-    assert "Historial" in avisos[-1][1]  # el aviso indica dónde se carga a RUBA
+    assert "Cargar Seleccionados a RUBA" in avisos[-1][1]  # el aviso indica dónde se carga a RUBA
 
 
-def test_lote_carga_en_ruba_con_una_sola_sesion(entorno, padron):
+def test_lote_carga_en_ruba_con_una_sola_sesion(entorno, padron, monkeypatch):
+    """🚀 del Historial: los partes se encolan en la ColaRuba (segundo plano,
+    sin diálogo modal) y se cargan con una sola sesión de navegador."""
     ventana, _, sitio = entorno
+    _con_internet(monkeypatch)
     ids = [_guardar_local(ventana, padron), _guardar_local(ventana, padron, calle="San Martín 100")]
+    eventos = _senales_cola(ventana)
 
     ventana._cargar_lote_ruba(ids)
-    dialogo = _dialogo(ventana)
-    assert dialogo.isModal() and ventana.carga_ruba_en_curso()
-    assert not ventana._pagina_historial.boton_cargar_lote.isEnabled()  # no se lanza otro lote
+    assert ventana._cola_ruba.activa  # el worker arrancó en su QThread
+    assert not ventana.findChildren(DialogoLoteRuba)  # ya no hay modal: la UI queda libre
+    with db.get_session() as session:  # encolados en el acto (o ya tomados por el worker)
+        assert all(session.get(Incidente, i).estado_ruba in (EstadoRuba.EN_COLA.value,
+                                                            EstadoRuba.SINCRONIZANDO.value,
+                                                            EstadoRuba.SINCRONIZADO.value) for i in ids)
 
-    # La UI sigue viva mientras el QThread trabaja.
-    assert _esperar(lambda: dialogo.estado_final is not None, 60), "el lote no terminó"
-    assert dialogo.estado_final == "ok", dialogo.label_resumen.text()
-    assert dialogo.barra.value() == 2
+    assert _esperar(lambda: not ventana._cola_ruba.activa, 90), "la cola no terminó"
+    assert sorted(eventos["sincronizado"]) == sorted(ids) and not eventos["error"]
+    assert eventos["inactiva"] >= 1
     assert sitio.logins == 1  # mismo navegador y misma sesión para todo el lote
-    assert _esperar(lambda: not ventana.carga_ruba_en_curso(), 10)
+    assert not ventana.carga_ruba_en_curso()
     with db.get_session() as session:
         for incidente_id in ids:
             incidente = session.get(Incidente, incidente_id)
             assert incidente.estado_ruba == EstadoRuba.SINCRONIZADO.value
             assert incidente.ruba_id_remoto and incidente.ruba_sincronizado_en is not None
-    assert ventana._pagina_historial.boton_cargar_lote.isEnabled()
+    assert ventana._chip_ruba.text().startswith("RUBA: Al día")
 
 
 def test_lote_sigue_despues_de_un_parte_con_error(entorno, padron, monkeypatch):
+    """Un parte con error de datos queda en ERROR (definitivo, sin reintento)
+    y la cola sigue con el siguiente."""
     ventana, _, _ = entorno
+    _con_internet(monkeypatch)
     malo = _guardar_local(ventana, padron)
     bueno = _guardar_local(ventana, padron, calle="San Martín 100")
     preparar_original = ruba_service.preparar_payload
@@ -143,15 +176,18 @@ def test_lote_sigue_despues_de_un_parte_con_error(entorno, padron, monkeypatch):
         return preparar_original(incidente_id)
 
     monkeypatch.setattr(ruba_service, "preparar_payload", preparar)
+    eventos = _senales_cola(ventana)
     ventana._cargar_lote_ruba([malo, bueno])
-    dialogo = _dialogo(ventana)
-    assert _esperar(lambda: dialogo.estado_final is not None, 60)
-    assert dialogo.estado_final == "con_errores"
-    assert _esperar(lambda: not ventana.carga_ruba_en_curso(), 10)
+    assert _esperar(lambda: not ventana._cola_ruba.activa, 90), "la cola no terminó"
+    assert [i for i, _m in eventos["error"]] == [malo]
+    assert eventos["sincronizado"] == [bueno]
     with db.get_session() as session:
-        assert session.get(Incidente, malo).estado_ruba == EstadoRuba.ERROR.value
-        assert "dato de prueba" in session.get(Incidente, malo).ruba_error_log
+        incidente_malo = session.get(Incidente, malo)
+        assert incidente_malo.estado_ruba == EstadoRuba.ERROR.value
+        assert "dato de prueba" in incidente_malo.ruba_error_log
+        assert incidente_malo.proximo_reintento_ruba is None
         assert session.get(Incidente, bueno).estado_ruba == EstadoRuba.SINCRONIZADO.value
+    assert ventana._chip_ruba.text().startswith("RUBA: 1 con error")
 
 
 def test_worker_omite_cargados_y_respeta_cancelar(entorno, padron, monkeypatch):

@@ -31,8 +31,9 @@ from sqlalchemy import (
     Time,
     UniqueConstraint,
 )
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, validates
 
+from app.core.roles import ROL_DEFAULT, ROLES
 from app.core.security import PIN_DEFAULT, hash_pin
 
 
@@ -186,6 +187,17 @@ class Personal(Base):
     # `estado` es su versión normalizada (Activo / Licencia / Reserva / Baja).
     situacion_revista: Mapped[Optional[str]] = mapped_column(String(60), nullable=True)
     fecha_ultimo_ascenso: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+
+    # RBAC local (app/core/roles.py): BOMBERO / JEFATURA / ADMIN. Lo asigna
+    # Configuración → "Usuarios y Roles"; el importador del padrón no lo toca.
+    rol: Mapped[str] = mapped_column(String(12), default=ROL_DEFAULT, server_default=ROL_DEFAULT, nullable=False)
+
+    @validates("rol")
+    def _validar_rol(self, _clave: str, valor: Optional[str]) -> str:
+        rol = (valor or ROL_DEFAULT).strip().upper()
+        if rol not in ROLES:
+            raise ValueError(f"Rol inválido: {valor!r} (válidos: {', '.join(ROLES)}).")
+        return rol
 
     def nombre_completo(self) -> str:
         return f"{self.apellido}, {self.nombre}"

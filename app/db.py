@@ -379,6 +379,8 @@ COLUMNAS_NUEVAS_PERSONAL = {
     "titulo_obtenido": "VARCHAR(160)",
     "situacion_revista": "VARCHAR(60)",
     "fecha_ultimo_ascenso": "DATE",
+    # RBAC local (app/core/roles.py): las bases previas quedan todas en BOMBERO.
+    "rol": "VARCHAR(12) NOT NULL DEFAULT 'BOMBERO'",
 }
 
 COLUMNAS_NUEVAS_MOVILES = {
