@@ -1,0 +1,7 @@
+# Configuración del CLI de Supabase (parcial: solo lo que el proyecto necesita).
+project_id = "uzwegoetekpdommmrnrv"
+
+# Webhook de Meta: Meta no envía un JWT de Supabase, así que la puerta de enlace
+# no debe exigirlo. Equivale a `supabase functions deploy whatsapp-bot --no-verify-jwt`.
+[functions.whatsapp-bot]
+verify_jwt = false
