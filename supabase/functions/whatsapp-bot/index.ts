@@ -195,25 +195,50 @@ async function postGraph(to: string, body: string): Promise<{ ok: boolean; statu
 }
 
 /**
- * Envía un texto al remitente. Peculiaridad de Argentina: Meta entrega el
- * wa_id como '549...' pero a veces solo acepta enviar a '54...' (sin el 9),
- * p.ej. con la lista de destinatarios de prueba (error 131030). Se reintenta
- * una vez sin el 9.
+ * Formatos de destino a probar, en orden. Peculiaridad de Argentina: Meta
+ * entrega el wa_id como '549' + área + número, pero según cómo se registró el
+ * destinatario solo acepta alguno de estos (si no, error 131030):
+ *   1. 549 + área + número          (original)
+ *   2. 54  + área + número          (sin el 9)
+ *   3. 54  + área + 15 + número     (formato con 15)
+ * Para el 3 se asume característica de 3 dígitos (358, la del cuartel).
  */
+const AREA_LEN_AR = 3;
+
+function formatosDestino(to: string): string[] {
+  const d = to.replace(/\D/g, "");
+  if (!d.startsWith("549") || d.length !== 13) return [d];
+  const nacional = d.slice(3); // área + número (10 dígitos)
+  const area = nacional.slice(0, AREA_LEN_AR);
+  const local = nacional.slice(AREA_LEN_AR);
+  return [d, `54${nacional}`, `54${area}15${local}`];
+}
+
+/** Errores de Meta que pueden deberse al formato del destinatario. */
+const ERRORES_FORMATO = new Set([131030, 100]);
+
 async function enviarTexto(to: string, body: string): Promise<void> {
   if (!ACCESS_TOKEN || !PHONE_ID) {
     console.error("[whatsapp-bot] Faltan WHATSAPP_ACCESS_TOKEN / WHATSAPP_PHONE_ID: no se responde");
     return;
   }
-  let r = await postGraph(to, body);
-  if (!r.ok && r.data?.error?.code === 131030 && to.startsWith("549")) {
-    r = await postGraph(`54${to.slice(3)}`, body);
-  }
-  if (r.ok) {
-    console.log(`[whatsapp-bot] Respuesta enviada a ${mask(`+${to}`)} (wamid ${r.data?.messages?.[0]?.id ?? "?"})`);
-  } else {
+  const formatos = formatosDestino(to);
+  for (let i = 0; i < formatos.length; i++) {
+    const destino = formatos[i];
+    const r = await postGraph(destino, body);
+    if (r.ok) {
+      console.log(
+        `[whatsapp-bot] Respuesta enviada a ${mask(`+${destino}`)} (formato ${i + 1}/${formatos.length}, ` +
+          `wamid ${r.data?.messages?.[0]?.id ?? "?"})`,
+      );
+      return;
+    }
     const e = r.data?.error ?? {};
-    console.error(`[whatsapp-bot] Graph API ${r.status}: code=${e.code} ${e.message ?? JSON.stringify(r.data)}`);
+    console.error(
+      `[whatsapp-bot] Graph API ${r.status} con formato ${i + 1}/${formatos.length} (${mask(`+${destino}`)}): ` +
+        `code=${e.code} ${e.message ?? JSON.stringify(r.data)}`,
+    );
+    if (!ERRORES_FORMATO.has(e.code)) return; // token, permisos, etc.: otro formato no lo arregla
   }
 }
 
