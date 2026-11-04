@@ -9,7 +9,12 @@ Dónde se busca:
         nunca cambia).
       * `update.json`: {"version", "paquete", "sha256", "tamano", "chromium", "notas"}.
   - Código fuente (desarrollo): `git fetch` + commits nuevos en origin/main.
-    Solo se AVISA (hay que hacer `git pull`): nunca se toca el árbol de trabajo.
+    Se avisa y, si el operador lo pide, se traen con `git pull --ff-only`
+    (solo en la rama main y con el árbol de trabajo limpio: nunca pisa
+    cambios locales ni hace merges).
+  - Además, en el ejecutable, si no hay release nuevo se consulta la API
+    de GitHub (compare vX.Y.Z...main) para avisar, sin molestar, que hay
+    commits en main que todavía no se publicaron como versión instalable.
 
 Por qué no se reemplaza solo FireStation.exe: el build es `--onedir`, y el
 mapeo de RUBA, las plantillas PCS/PCD2, los íconos y las dependencias viven
@@ -54,6 +59,8 @@ log = logging.getLogger(__name__)
 
 REPO_GITHUB = "agufen27-hash/fire-station"
 URL_ULTIMO_RELEASE = f"https://api.github.com/repos/{REPO_GITHUB}/releases/latest"
+URL_COMPARAR = f"https://api.github.com/repos/{REPO_GITHUB}/compare/{{base}}...main"
+RAMA_PRINCIPAL = "main"
 NOMBRE_MANIFIESTO = "update.json"
 NOMBRE_EXE = "FireStation.exe"
 CARPETA_INTERNA = "_internal"
@@ -77,7 +84,7 @@ class ActualizacionError(Exception):
 @dataclass
 class InfoActualizacion:
     version: str
-    origen: str                      # "release" | "git"
+    origen: str                      # "release" | "git" | "sin_publicar"
     notas: str = ""
     url_paquete: str = ""
     nombre_paquete: str = ""
@@ -85,6 +92,7 @@ class InfoActualizacion:
     tamano: int = 0
     chromium: List[str] = field(default_factory=list)
     commits_nuevos: int = 0
+    arbol_limpio: bool = True        # git: se puede hacer `git pull --ff-only` sin pisar nada
 
 
 # ---------------------------------------------------------------------------
@@ -286,18 +294,66 @@ def _git(*args: str, cwd: Path, timeout: float = 30) -> str:
     return resultado.stdout.strip()
 
 
+def commits_sin_publicar(version: str = __version__) -> Optional[Tuple[int, str]]:
+    """Commits de main posteriores al tag vX.Y.Z (API compare de GitHub):
+    (cantidad, asunto del último). None si no se pudo saber: es solo un
+    aviso informativo y nunca debe hacer fallar la verificación."""
+    try:
+        datos = _consultar_github(URL_COMPARAR.format(base=f"v{version}"), github_token())
+    except Exception as e:  # noqa: BLE001 - sin internet, tag inexistente, rate limit...
+        _informar(f"[Actualizaciones] No se pudo comparar v{version}...main: {e}", logging.WARNING)
+        return None
+    adelante = int(datos.get("ahead_by") or 0)
+    commits = datos.get("commits") or []
+    ultimo = ""
+    if commits and isinstance(commits[-1], dict):
+        mensaje = str((commits[-1].get("commit") or {}).get("message") or "")
+        ultimo = mensaje.splitlines()[0] if mensaje else ""
+    _informar(f"[Actualizaciones] main tiene {adelante} commit(s) posteriores a v{version} sin publicar.")
+    return adelante, ultimo
+
+
+def _arbol_limpio(raiz: Path) -> bool:
+    """Sin cambios en archivos versionados (los no versionados no molestan a un pull --ff-only)."""
+    return not _git("status", "--porcelain", "--untracked-files=no", cwd=raiz)
+
+
 def buscar_en_git(raiz: Optional[Path] = None) -> Optional[InfoActualizacion]:
     """Desarrollo: commits en origin/main que este checkout no tiene."""
     raiz = raiz or get_resource_path(".")
     _informar(f"[Actualizaciones] Modo desarrollo (código fuente): versión local v{__version__}; "
               f"se compara HEAD con origin/main vía git en {raiz} (no se consulta la API de GitHub).")
-    _git("fetch", "--quiet", "origin", "main", cwd=raiz)
-    nuevos = int(_git("rev-list", "--count", "HEAD..origin/main", cwd=raiz) or 0)
+    _git("fetch", "--quiet", "origin", RAMA_PRINCIPAL, cwd=raiz)
+    nuevos = int(_git("rev-list", "--count", f"HEAD..origin/{RAMA_PRINCIPAL}", cwd=raiz) or 0)
     if not nuevos:
         return None
-    ultimo = _git("log", "-1", "--format=%s", "origin/main", cwd=raiz)
+    ultimo = _git("log", "-1", "--format=%s", f"origin/{RAMA_PRINCIPAL}", cwd=raiz)
+    rama = _git("rev-parse", "--abbrev-ref", "HEAD", cwd=raiz)
     return InfoActualizacion(version=f"origin/main (+{nuevos})", origen="git", commits_nuevos=nuevos,
-                             notas=f"Último commit: {ultimo}")
+                             notas=f"Último commit: {ultimo}",
+                             arbol_limpio=rama == RAMA_PRINCIPAL and _arbol_limpio(raiz))
+
+
+def traer_cambios_git(raiz: Optional[Path] = None) -> str:
+    """`git pull --ff-only origin main` en el checkout de desarrollo. Se niega
+    (ActualizacionError) fuera de main o con cambios locales sin commitear:
+    nunca pisa trabajo ni crea merges. Devuelve "abc123 → def456"."""
+    raiz = raiz or get_resource_path(".")
+    rama = _git("rev-parse", "--abbrev-ref", "HEAD", cwd=raiz)
+    if rama != RAMA_PRINCIPAL:
+        raise ActualizacionError(f"El checkout está en la rama '{rama}', no en main: actualizá a mano.")
+    if not _arbol_limpio(raiz):
+        raise ActualizacionError("Hay cambios locales sin commitear: guardalos (commit / stash) y probá de nuevo.")
+    antes = _git("rev-parse", "--short", "HEAD", cwd=raiz)
+    try:
+        _git("pull", "--ff-only", "--quiet", "origin", RAMA_PRINCIPAL, cwd=raiz, timeout=120)
+    except subprocess.CalledProcessError as e:
+        raise ActualizacionError(
+            "git pull --ff-only falló (¿hay commits locales que no están en GitHub?): "
+            + (e.stderr or "").strip()[:300]) from e
+    despues = _git("rev-parse", "--short", "HEAD", cwd=raiz)
+    _informar(f"[Actualizaciones] git pull --ff-only: {antes} -> {despues}")
+    return f"{antes} → {despues}"
 
 
 def buscar_actualizacion() -> Optional[InfoActualizacion]:
@@ -305,14 +361,23 @@ def buscar_actualizacion() -> Optional[InfoActualizacion]:
     al día, o el motivo del fallo (autenticación incluida). Re-levanta el
     error para que la UI decida si lo muestra."""
     try:
-        info = buscar_en_releases() if is_frozen() else buscar_en_git()
+        if is_frozen():
+            info = buscar_en_releases()
+            if info is None:
+                pendientes = commits_sin_publicar()
+                if pendientes and pendientes[0] > 0:
+                    info = InfoActualizacion(
+                        version=f"main (+{pendientes[0]})", origen="sin_publicar", commits_nuevos=pendientes[0],
+                        notas=f"Último commit: {pendientes[1]}" if pendientes[1] else "")
+        else:
+            info = buscar_en_git()
     except ActualizacionError as e:
         _informar(f"[Actualizaciones] {e}", logging.WARNING)
         raise
     except Exception as e:  # noqa: BLE001 - sin internet, sin git, etc.: se loguea y se re-levanta
         _informar(f"[Actualizaciones] Falló la verificación: {type(e).__name__}: {e}", logging.WARNING)
         raise
-    if info is None:
+    if info is None or info.origen == "sin_publicar":
         _informar(f"[Actualizaciones] Sin versión nueva: v{__version__} está al día.")
     else:
         _informar(f"[Actualizaciones] Versión nueva encontrada: {info.version} (origen: {info.origen}).")
@@ -482,6 +547,21 @@ class BuscarActualizacionWorker(QObject):
             self.fallo.emit(f"git {' '.join(e.cmd[1:])} falló (código {e.returncode}): {(e.stderr or '').strip()}")
         except Exception as e:  # noqa: BLE001 - sin internet / repo privado / sin git: no molesta al operador
             self.fallo.emit(f"{type(e).__name__}: {e}")
+        finally:
+            self.terminado.emit()
+
+
+class TraerCambiosGitWorker(QObject):
+    """`git pull --ff-only` (solo desarrollo) fuera del hilo de la UI."""
+    listo = Signal(str)          # "abc123 → def456"
+    fallo = Signal(str)
+    terminado = Signal()
+
+    def run(self) -> None:
+        try:
+            self.listo.emit(traer_cambios_git())
+        except Exception as e:  # noqa: BLE001 - se informa en la UI
+            self.fallo.emit(str(e) if isinstance(e, ActualizacionError) else f"{type(e).__name__}: {e}")
         finally:
             self.terminado.emit()
 

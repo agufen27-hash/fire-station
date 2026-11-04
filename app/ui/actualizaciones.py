@@ -10,17 +10,25 @@ Comportamiento según data/config.json -> "actualizaciones": {"modo": ...}:
     Nunca se cierra sola: en un cuartel, reiniciar en medio de un despacho
     o de una carga en RUBA sería peor que quedarse con la versión anterior.
   - "desactivado".
-En desarrollo (código fuente) solo avisa en la barra de estado que hay
-commits nuevos en origin/main.
+En desarrollo (código fuente) avisa en la barra de estado que hay commits
+nuevos en origin/main; desde "Buscar actualizaciones ahora" se pueden traer
+con `git pull --ff-only` (solo en main y sin cambios locales) y reiniciar.
+En el ejecutable, si no hay release nuevo pero main tiene commits sin
+publicar, también se avisa de forma sutil (barra de estado).
+
+La verificación se repite cada INTERVALO_RECHEQUEO_MS mientras la app está
+abierta (las PCs de guardia quedan encendidas días). Sin internet / sin git
+/ repo inaccesible: se registra en logs/actualizaciones.log y no se molesta.
 """
 
 from __future__ import annotations
 
 import logging
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
-from PySide6.QtCore import QObject, Qt, QTimer, Signal
+from PySide6.QtCore import QObject, QProcess, Qt, QTimer, Signal
 from PySide6.QtWidgets import QApplication, QMessageBox, QProgressDialog
 
 from app import __version__
@@ -34,6 +42,8 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 DEMORA_PRIMERA_BUSQUEDA_MS = 8000  # que la ventana termine de abrir antes de salir a la red
+INTERVALO_RECHEQUEO_MS = 6 * 60 * 60 * 1000
+MENSAJE_PERSISTENTE = 0  # QStatusBar.showMessage(…, 0): queda hasta el próximo mensaje
 
 
 class ControladorActualizaciones(QObject):
@@ -58,6 +68,10 @@ class ControladorActualizaciones(QObject):
         if self.modo == updater.MODO_DESACTIVADO:
             return
         QTimer.singleShot(DEMORA_PRIMERA_BUSQUEDA_MS, self.buscar)
+        self._timer_rechequeo = QTimer(self)
+        self._timer_rechequeo.setInterval(INTERVALO_RECHEQUEO_MS)
+        self._timer_rechequeo.timeout.connect(self.buscar)
+        self._timer_rechequeo.start()
 
     def buscar(self) -> None:
         """Búsqueda automática (al arrancar): silenciosa si no hay nada o si falla."""
@@ -110,12 +124,17 @@ class ControladorActualizaciones(QObject):
                                     f"Tenés la última versión instalada: v{__version__}")
             return
         self.info = info
-        if info.origen == "git":
+        if info.origen == "sin_publicar":
             QMessageBox.information(
-                self.ventana, "Hay cambios nuevos",
-                f"Hay {info.commits_nuevos} commit(s) nuevo(s) en origin/main (tenés v{__version__}).\n\n"
-                f"{info.notas}\n\nEn desarrollo se actualiza con 'git pull'.",
+                self.ventana, "Estás al día",
+                f"Tenés la última versión publicada: v{__version__}.\n\n"
+                f"En GitHub hay {info.commits_nuevos} cambio(s) nuevo(s) en main que todavía no se publicaron "
+                f"como versión instalable.\n{info.notas}\n\n"
+                "Llegan solos a esta PC cuando se publique la próxima versión (tools/release.py).",
             )
+            return
+        if info.origen == "git":
+            self._preguntar_git(info)
             return
         self._preguntar(info)
 
@@ -140,8 +159,15 @@ class ControladorActualizaciones(QObject):
         if info is None:
             return
         self.info = info
+        if info.origen == "sin_publicar":
+            self._mensaje(f"ℹ️ Hay {info.commits_nuevos} cambio(s) en GitHub (main) todavía sin publicar "
+                          "como versión instalable.", "info", MENSAJE_PERSISTENTE)
+            return
         if info.origen == "git":
-            self._mensaje(f"Hay {info.commits_nuevos} commit(s) nuevo(s) en origin/main: hacé 'git pull'.", "info")
+            accion = ("Configuración → 🔄 Buscar actualizaciones ahora para traerlos."
+                      if info.arbol_limpio else "hacé 'git pull' (hay cambios locales o no estás en main).")
+            self._mensaje(f"🔄 Hay {info.commits_nuevos} commit(s) nuevo(s) en origin/main: {accion}",
+                          "info", MENSAJE_PERSISTENTE)
             return
         if self.modo == updater.MODO_AUTOMATICO:
             self._descargar(instalar_al_terminar=False)
@@ -166,6 +192,66 @@ class ControladorActualizaciones(QObject):
             self._descargar(instalar_al_terminar=True)
         elif caja.clickedButton() is al_cerrar:
             self._descargar(instalar_al_terminar=False)
+
+    # -- Desarrollo: traer cambios con git -------------------------------------------
+
+    def _preguntar_git(self, info: updater.InfoActualizacion) -> None:
+        caja = QMessageBox(self.ventana)
+        caja.setIcon(QMessageBox.Icon.Information)
+        caja.setWindowTitle("Hay cambios nuevos")
+        caja.setText(f"Hay {info.commits_nuevos} commit(s) nuevo(s) en origin/main (tenés v{__version__}).")
+        if info.arbol_limpio:
+            caja.setInformativeText(f"{info.notas}\n\nSe traen con 'git pull --ff-only' (no toca cambios "
+                                    "locales ni hace merges) y después se reinicia Fire Station.")
+            traer = caja.addButton("Traer cambios ahora", QMessageBox.ButtonRole.AcceptRole)
+            caja.addButton("Más tarde", QMessageBox.ButtonRole.RejectRole)
+        else:
+            caja.setInformativeText(f"{info.notas}\n\nNo se actualiza solo: el checkout no está en main o tiene "
+                                    "cambios sin commitear. Actualizá a mano con 'git pull'.")
+            traer = None
+            caja.addButton("Entendido", QMessageBox.ButtonRole.RejectRole)
+        caja.exec()
+        if traer is not None and caja.clickedButton() is traer:
+            self._traer_cambios_git()
+
+    def _traer_cambios_git(self) -> None:
+        self._mensaje("🔄 Trayendo cambios de GitHub (git pull)…", "info", MENSAJE_PERSISTENTE)
+        QApplication.setOverrideCursor(Qt.CursorShape.BusyCursor)
+        worker = updater.TraerCambiosGitWorker()
+        worker.listo.connect(self._on_cambios_traidos)
+        worker.fallo.connect(self._on_fallo_git)
+        worker.terminado.connect(QApplication.restoreOverrideCursor)
+        self._mantener(updater.lanzar_en_hilo(worker), worker)
+
+    def _on_fallo_git(self, error: str) -> None:
+        self._mensaje("No se pudieron traer los cambios de GitHub.", "alerta")
+        QMessageBox.warning(self.ventana, "No se pudo actualizar", error)
+
+    def _on_cambios_traidos(self, resumen: str) -> None:
+        self.info = None
+        self._mensaje(f"✅ Código actualizado ({resumen}): reiniciá Fire Station para usarlo.", "ok",
+                      MENSAJE_PERSISTENTE)
+        motivo = self._motivo_para_esperar()
+        if motivo:
+            QMessageBox.information(self.ventana, "Código actualizado",
+                                    f"Cambios traídos ({resumen}).\n\n{motivo}\n\n"
+                                    "Reiniciá Fire Station cuando termines para usar la versión nueva.")
+            return
+        respuesta = QMessageBox.question(
+            self.ventana, "Código actualizado",
+            f"Cambios traídos ({resumen}). ¿Reiniciar Fire Station ahora para usar la versión nueva?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.Yes,
+        )
+        if respuesta == QMessageBox.StandardButton.Yes:
+            self._reiniciar()
+
+    def _reiniciar(self) -> None:
+        """Abre una instancia nueva (mismo intérprete y argumentos) y cierra esta."""
+        if QProcess.startDetached(sys.executable, sys.argv)[0]:
+            self.ventana.close()
+        else:
+            QMessageBox.warning(self.ventana, "No se pudo reiniciar",
+                                "Cerrá y volvé a abrir Fire Station para usar la versión nueva.")
 
     # -- Descarga -----------------------------------------------------------------
 
@@ -254,10 +340,10 @@ class ControladorActualizaciones(QObject):
         except Exception as e:  # noqa: BLE001 - nunca impedir el cierre por la actualización
             log.exception("No se pudo lanzar la instalación de la actualización: %s", e)
 
-    def _mensaje(self, texto: str, tono: str) -> None:
+    def _mensaje(self, texto: str, tono: str, duracion_ms: int = 15000) -> None:
         barra = self.ventana.statusBar()
         theme.set_tono(barra, "neutro" if tono == "info" else tono)
-        barra.showMessage(texto, 15000)
+        barra.showMessage(texto, duracion_ms)
 
 
 def iniciar_actualizaciones(ventana: "MainWindow") -> ControladorActualizaciones:
