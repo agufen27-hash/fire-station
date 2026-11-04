@@ -31,9 +31,6 @@ const ACCESS_TOKEN = Deno.env.get("WHATSAPP_ACCESS_TOKEN") ?? "";
 const PHONE_ID = Deno.env.get("WHATSAPP_PHONE_ID") ?? "";
 const GRAPH_URL = "https://graph.facebook.com/v26.0";
 
-// Runtime de Supabase: permite seguir trabajando después de responder.
-declare const EdgeRuntime: { waitUntil(p: Promise<unknown>): void } | undefined;
-
 const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, {
   auth: { persistSession: false, autoRefreshToken: false },
 });
@@ -231,7 +228,10 @@ async function procesarWebhook(raw: string, firma: string | null): Promise<void>
     const msg = payload.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
 
     // Notificaciones de estado (sent/delivered/read) u otros eventos sin mensaje.
-    if (!msg) return;
+    if (!msg) {
+      console.log("[whatsapp-bot] Evento sin mensaje (statuses u otro): ignorado");
+      return;
+    }
 
     const from = msg.from;
     const texto = extraerTexto(msg);
@@ -274,15 +274,16 @@ async function handleMessage(req: Request): Promise<Response> {
   let raw = "";
   try {
     raw = await req.text();
+    console.log(`[whatsapp-bot] POST recibido (${raw.length} bytes, UA=${req.headers.get("user-agent") ?? "?"})`);
   } catch (err) {
     console.error("[whatsapp-bot] No se pudo leer el body:", err instanceof Error ? err.message : err);
     return ok();
   }
 
-  // Se responde 200 a Meta de inmediato; la consulta y el envío siguen en segundo plano.
-  const tarea = procesarWebhook(raw, req.headers.get("x-hub-signature-256"));
-  if (typeof EdgeRuntime !== "undefined") EdgeRuntime.waitUntil(tarea);
-  else await tarea; // fallback (p.ej. `deno run` local)
+  // Se procesa todo (consulta + envío a Meta, ~1-2 s) ANTES de responder: así el
+  // runtime no puede cortar trabajo pendiente. Meta tolera esa latencia.
+  // procesarWebhook nunca lanza (try/catch interno), así que el 200 está garantizado.
+  await procesarWebhook(raw, req.headers.get("x-hub-signature-256"));
 
   return ok();
 }
