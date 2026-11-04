@@ -1,9 +1,10 @@
 """
-Ventana principal de Fire Station: dashboard con sidebar lateral (7 módulos),
+Ventana principal de Fire Station: dashboard con sidebar lateral (8 módulos),
 barra institucional superior con el nombre de la sección activa, y un
 QStackedWidget de páginas -- Inicio, Nueva Salida (formulario operativo de
 guardia, con dotaciones dinámicas y firma electrónica), Historial de
-Salidas, Cartografía Táctica, Personal y Unidades (CRUD), Documentación
+Salidas, Cartografía Táctica, Personal y Unidades (CRUD), Libro de Guardia
+(bitácora de viajes y asistencias en Supabase), Documentación
 (legajos con acceso por PIN) y Configuración (Fase 6 y Fase 7).
 """
 
@@ -116,6 +117,7 @@ from app.ui.pin_dialogs import DialogoResetPinMaestra
 from app.ui.dotaciones_widgets import PanelDotaciones, PanelPersonalBase, personas_repetidas
 from app.ui.participacion_widgets import HorarioServicio, SelectorBombero
 from app.ui.bomberos_view import importar_bomberos_desde_excel
+from app.ui.libro_guardia_view import PaginaLibroGuardia
 from app.ui.personnel_window import BotonSyncCloud, LegajoPrivadoWidget
 from app.ui import theme
 from app.ui.map_dialog import DialogoMarcarMapa, parsear_par
@@ -147,8 +149,9 @@ IDX_FORMULARIO = 1
 IDX_HISTORIAL = 2
 IDX_MAPA = 3
 IDX_DOTACIONES = 4
-IDX_DOCUMENTACION = 5
-IDX_CONFIGURACION = 6
+IDX_LIBRO_GUARDIA = 5
+IDX_DOCUMENTACION = 6
+IDX_CONFIGURACION = 7
 
 # Estado reactivo: chequeo de internet cada 4 min (en un QThread) y retardo
 # para agrupar los avisos del QFileSystemWatcher del padrón.
@@ -180,6 +183,7 @@ ITEMS_NAV = [
     (IDX_HISTORIAL, "📈  Estadísticas"),
     (IDX_MAPA, "🗺️  Cartografía Táctica"),
     (IDX_DOTACIONES, "🚒  Personal y Unidades"),
+    (IDX_LIBRO_GUARDIA, "📒  Libro de Guardia"),
     (IDX_DOCUMENTACION, "📁  Documentación"),
     (IDX_CONFIGURACION, "⚙️  Configuración"),
 ]
@@ -213,6 +217,7 @@ NOMBRES_SECCION = {
     IDX_HISTORIAL: "ESTADÍSTICAS",
     IDX_MAPA: "CARTOGRAFÍA TÁCTICA",
     IDX_DOTACIONES: "PERSONAL Y UNIDADES",
+    IDX_LIBRO_GUARDIA: "LIBRO DE GUARDIA",
     IDX_DOCUMENTACION: "DOCUMENTACIÓN",
     IDX_CONFIGURACION: "CONFIGURACIÓN",
 }
@@ -374,6 +379,7 @@ class MainWindow(QMainWindow):
         self._pagina_historial.estados_cambiados.connect(self._refrescar_estado_ruba)
         self._pagina_mapa = OperationsMapWindow(self)
         self._pagina_dotaciones = self._crear_pagina_dotaciones()
+        self._pagina_libro_guardia = PaginaLibroGuardia(self)
         self._pagina_documentacion = self._crear_pagina_documentacion()
         self._pagina_configuracion = self._crear_pagina_configuracion()
 
@@ -383,6 +389,7 @@ class MainWindow(QMainWindow):
             self._pagina_historial,
             self._pagina_mapa,
             self._pagina_dotaciones,
+            self._pagina_libro_guardia,
             self._pagina_documentacion,
             self._pagina_configuracion,
         ):
@@ -585,6 +592,8 @@ class MainWindow(QMainWindow):
             self._pagina_mapa.refrescar()
         elif indice == IDX_DOTACIONES:
             self._cargar_pagina_dotaciones()
+        elif indice == IDX_LIBRO_GUARDIA:
+            self._pagina_libro_guardia.refrescar()
         elif indice == IDX_DOCUMENTACION:
             self._cargar_pagina_documentacion()
         elif indice == IDX_CONFIGURACION:
