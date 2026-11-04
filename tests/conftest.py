@@ -50,3 +50,14 @@ def _cerrar_ventanas_sobrantes():
         ventana.close()
         ventana.deleteLater()
     QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+@pytest.fixture(autouse=True)
+def _cache_offline_temporal(tmp_path):
+    """La caché / cola offline de Supabase de cada test vive en tmp_path:
+    nunca toca data/cache_nube.db."""
+    from app.services import cache_offline
+
+    cache_offline.configurar_ruta(tmp_path / "cache_nube.db")
+    yield
+    cache_offline.configurar_ruta(None)

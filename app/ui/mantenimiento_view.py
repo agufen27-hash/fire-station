@@ -85,7 +85,7 @@ from app.services.mantenimiento_service import (
 )
 from app.services.supabase_client import SupabaseConfigError, cargar_credenciales
 from app.ui import theme
-from app.ui.libro_guardia_view import DialogoCredencialesSupabase, _crear_chip, ahora_cuartel, formatear_fecha_hora
+from app.ui.libro_guardia_view import DialogoCredencialesSupabase, _crear_chip, formatear_fecha_hora
 from app.ui.widgets import TarjetaKPI
 from app.workers.supabase_tarea import TareaSupabase
 
@@ -852,6 +852,12 @@ class DialogoFichaActivo(QDialog, _ConTareas):
             return
         self.hubo_cambios = True
         r = dialogo.resultado
+        if r.encolado:
+            from app.ui.estado_nube import texto_encolado
+
+            QMessageBox.information(self, "Revisión guardada sin conexión",
+                                    texto_encolado(f"la revisión de «{item.nombre}»"))
+            return
         if r.cambio_estado:
             QMessageBox.warning(self, "Cambio de estado", f"«{item.nombre}» quedó "
                                 f"{ESTADOS_INVENTARIO.get(r.estado_item, r.estado_item).upper()}.")
@@ -1112,7 +1118,9 @@ class PaginaMantenimiento(QWidget, _ConTareas):
         self._items = items
         self._actualizar_kpis()
         self._pintar_tabla()
-        self._set_chip(f"☁️ Sincronizado {ahora_cuartel():%H:%M}", "ok")
+        from app.ui.estado_nube import chip_tras_carga
+
+        self._set_chip(*chip_tras_carga())
 
     def _al_fallar_carga(self, mensaje: str) -> None:
         self._cargando = False
@@ -1265,6 +1273,13 @@ class PaginaMantenimiento(QWidget, _ConTareas):
         if dialogo.exec() != QDialog.DialogCode.Accepted or dialogo.resultado is None:
             return
         r = dialogo.resultado
+        if r.encolado:
+            from app.ui.estado_nube import texto_encolado
+
+            QMessageBox.information(self, "Revisión guardada sin conexión",
+                                    texto_encolado(f"la revisión de «{item.nombre}»") +
+                                    "\n\nEl estado del ítem se recalcula al sincronizar.")
+            return
         texto = f"Revisión registrada: {RESULTADOS.get(r.resultado, r.resultado)}."
         if r.cambio_estado and r.estado_item == FUERA_DE_SERVICIO:
             QMessageBox.warning(self, "Ítem fuera de servicio",

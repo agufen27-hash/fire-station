@@ -61,7 +61,7 @@ from app.services.inventario_service import (
 )
 from app.services.supabase_client import SupabaseConfigError, cargar_credenciales
 from app.ui import theme
-from app.ui.libro_guardia_view import DialogoCredencialesSupabase, _crear_chip, ahora_cuartel, formatear_fecha_hora
+from app.ui.libro_guardia_view import DialogoCredencialesSupabase, _crear_chip, formatear_fecha_hora
 from app.ui.qr_etiquetas import DialogoQrActivo, activos_para_etiquetas, exportar_etiquetas, qr_icono
 from app.ui.widgets import TarjetaKPI
 from app.workers.supabase_tarea import TareaSupabase
@@ -464,7 +464,9 @@ class PaginaInventario(QWidget):
             self._set_chip("✅ " + self._aviso_pendiente, "ok")
             self._aviso_pendiente = None
         else:
-            self._set_chip(f"☁️ Sincronizado {ahora_cuartel():%H:%M}", "ok")
+            from app.ui.estado_nube import chip_tras_carga
+
+            self._set_chip(*chip_tras_carga())
 
     def _al_fallar_carga(self, mensaje: str) -> None:
         self._cargando = False

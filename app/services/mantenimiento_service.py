@@ -28,6 +28,7 @@ cargado para reintentar).
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Mapping, Optional
@@ -268,6 +269,7 @@ class ResultadoChecklist:
     estado_item: str
     cambio_estado: bool
     motivos: List[Dict[str, Any]]
+    encolado: bool = False          # sin red: quedó en la cola local, se sincroniza solo
 
 
 # =============================================================================
@@ -395,10 +397,18 @@ class MantenimientoCliente(ClienteSupabaseRest):
         cuerpo = [{"tarea_id": tid, "estado": estado,
                    "observacion": (observaciones_tareas.get(tid) or "").strip()}
                   for tid, estado in respuestas.items()]
-        r = self._exigir_ok(self._rpc("rpc_mantenimiento_registrar", {
+        r = self._rpc_escritura("rpc_mantenimiento_registrar", {
             "p_operador_id": operador_id, "p_item_id": item_id, "p_frecuencia": frecuencia,
             "p_respuestas": cuerpo, "p_observaciones": observaciones.strip(),
-        }))
+            "p_fecha_hora": datetime.now(TZ_CUARTEL).isoformat(),   # hora real aunque se envíe después
+            "p_cliente_id": str(uuid.uuid4()),
+        }, f"revisión {FRECUENCIAS.get(frecuencia, frecuencia).lower()}")
+        if r is None:
+            fallas = any(e == FALLA_RESPUESTA for e in respuestas.values())
+            return ResultadoChecklist(registro_id="", resultado="CON_OBSERVACIONES" if fallas else "APROBADO",
+                                      estado_general="", estado_item="", cambio_estado=False, motivos=[],
+                                      encolado=True)
+        r = self._exigir_ok(r)
         return ResultadoChecklist(
             registro_id=str(r["registro_id"]), resultado=r["resultado"], estado_general=r["estado_general"],
             estado_item=r["estado_item"], cambio_estado=bool(r.get("cambio_estado")),

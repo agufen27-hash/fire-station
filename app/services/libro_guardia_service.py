@@ -20,6 +20,7 @@ Los IDs de bombero son los de la base local: el sync del padrón sube
 from __future__ import annotations
 
 import logging
+import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
@@ -139,7 +140,7 @@ class LibroGuardiaCliente(ClienteSupabaseRest):
     # -- Lecturas -----------------------------------------------------------------
 
     def resumen(self) -> ResumenGuardia:
-        r = self._rpc("rpc_resumen_libro_guardia") or {}
+        r = self._rpc_lectura("rpc_resumen_libro_guardia") or {}
         return ResumenGuardia(
             viajes_activos=int(r.get("viajes_activos") or 0),
             personal_en_cuartel=int(r.get("personal_en_cuartel") or 0),
@@ -159,7 +160,9 @@ class LibroGuardiaCliente(ClienteSupabaseRest):
             "order": "inicio.desc",
             "limit": str(limite),
         }
-        filas = self._pedir("GET", VISTA_BITACORA, params=params) or []
+        # Clave de caché fija: `desde` cambia en cada lectura (ahora - 30 días).
+        filas = self._pedir("GET", VISTA_BITACORA, params=params,
+                            clave_cache=f"libro_guardia.bitacora.{limite}.{hasta is not None}") or []
         return [registro_desde_fila(f) for f in filas]
 
     def bitacora_mes(self, anio: int, mes: int) -> List[RegistroBitacora]:
@@ -177,20 +180,33 @@ class LibroGuardiaCliente(ClienteSupabaseRest):
     # -- Escrituras -----------------------------------------------------------------
 
     def registrar_salida(self, bombero_id: int, destino: str, vehiculo: str) -> Dict[str, Any]:
-        return self._exigir_ok(self._rpc("rpc_registrar_viaje", {
+        """Sin red queda en la cola local con la hora real de salida:
+        devuelve {"ok": True, "encolado": True, ...}."""
+        salida = datetime.now(TZ_CUARTEL)
+        args = {
             "p_bombero_id": bombero_id,
             "p_destino": destino.strip(),
             "p_vehiculo": vehiculo.strip(),
             "p_origen": "ESCRITORIO",
-        }))
+            "p_fecha_salida": salida.isoformat(),
+            "p_cliente_id": str(uuid.uuid4()),   # idempotencia de los reintentos
+        }
+        r = self._rpc_escritura("rpc_registrar_viaje", args, f"{destino.strip()} en {vehiculo.strip()}")
+        if r is None:
+            return {"ok": True, "encolado": True, "destino": args["p_destino"], "vehiculo": args["p_vehiculo"],
+                    "fecha_salida": salida.isoformat()}
+        return self._exigir_ok(r)
 
     def marcar_regreso(self, viaje_id: str, fecha_llegada: datetime) -> Dict[str, Any]:
         if fecha_llegada.tzinfo is None:
             fecha_llegada = fecha_llegada.replace(tzinfo=TZ_CUARTEL)
-        return self._exigir_ok(self._rpc("rpc_cerrar_viaje_manual", {
+        r = self._rpc_escritura("rpc_cerrar_viaje_manual", {
             "p_viaje_id": viaje_id,
             "p_fecha_llegada": fecha_llegada.isoformat(),
-        }))
+        }, f"regreso {fecha_llegada:%d/%m %H:%M}")
+        if r is None:
+            return {"ok": True, "encolado": True, "fecha_llegada": fecha_llegada.isoformat(), "minutos": None}
+        return self._exigir_ok(r)
 
 
 def mes_anterior(hoy: Optional[date] = None) -> tuple[int, int]:

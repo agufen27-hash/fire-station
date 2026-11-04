@@ -62,6 +62,7 @@ from app.services.libro_guardia_service import (
     ResumenGuardia,
 )
 from app.ui import theme
+from app.ui.estado_nube import texto_encolado
 from app.ui.widgets import DateField, TarjetaKPI, TimeField
 from app.workers.libro_guardia_worker import TareaLibroGuardia
 
@@ -660,8 +661,11 @@ class PaginaLibroGuardia(QWidget):
         self._mostrar_resumen(resumen)
         self._registros = registros
         self._pintar_tabla()
-        self._set_chip(f"☁️ Sincronizado {ahora_cuartel():%H:%M}", "ok",
-                       f"Últimos {DIAS_BITACORA} días + todo lo que sigue en curso. Se actualiza cada minuto.")
+        from app.ui.estado_nube import chip_tras_carga
+
+        texto, tono, ayuda = chip_tras_carga()
+        self._set_chip(texto, tono, ayuda or f"Últimos {DIAS_BITACORA} días + todo lo que sigue en curso. "
+                                             "Se actualiza cada minuto.")
 
     def _al_fallar_carga(self, mensaje: str) -> None:
         self._cargando = False
@@ -772,9 +776,10 @@ class PaginaLibroGuardia(QWidget):
         self.boton_registrar.setEnabled(False)
         self._ejecutar(
             lambda: self._cliente_factory().registrar_salida(bombero_id, destino, vehiculo),
-            lambda _r: self._al_terminar_accion(self.boton_registrar, "Salida registrada",
-                                                f"Viaje a {destino} registrado. El aviso al grupo operativo "
-                                                "sale automáticamente por WhatsApp."),
+            lambda r: self._al_terminar_accion(
+                self.boton_registrar, "Salida registrada",
+                texto_encolado(f"la salida a {destino}") if r.get("encolado") else
+                f"Viaje a {destino} registrado. El aviso al grupo operativo sale automáticamente por WhatsApp."),
             lambda msg: self._al_fallar_accion(self.boton_registrar, "No se pudo registrar la salida", msg),
         )
 
@@ -791,6 +796,7 @@ class PaginaLibroGuardia(QWidget):
             lambda: self._cliente_factory().marcar_regreso(registro.id, llegada),
             lambda r: self._al_terminar_accion(
                 self.boton_regreso, "Regreso registrado",
+                texto_encolado(f"el regreso de {registro.bombero} ({llegada:%d/%m %H:%M})") if r.get("encolado") else
                 f"{registro.bombero}: regreso {llegada:%d/%m/%Y %H:%M} "
                 f"({formatear_duracion(r.get('minutos'))}). Viaje FINALIZADO."),
             lambda msg: self._al_fallar_accion(self.boton_regreso, "No se pudo marcar el regreso", msg),

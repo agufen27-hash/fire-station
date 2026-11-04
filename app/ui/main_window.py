@@ -412,6 +412,95 @@ class MainWindow(QMainWindow):
         self._stack.currentChanged.connect(self._on_pagina_cambiada)
         self._aplicar_permisos()
         self._configurar_qr()
+        self._configurar_offline()
+
+    # -- Modo offline (cola local de Supabase) -------------------------------------
+
+    def _configurar_offline(self) -> None:
+        """Las salidas, regresos y revisiones hechas sin red quedan en la cola
+        local (app/services/cache_offline.py) y se envían solas al volver la
+        conexión; el chip ⏳ muestra cuántas faltan."""
+        from app.workers.sincronizador_offline import SincronizadorOffline
+
+        self._sincronizador = SincronizadorOffline(self)
+        self._sincronizador.estado_cambiado.connect(self._actualizar_chip_offline)
+        self._sincronizador.sincronizado.connect(self._on_cola_offline_sincronizada)
+        app = QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self._sincronizador.detener)
+        self._sincronizador.iniciar()
+
+    def _actualizar_chip_offline(self, pendientes: int, errores: int, en_linea: bool) -> None:
+        if not (pendientes or errores or not en_linea):
+            self._chip_offline.setVisible(False)
+            return
+        if errores:
+            texto, tono = f"⚠️ {errores} sin sincronizar (revisar)", "error"
+        elif pendientes:
+            texto, tono = f"⏳ {pendientes} por sincronizar", "alerta"
+        else:
+            texto, tono = "📴 Sin conexión con la nube", "alerta"
+        if pendientes and not en_linea:
+            texto += " · sin conexión"
+        self._chip_offline.setText(texto)
+        self._chip_offline.setToolTip("Operaciones guardadas en esta PC: se envían solas al volver la conexión. "
+                                      "Clic para ver el detalle.")
+        theme.set_tono(self._chip_offline, tono)
+        self._chip_offline.setVisible(True)
+        self._ajustar_chip(self._chip_offline)
+
+    def _on_cola_offline_sincronizada(self, resultado) -> None:
+        if resultado.enviadas:
+            theme.set_tono(self.statusBar(), "ok")
+            self.statusBar().showMessage(
+                f"☁️ Se sincronizaron {resultado.enviadas} operación(es) guardadas sin conexión.", 8000)
+            self._on_pagina_cambiada(self._stack.currentIndex())   # refresca lo que se está viendo
+        if resultado.rechazadas:
+            theme.set_tono(self.statusBar(), "alerta")
+            self.statusBar().showMessage(
+                f"⚠️ {resultado.rechazadas} operación(es) guardadas sin conexión fueron rechazadas: "
+                "clic en el chip ⚠️ para revisarlas.", 15000)
+
+    def _mostrar_cola_offline(self) -> None:
+        from app.services import cache_offline
+
+        operaciones = cache_offline.pendientes()
+        caja = QMessageBox(self)
+        caja.setWindowTitle("Operaciones sin sincronizar")
+        estado = cache_offline.estado()
+        caja.setIcon(QMessageBox.Icon.Information if estado.en_linea else QMessageBox.Icon.Warning)
+        if not operaciones:
+            caja.setText("No hay operaciones pendientes." if estado.en_linea else
+                         "Sin conexión con la nube: se muestran los últimos datos guardados en esta PC.")
+            caja.exec()
+            return
+        lineas = []
+        for op in operaciones:
+            hora = op.creado_at.astimezone().strftime("%d/%m %H:%M")
+            linea = f"• {hora} — {op.nombre}" + (f": {op.descripcion}" if op.descripcion else "")
+            if op.estado == cache_offline.ESTADO_ERROR:
+                linea += f"\n     ⚠️ Rechazada: {op.ultimo_error}"
+            lineas.append(linea)
+        errores = [op for op in operaciones if op.estado == cache_offline.ESTADO_ERROR]
+        caja.setText(f"{len(operaciones)} operación(es) guardadas en esta PC"
+                     + ("" if estado.en_linea else " · sin conexión con la nube") + ".")
+        caja.setInformativeText("Se envían solas, en orden, apenas haya conexión.\n\n" + "\n".join(lineas[:25]))
+        sincronizar = caja.addButton("Sincronizar ahora", QMessageBox.ButtonRole.AcceptRole)
+        reintentar = caja.addButton("Reintentar rechazadas", QMessageBox.ButtonRole.ActionRole) if errores else None
+        descartar = caja.addButton("Descartar rechazadas", QMessageBox.ButtonRole.DestructiveRole) if errores else None
+        caja.addButton("Cerrar", QMessageBox.ButtonRole.RejectRole)
+        caja.exec()
+        boton = caja.clickedButton()
+        if boton is reintentar:
+            cache_offline.reintentar_errores()
+        elif boton is descartar and QMessageBox.question(
+                self, "Descartar", f"¿Descartar {len(errores)} operación(es) rechazadas? No se van a registrar.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
+            for op in errores:
+                cache_offline.descartar(op.id)
+        if boton in (sincronizar, reintentar, descartar):
+            self._sincronizador.revisar()
 
     # -- Códigos QR de los activos ------------------------------------------------
 
@@ -483,6 +572,14 @@ class MainWindow(QMainWindow):
         self._chip_operador.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._chip_operador.setCursor(Qt.CursorShape.PointingHandCursor)
         self._chip_operador.clicked.connect(self._on_chip_operador)
+        # Modo offline: operaciones guardadas en esta PC esperando conexión (clic = detalle).
+        self._chip_offline = ChipClickable("", barra)
+        self._chip_offline.setObjectName("chip")
+        self._chip_offline.setFixedHeight(24)
+        self._chip_offline.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._chip_offline.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._chip_offline.setVisible(False)
+        self._chip_offline.clicked.connect(self._mostrar_cola_offline)
         # Acceso directo a la búsqueda por QR (también Ctrl+K y la pistola lectora).
         self._chip_escanear = ChipClickable("🔳 Escanear QR", barra)
         self._chip_escanear.setObjectName("chip")
@@ -494,7 +591,7 @@ class MainWindow(QMainWindow):
         theme.set_tono(self._chip_escanear, "info")
         self._chip_escanear.clicked.connect(self._escanear_qr)
         for chip in (self._chip_borrador, self._chip_semaforo, self._chip_padron, self._chip_ruba,
-                     self._chip_escanear, self._chip_operador):
+                     self._chip_offline, self._chip_escanear, self._chip_operador):
             layout.addWidget(chip, 0, Qt.AlignmentFlag.AlignVCenter)
         self._chip_borrador.setVisible(False)
         self._chip_semaforo.setVisible(False)

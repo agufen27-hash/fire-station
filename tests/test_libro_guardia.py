@@ -57,8 +57,10 @@ def test_registrar_salida_llama_rpc_con_origen_escritorio():
     assert cliente.registrar_salida(7, " Río Cuarto ", " M-12 ")["viaje_id"] == "v1"
     metodo, url = session.request.call_args.args
     assert metodo == "POST" and url.endswith("/rest/v1/rpc/rpc_registrar_viaje")
-    assert session.request.call_args.kwargs["json"] == {
+    cuerpo = session.request.call_args.kwargs["json"]
+    assert {k: cuerpo[k] for k in ("p_bombero_id", "p_destino", "p_vehiculo", "p_origen")} == {
         "p_bombero_id": 7, "p_destino": "Río Cuarto", "p_vehiculo": "M-12", "p_origen": "ESCRITORIO"}
+    assert cuerpo["p_cliente_id"] and cuerpo["p_fecha_salida"]   # hora real + idempotencia (modo offline)
 
 
 def test_motivo_de_rechazo_se_traduce():
