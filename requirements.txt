@@ -21,6 +21,12 @@ certifi==2026.05.20
 # Puente cloud: API REST de Supabase (app/services/supabase_client.py)
 requests==2.34.2
 
+# Códigos QR de los activos: generación (segno, Python puro) y lectura por
+# cámara (zxing-cpp, decodificador nativo chico; usa numpy)
+segno==1.6.6
+zxing-cpp==3.1.1
+numpy>=2.0
+
 # Utilidades de fecha/hora
 python-dateutil==2.9.0.post0
 

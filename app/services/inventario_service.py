@@ -101,6 +101,8 @@ class ItemInventario:
     updated_at: Optional[datetime]
     creado_por: Optional[str]
     modificado_por: Optional[str]
+    fuera_servicio_automatico: bool = False   # puesto fuera de servicio por el motor de mantenimiento
+    motivo_estado: Optional[str] = None
 
     @property
     def categoria_legible(self) -> str:
@@ -132,6 +134,8 @@ def item_desde_fila(fila: Dict[str, Any]) -> ItemInventario:
         updated_at=_fecha(fila.get("updated_at")),
         creado_por=fila.get("creado_por"),
         modificado_por=fila.get("modificado_por"),
+        fuera_servicio_automatico=bool(fila.get("fuera_servicio_automatico")),
+        motivo_estado=fila.get("motivo_estado"),
     )
 
 

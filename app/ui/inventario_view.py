@@ -12,6 +12,11 @@ Supabase (vehículos, herramientas, equipos de protección respiratoria, EPP...)
     cada vez que cambia la sesión (chip 👤). El servicio y la base vuelven a
     verificar el rol (ver app/services/inventario_service.py).
 
+Códigos QR: miniatura en la grilla, "🔳 Ver QR" (guardar / imprimir la
+etiqueta), "🏷️ Etiquetas QR" (PDF A4 con todos los ítems filtrados, para
+rotular) y "📋 Ficha y checklists" / "🔳 Escanear QR", que abren la ficha del
+activo en Mantenimiento (señal `ficha_solicitada`, la conecta MainWindow).
+
 Toda llamada a la nube corre en un TareaSupabase (QThread).
 """
 
@@ -19,7 +24,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, List, Optional, Set
 
-from PySide6.QtCore import QTimer, Qt
+from PySide6.QtCore import QSize, QTimer, Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -57,6 +62,7 @@ from app.services.inventario_service import (
 from app.services.supabase_client import SupabaseConfigError, cargar_credenciales
 from app.ui import theme
 from app.ui.libro_guardia_view import DialogoCredencialesSupabase, _crear_chip, ahora_cuartel, formatear_fecha_hora
+from app.ui.qr_etiquetas import DialogoQrActivo, activos_para_etiquetas, exportar_etiquetas, qr_icono
 from app.ui.widgets import TarjetaKPI
 from app.workers.supabase_tarea import TareaSupabase
 
@@ -175,6 +181,10 @@ class DialogoItemInventario(QDialog):
 # =============================================================================
 
 class PaginaInventario(QWidget):
+    # Código QR del activo cuya ficha (con checklists) hay que abrir.
+    ficha_solicitada = Signal(str)
+    escaneo_solicitado = Signal()
+
     def __init__(self, parent: Optional[QWidget] = None,
                  cliente_factory: Callable[[], InventarioCliente] = InventarioCliente) -> None:
         super().__init__(parent)
@@ -309,12 +319,30 @@ class PaginaInventario(QWidget):
         for boton in (self.boton_nuevo, self.boton_editar, self.boton_baja):
             boton.setCursor(Qt.CursorShape.PointingHandCursor)
             acciones.addWidget(boton)
-        acciones.addWidget(self.label_solo_lectura, 1)
+        self.boton_ficha = QPushButton("📋 Ficha y checklists", contenido)
+        self.boton_ficha.setObjectName("botonLimpiar")
+        self.boton_ficha.clicked.connect(self._pedir_ficha)
+        self.boton_qr = QPushButton("🔳 Ver QR", contenido)
+        self.boton_qr.setObjectName("botonLimpiar")
+        self.boton_qr.clicked.connect(self._ver_qr)
+        self.boton_etiquetas = QPushButton("🏷️ Etiquetas QR", contenido)
+        self.boton_etiquetas.setObjectName("botonLimpiar")
+        self.boton_etiquetas.setToolTip("PDF A4 con las etiquetas de los ítems que muestra la grilla (filtros incluidos)")
+        self.boton_etiquetas.clicked.connect(self._exportar_etiquetas)
+        self.boton_escanear = QPushButton("🔳 Escanear", contenido)
+        self.boton_escanear.setObjectName("botonHerramienta")
+        self.boton_escanear.setToolTip("Pistola lectora, código a mano o cámara (Ctrl+K)")
+        self.boton_escanear.clicked.connect(self.escaneo_solicitado.emit)
+        for boton in (self.boton_ficha, self.boton_qr, self.boton_etiquetas):
+            boton.setCursor(Qt.CursorShape.PointingHandCursor)
+            acciones.addWidget(boton)
         acciones.addStretch(1)
         acciones.addWidget(self.check_bajas)
         acciones.addWidget(self.boton_configurar)
+        acciones.addWidget(self.boton_escanear)
         acciones.addWidget(self.boton_refrescar)
         layout_contenido.addLayout(acciones)
+        layout_contenido.addWidget(self.label_solo_lectura)
 
         self.tabla = QTableWidget(contenido)
         self.tabla.setColumnCount(len(COLUMNAS))
@@ -329,7 +357,9 @@ class PaginaInventario(QWidget):
         cab.setSectionResizeMode(COL_ESTADO, QHeaderView.ResizeMode.Fixed)
         theme.estilizar_tabla(self.tabla)
         self.tabla.itemSelectionChanged.connect(self._actualizar_botones)
-        self.tabla.cellDoubleClicked.connect(lambda *_: self._editar())
+        self.tabla.setIconSize(QSize(30, 30))
+        # Doble clic: el Administrador edita; el resto abre la ficha con los checklists.
+        self.tabla.cellDoubleClicked.connect(lambda *_: self._editar() if self.puede_editar else self._pedir_ficha())
         layout_contenido.addWidget(self.tabla, 1)
 
         self.label_vacio = QLabel("", contenido)
@@ -500,12 +530,14 @@ class PaginaInventario(QWidget):
         visibles = self.items_visibles()
         self.tabla.setRowCount(len(visibles))
         for fila, i in enumerate(visibles):
-            celda_codigo = QTableWidgetItem(i.codigo_qr)
+            celda_codigo = QTableWidgetItem(qr_icono(i.codigo_qr), i.codigo_qr)
             celda_codigo.setData(Qt.ItemDataRole.UserRole, i.id)
+            celda_codigo.setToolTip("Doble clic: ficha y checklists · 🔳 Ver QR: imprimir la etiqueta")
             self.tabla.setItem(fila, COL_CODIGO, celda_codigo)
             celda_nombre = QTableWidgetItem(i.nombre if i.activo else f"{i.nombre}  (BAJA)")
             celda_nombre.setToolTip("\n".join(filter(None, (
                 i.observaciones, f"Baja: {i.motivo_baja}" if i.motivo_baja else None,
+                f"⚙️ {i.motivo_estado}" if i.motivo_estado else None,
                 f"Alta: {formatear_fecha_hora(i.fecha_alta)}" + (f" por {i.creado_por}" if i.creado_por else "")))))
             if not i.activo:
                 celda_nombre.setForeground(theme_color("texto_tenue"))
@@ -540,7 +572,11 @@ class PaginaInventario(QWidget):
         fila = QHBoxLayout(contenedor)
         fila.setContentsMargins(6, 0, 6, 0)
         if item.activo:
-            chip = _crear_chip(item.estado_legible.upper(), TONO_ESTADO.get(item.estado, "neutro"))
+            texto = item.estado_legible.upper()
+            chip = _crear_chip(("⚙️ " + texto) if item.fuera_servicio_automatico else texto,
+                               TONO_ESTADO.get(item.estado, "neutro"))
+            if item.motivo_estado:
+                chip.setToolTip(item.motivo_estado)
         else:
             chip = _crear_chip("DADO DE BAJA", "neutro")
         fila.addWidget(chip, 0, Qt.AlignmentFlag.AlignCenter)
@@ -565,6 +601,9 @@ class PaginaInventario(QWidget):
     def _actualizar_botones(self) -> None:
         item = self.item_seleccionado()
         editable = self.puede_editar and item is not None and item.activo
+        self.boton_ficha.setEnabled(item is not None and item.activo)
+        self.boton_qr.setEnabled(item is not None)
+        self.boton_etiquetas.setEnabled(any(i.activo for i in self.items_visibles()))
         self.boton_editar.setEnabled(editable)
         self.boton_baja.setEnabled(editable)
         self.boton_nuevo.setEnabled(self.puede_editar and not self._sin_credenciales)
@@ -619,6 +658,21 @@ class PaginaInventario(QWidget):
             lambda _r: self._al_terminar(f"«{item.nombre}» dado de baja.", None),
             lambda msg: self._al_fallar("No se pudo dar de baja", msg),
         )
+
+    # -- QR -------------------------------------------------------------------------
+
+    def _pedir_ficha(self) -> None:
+        item = self.item_seleccionado()
+        if item is not None and item.activo:
+            self.ficha_solicitada.emit(item.codigo_qr)
+
+    def _ver_qr(self) -> None:
+        item = self.item_seleccionado()
+        if item is not None:
+            DialogoQrActivo(item.codigo_qr, item.nombre, item.ubicacion, self).exec()
+
+    def _exportar_etiquetas(self) -> None:
+        exportar_etiquetas(self, activos_para_etiquetas(i for i in self.items_visibles() if i.activo))
 
     def _al_terminar(self, texto: str, seleccionar: Optional[str]) -> None:
         self._aviso_pendiente = texto[:70]

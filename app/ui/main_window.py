@@ -411,6 +411,39 @@ class MainWindow(QMainWindow):
 
         self._stack.currentChanged.connect(self._on_pagina_cambiada)
         self._aplicar_permisos()
+        self._configurar_qr()
+
+    # -- Códigos QR de los activos ------------------------------------------------
+
+    def _configurar_qr(self) -> None:
+        """Pistola lectora USB (fuera de los campos de texto), Ctrl+K y los
+        accesos de Inventario: todo termina en la ficha del activo con sus
+        checklists de mantenimiento."""
+        from PySide6.QtGui import QKeySequence, QShortcut
+
+        from app.ui.qr_escaner import LectorPistolaQr
+
+        self._lector_qr = LectorPistolaQr(self)
+        self._lector_qr.codigo_leido.connect(self._abrir_activo_por_codigo)
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self._lector_qr)
+        atajo = QShortcut(QKeySequence("Ctrl+K"), self)
+        atajo.activated.connect(self._escanear_qr)
+        self._pagina_inventario.ficha_solicitada.connect(self._abrir_activo_por_codigo)
+        self._pagina_inventario.escaneo_solicitado.connect(self._escanear_qr)
+
+    def _escanear_qr(self) -> None:
+        from app.ui.qr_escaner import pedir_codigo_qr
+
+        codigo = pedir_codigo_qr(self)
+        if codigo:
+            self._abrir_activo_por_codigo(codigo)
+
+    def _abrir_activo_por_codigo(self, codigo: str) -> None:
+        theme.set_tono(self.statusBar(), "info")
+        self.statusBar().showMessage(f"🔳 Código leído: {codigo}", 5000)
+        self._pagina_mantenimiento.abrir_por_codigo(codigo)
 
     def _crear_barra_institucional(self) -> QFrame:
         barra = QFrame(self)
@@ -450,8 +483,18 @@ class MainWindow(QMainWindow):
         self._chip_operador.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._chip_operador.setCursor(Qt.CursorShape.PointingHandCursor)
         self._chip_operador.clicked.connect(self._on_chip_operador)
+        # Acceso directo a la búsqueda por QR (también Ctrl+K y la pistola lectora).
+        self._chip_escanear = ChipClickable("🔳 Escanear QR", barra)
+        self._chip_escanear.setObjectName("chip")
+        self._chip_escanear.setFixedHeight(24)
+        self._chip_escanear.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._chip_escanear.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._chip_escanear.setToolTip("Escanear / buscar un activo por su QR (Ctrl+K). La pistola lectora USB "
+                                       "funciona desde cualquier sección.")
+        theme.set_tono(self._chip_escanear, "info")
+        self._chip_escanear.clicked.connect(self._escanear_qr)
         for chip in (self._chip_borrador, self._chip_semaforo, self._chip_padron, self._chip_ruba,
-                     self._chip_operador):
+                     self._chip_escanear, self._chip_operador):
             layout.addWidget(chip, 0, Qt.AlignmentFlag.AlignVCenter)
         self._chip_borrador.setVisible(False)
         self._chip_semaforo.setVisible(False)

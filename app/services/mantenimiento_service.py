@@ -244,6 +244,23 @@ def plantilla_desde_fila(fila: Mapping[str, Any]) -> TareaPlantilla:
 
 
 @dataclass(frozen=True)
+class FichaActivo:
+    """Lo que se abre al escanear un QR: el activo, su evaluación y sus tareas."""
+    item: Any                            # app.services.inventario_service.ItemInventario
+    estado: Optional[EstadoItem]         # None si el ítem no tiene tareas de mantenimiento
+    tareas: List[TareaItem]
+
+    def resumen(self, frecuencia: str) -> Optional[ResumenFrecuencia]:
+        return self.estado.resumen(frecuencia) if self.estado else None
+
+    @property
+    def frecuencia_mas_urgente(self) -> Optional[str]:
+        """La cadencia a revisar primero (falla > vencida > pendiente > por vencer)."""
+        candidatas = [(GRAVEDAD[r.estado], f) for f in FRECUENCIAS if (r := self.resumen(f)) and r.estado != AL_DIA]
+        return max(candidatas)[1] if candidatas else None
+
+
+@dataclass(frozen=True)
 class ResultadoChecklist:
     registro_id: str
     resultado: str
@@ -340,6 +357,23 @@ class MantenimientoCliente(ClienteSupabaseRest):
         if item_id:
             params["item_id"] = f"eq.{item_id}"
         return [registro_desde_fila(f) for f in self._pedir("GET", "vw_mantenimiento_historial", params=params) or []]
+
+    def ficha_por_codigo(self, codigo: str) -> FichaActivo:
+        """Busca el activo por su código QR (exacto, ya normalizado)."""
+        from app.services.inventario_service import item_desde_fila
+
+        filas = self._pedir("GET", "vw_inventario_cuartel", params={
+            "select": "*", "codigo_qr": f"eq.{codigo}", "limit": "1"}) or []
+        if not filas:
+            raise MantenimientoError(f"No hay ningún activo con el código {codigo}.")
+        item = item_desde_fila(filas[0])
+        if not item.activo:
+            raise MantenimientoError(f"El activo {codigo} («{item.nombre}») está dado de baja"
+                                     + (f": {item.motivo_baja}" if item.motivo_baja else "."))
+        estados = self._pedir("GET", "vw_mantenimiento_items", params={
+            "select": "*", "id": f"eq.{item.id}", "limit": "1"}) or []
+        return FichaActivo(item=item, estado=estado_item_desde_fila(estados[0]) if estados else None,
+                           tareas=self.tareas_item(item.id))
 
     def detalle_registro(self, registro_id: str) -> List[Dict[str, Any]]:
         return self._pedir("GET", "mantenimiento_registro_tareas", params={

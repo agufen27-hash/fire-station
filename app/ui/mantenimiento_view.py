@@ -73,6 +73,7 @@ from app.services.mantenimiento_service import (
     TONO_RESULTADO,
     VENCIDA,
     EstadoItem,
+    FichaActivo,
     MantenimientoCliente,
     RegistroHistorial,
     ResultadoChecklist,
@@ -699,6 +700,167 @@ class DialogoPlantillas(QDialog, _ConTareas):
 
 
 # =============================================================================
+# Ficha del activo (lo que se abre al escanear un QR)
+# =============================================================================
+
+class DialogoFichaActivo(QDialog, _ConTareas):
+    """Datos del activo, su QR y una fila por cadencia con el estado y el botón
+    para completar la revisión en el momento (la más urgente, resaltada)."""
+
+    def __init__(self, ficha: FichaActivo, cliente_factory: Callable[[], MantenimientoCliente],
+                 operador_id: Optional[int], operador_nombre: str, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._init_tareas()
+        self._cliente_factory = cliente_factory
+        self._operador_id = operador_id
+        self._operador_nombre = operador_nombre
+        self.hubo_cambios = False
+        self.setWindowTitle(f"Ficha del activo · {ficha.item.codigo_qr}")
+        self.setMinimumWidth(720)
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(20, 18, 20, 16)
+        self._layout.setSpacing(12)
+        self._contenido: Optional[QWidget] = None
+        self._mostrar(ficha)
+
+    def _mostrar(self, ficha: FichaActivo) -> None:
+        from app.ui.qr_etiquetas import DialogoQrActivo, qr_pixmap
+
+        self.ficha = ficha
+        if self._contenido is not None:
+            self._layout.removeWidget(self._contenido)
+            self._contenido.deleteLater()
+        contenido = self._contenido = QWidget(self)
+        layout = QVBoxLayout(contenido)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+        item = ficha.item
+
+        cabecera = QHBoxLayout()
+        qr = QPushButton(contenido)
+        qr.setIcon(qr_pixmap(item.codigo_qr, 120))
+        qr.setIconSize(qr_pixmap(item.codigo_qr, 120).size())
+        qr.setFlat(True)
+        qr.setCursor(Qt.CursorShape.PointingHandCursor)
+        qr.setToolTip("Ver / imprimir el QR")
+        qr.clicked.connect(lambda: DialogoQrActivo(item.codigo_qr, item.nombre, item.ubicacion, self).exec())
+        cabecera.addWidget(qr, 0, Qt.AlignmentFlag.AlignTop)
+        datos = QVBoxLayout()
+        nombre = QLabel(item.nombre, contenido)
+        nombre.setObjectName("pageTitle")
+        nombre.setWordWrap(True)
+        datos.addWidget(nombre)
+        detalle = QLabel(" · ".join(filter(None, (item.codigo_qr, item.categoria_legible, item.ubicacion,
+                                                  item.marca_modelo, f"Serie {item.numero_serie}"
+                                                  if item.numero_serie else None))), contenido)
+        detalle.setObjectName("pageSubtitle")
+        detalle.setWordWrap(True)
+        datos.addWidget(detalle)
+        fila_estado = QHBoxLayout()
+        texto_estado = ESTADOS_INVENTARIO.get(item.estado, item.estado).upper()
+        if item.fuera_servicio_automatico:
+            texto_estado = "⚙️ " + texto_estado + " (mantenimiento)"
+        fila_estado.addWidget(_crear_chip(texto_estado, TONO_ESTADO_INVENTARIO.get(item.estado, "neutro"), contenido))
+        if ficha.estado is not None and ficha.estado.estado_general not in ("OPERATIVO", item.estado):
+            fila_estado.addWidget(_crear_chip(ESTADOS_GENERALES[ficha.estado.estado_general].upper(),
+                                              TONO_ESTADO_GENERAL[ficha.estado.estado_general], contenido))
+        fila_estado.addStretch(1)
+        datos.addLayout(fila_estado)
+        if item.motivo_estado or (ficha.estado and ficha.estado.motivos):
+            motivos = item.motivo_estado or "; ".join(f"{m.get('titulo')} ({m.get('estado', '').lower()})"
+                                                     for m in ficha.estado.motivos)
+            label = QLabel(f"⚠️ {motivos}", contenido)
+            label.setObjectName("ayudaSeccion")
+            label.setWordWrap(True)
+            datos.addWidget(label)
+        datos.addStretch(1)
+        cabecera.addLayout(datos, 1)
+        layout.addLayout(cabecera)
+
+        sub = QLabel("CHECKLISTS DE MANTENIMIENTO", contenido)
+        sub.setObjectName("subtituloBloque")
+        layout.addWidget(sub)
+        urgente = ficha.frecuencia_mas_urgente
+        self.botones_revision: Dict[str, QPushButton] = {}
+        for frecuencia in FRECUENCIAS:
+            layout.addWidget(self._fila_cadencia(ficha, frecuencia, urgente, contenido))
+        if ficha.estado is None:
+            vacio = QLabel("Este activo no tiene tareas de mantenimiento: un Administrador puede asignarlas en "
+                           "Mantenimiento → ⚙️ Plantillas (por categoría o para este ítem).", contenido)
+            vacio.setObjectName("ayudaSeccion")
+            vacio.setWordWrap(True)
+            layout.addWidget(vacio)
+        if self._operador_id is None:
+            aviso = QLabel("👤 Para firmar una revisión identificate con el chip de la barra superior.", contenido)
+            aviso.setObjectName("ayudaSeccion")
+            layout.addWidget(aviso)
+
+        botones = QHBoxLayout()
+        historial = QPushButton("📜 Historial", contenido)
+        historial.setObjectName("botonLimpiar")
+        historial.clicked.connect(lambda: DialogoHistorial(self._cliente_factory, ficha.estado, self).exec()
+                                  if ficha.estado else None)
+        historial.setEnabled(ficha.estado is not None)
+        botones.addWidget(historial)
+        botones.addStretch(1)
+        cerrar = QPushButton("Cerrar", contenido)
+        cerrar.clicked.connect(self.accept)
+        botones.addWidget(cerrar)
+        layout.addLayout(botones)
+        self._layout.addWidget(contenido)
+
+    def _fila_cadencia(self, ficha: FichaActivo, frecuencia: str, urgente: Optional[str], parent: QWidget) -> QFrame:
+        marco = QFrame(parent)
+        marco.setObjectName("seccionFormulario")
+        fila = QHBoxLayout(marco)
+        fila.setContentsMargins(12, 8, 12, 8)
+        icono = QLabel(f"{ICONOS_FRECUENCIA[frecuencia]}  {FRECUENCIAS[frecuencia]}", marco)
+        icono.setObjectName("preguntaConmutable")
+        icono.setMinimumWidth(130)
+        fila.addWidget(icono)
+        resumen = ficha.resumen(frecuencia)
+        if resumen is None:
+            texto = QLabel("Sin tareas", marco)
+            texto.setObjectName("ayudaSeccion")
+            fila.addWidget(texto, 1)
+            return marco
+        fila.addWidget(_crear_chip(ESTADOS_TAREA[resumen.estado].upper(), TONO_ESTADO_TAREA[resumen.estado], marco))
+        texto = QLabel(f"{resumen.total} tarea(s) · última {formatear_fecha_hora(resumen.ultima_revision)} · "
+                       f"vence {formatear_fecha_hora(resumen.proximo_vencimiento)}", marco)
+        texto.setObjectName("ayudaSeccion")
+        texto.setWordWrap(True)
+        fila.addWidget(texto, 1)
+        boton = QPushButton("✅ Completar" if frecuencia == urgente else "Revisar", marco)
+        boton.setObjectName("botonPrimarioRojo" if frecuencia == urgente else "botonLimpiar")
+        boton.setCursor(Qt.CursorShape.PointingHandCursor)
+        boton.setEnabled(self._operador_id is not None)
+        boton.clicked.connect(lambda _=False, f=frecuencia: self.completar(f))
+        self.botones_revision[frecuencia] = boton
+        fila.addWidget(boton)
+        return marco
+
+    def completar(self, frecuencia: str) -> None:
+        if self._operador_id is None or self.ficha.estado is None:
+            return
+        operador, item = self._operador_id, self.ficha.estado
+        dialogo = DialogoChecklist(
+            item, frecuencia, self.ficha.tareas, self._operador_nombre or f"operador {operador}",
+            lambda resp, obs, general: self._cliente_factory().registrar(operador, item.id, frecuencia, resp, obs,
+                                                                          general),
+            self)
+        if dialogo.exec() != QDialog.DialogCode.Accepted or dialogo.resultado is None:
+            return
+        self.hubo_cambios = True
+        r = dialogo.resultado
+        if r.cambio_estado:
+            QMessageBox.warning(self, "Cambio de estado", f"«{item.nombre}» quedó "
+                                f"{ESTADOS_INVENTARIO.get(r.estado_item, r.estado_item).upper()}.")
+        codigo = self.ficha.item.codigo_qr
+        self._ejecutar(lambda: self._cliente_factory().ficha_por_codigo(codigo), self._mostrar,
+                       lambda msg: QMessageBox.warning(self, "No se pudo actualizar la ficha", msg))
+
+
+# =============================================================================
 # Página
 # =============================================================================
 
@@ -835,7 +997,11 @@ class PaginaMantenimiento(QWidget, _ConTareas):
         self.boton_refrescar = QPushButton("⟳ Actualizar", contenido)
         self.boton_refrescar.setObjectName("botonHerramienta")
         self.boton_refrescar.clicked.connect(self.refrescar)
-        for boton in (self.boton_completar, self.boton_historial, self.boton_plantillas):
+        self.boton_escanear = QPushButton("🔳 Escanear QR", contenido)
+        self.boton_escanear.setObjectName("botonPrimarioAzul")
+        self.boton_escanear.setToolTip("Pistola lectora, código a mano o cámara (Ctrl+K desde cualquier sección)")
+        self.boton_escanear.clicked.connect(self.escanear)
+        for boton in (self.boton_completar, self.boton_escanear, self.boton_historial, self.boton_plantillas):
             boton.setCursor(Qt.CursorShape.PointingHandCursor)
             acciones.addWidget(boton)
         acciones.addStretch(1)
@@ -1110,6 +1276,34 @@ class PaginaMantenimiento(QWidget, _ConTareas):
         else:
             self._set_chip(f"✅ {texto}", "ok")
         self.refrescar()
+
+    # -- QR ---------------------------------------------------------------------------
+
+    def escanear(self) -> None:
+        from app.ui.qr_escaner import pedir_codigo_qr
+
+        codigo = pedir_codigo_qr(self)
+        if codigo:
+            self.abrir_por_codigo(codigo)
+
+    def abrir_por_codigo(self, codigo: str) -> None:
+        """Busca el activo del QR y abre su ficha con los checklists (MainWindow lo
+        llama también al leer una pistola desde cualquier sección)."""
+        if self._sin_credenciales or self._faltan_credenciales():
+            QMessageBox.information(self, "Sin conexión con la nube",
+                                    "Configurá la conexión con Supabase para buscar activos por QR.")
+            return
+        self._set_chip(f"🔳 Buscando {codigo}…", "neutro")
+        self._ejecutar(lambda: self._cliente_factory().ficha_por_codigo(codigo), self._abrir_ficha,
+                       lambda msg: (self._set_chip("🔳 Código no encontrado", "alerta", msg),
+                                    QMessageBox.warning(self, f"Código {codigo}", msg)))
+
+    def _abrir_ficha(self, ficha: FichaActivo) -> None:
+        self._set_chip(f"🔳 {ficha.item.codigo_qr}", "ok")
+        dialogo = DialogoFichaActivo(ficha, self._cliente_factory, self._operador_id, self._operador_nombre, self)
+        dialogo.exec()
+        if dialogo.hubo_cambios:
+            self.refrescar()
 
     def _abrir_historial(self) -> None:
         DialogoHistorial(self._cliente_factory, self.item_seleccionado(), self).exec()
