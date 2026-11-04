@@ -1,11 +1,12 @@
 """
-Ventana principal de Fire Station: dashboard con sidebar lateral (9 módulos),
+Ventana principal de Fire Station: dashboard con sidebar lateral (10 módulos),
 barra institucional superior con el nombre de la sección activa, y un
 QStackedWidget de páginas -- Inicio, Nueva Salida (formulario operativo de
 guardia, con dotaciones dinámicas y firma electrónica), Historial de
 Salidas, Cartografía Táctica, Personal y Unidades (CRUD), Libro de Guardia
 (bitácora de viajes y asistencias en Supabase), Inventario (ABM de activos,
-edición solo para ADMIN), Documentación
+edición solo para ADMIN), Mantenimiento (checklists preventivos por cadencia),
+Documentación
 (legajos con acceso por PIN) y Configuración (Fase 6 y Fase 7).
 """
 
@@ -120,6 +121,7 @@ from app.ui.participacion_widgets import HorarioServicio, SelectorBombero
 from app.ui.bomberos_view import importar_bomberos_desde_excel
 from app.ui.libro_guardia_view import PaginaLibroGuardia
 from app.ui.inventario_view import PaginaInventario
+from app.ui.mantenimiento_view import PaginaMantenimiento
 from app.ui.personnel_window import BotonSyncCloud, LegajoPrivadoWidget
 from app.ui import theme
 from app.ui.map_dialog import DialogoMarcarMapa, parsear_par
@@ -153,8 +155,9 @@ IDX_MAPA = 3
 IDX_DOTACIONES = 4
 IDX_LIBRO_GUARDIA = 5
 IDX_INVENTARIO = 6
-IDX_DOCUMENTACION = 7
-IDX_CONFIGURACION = 8
+IDX_MANTENIMIENTO = 7
+IDX_DOCUMENTACION = 8
+IDX_CONFIGURACION = 9
 
 # Estado reactivo: chequeo de internet cada 4 min (en un QThread) y retardo
 # para agrupar los avisos del QFileSystemWatcher del padrón.
@@ -188,6 +191,7 @@ ITEMS_NAV = [
     (IDX_DOTACIONES, "🚒  Personal y Unidades"),
     (IDX_LIBRO_GUARDIA, "📒  Libro de Guardia"),
     (IDX_INVENTARIO, "🧰  Inventario"),
+    (IDX_MANTENIMIENTO, "🛠️  Mantenimiento"),
     (IDX_DOCUMENTACION, "📁  Documentación"),
     (IDX_CONFIGURACION, "⚙️  Configuración"),
 ]
@@ -223,6 +227,7 @@ NOMBRES_SECCION = {
     IDX_DOTACIONES: "PERSONAL Y UNIDADES",
     IDX_LIBRO_GUARDIA: "LIBRO DE GUARDIA",
     IDX_INVENTARIO: "INVENTARIO",
+    IDX_MANTENIMIENTO: "MANTENIMIENTO",
     IDX_DOCUMENTACION: "DOCUMENTACIÓN",
     IDX_CONFIGURACION: "CONFIGURACIÓN",
 }
@@ -386,6 +391,7 @@ class MainWindow(QMainWindow):
         self._pagina_dotaciones = self._crear_pagina_dotaciones()
         self._pagina_libro_guardia = PaginaLibroGuardia(self)
         self._pagina_inventario = PaginaInventario(self)
+        self._pagina_mantenimiento = PaginaMantenimiento(self)
         self._pagina_documentacion = self._crear_pagina_documentacion()
         self._pagina_configuracion = self._crear_pagina_configuracion()
 
@@ -397,6 +403,7 @@ class MainWindow(QMainWindow):
             self._pagina_dotaciones,
             self._pagina_libro_guardia,
             self._pagina_inventario,
+            self._pagina_mantenimiento,
             self._pagina_documentacion,
             self._pagina_configuracion,
         ):
@@ -603,6 +610,8 @@ class MainWindow(QMainWindow):
             self._pagina_libro_guardia.refrescar()
         elif indice == IDX_INVENTARIO:
             self._pagina_inventario.refrescar()
+        elif indice == IDX_MANTENIMIENTO:
+            self._pagina_mantenimiento.refrescar()
         elif indice == IDX_DOCUMENTACION:
             self._cargar_pagina_documentacion()
         elif indice == IDX_CONFIGURACION:
@@ -3006,6 +3015,8 @@ class MainWindow(QMainWindow):
         self._boton_sync_cloud.set_rol(rol)
         # Inventario: alta / edición / baja solo con un operador ADMIN identificado.
         self._pagina_inventario.set_operador(self._operador_id, rol)
+        # Mantenimiento: cualquier operador identificado firma revisiones; plantillas solo ADMIN.
+        self._pagina_mantenimiento.set_operador(self._operador_id, rol, self._operador_nombre)
 
         puede_abm = self._permisos.editar_padron
         for boton in self._botones_abm:
