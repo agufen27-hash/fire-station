@@ -12,7 +12,7 @@
 //             text "QR:XXXX" / token -> rpc_registrar_token_wa (evento con token)
 //             text "VIAJE <destino> EN <vehículo>" -> rpc_registrar_viaje (libro de guardia;
 //                                    el trigger avisa al grupo OPERATIVO y a Alerthor)
-//             text "REGRESO HH:MM" / "HH:MM" -> rpc_cerrar_viaje (día anclado a la salida)
+//             text "REGRESO HH:MM" / "HH:MM" -> rpc_cerrar_viaje (hora de hoy, entre salida y ahora)
 //             text "SI" / "REGRESO" con viaje abierto -> pide la hora de llegada
 //             text normal         -> saludo + ayuda
 //
@@ -380,10 +380,11 @@ function textoMotivo(r: RpcResult): string {
     case "HORA_INVALIDA":
       return "❌ Hora no válida. Usá el formato *REGRESO HH:MM* (ej. REGRESO 18:30).";
     case "LLEGADA_ANTERIOR_A_SALIDA":
-      return `❌ La llegada no puede ser anterior a la salida (${horaLocal(new Date(r.fecha_salida))}). ` +
-        `El día queda fijo en el de salida (${diaLocal(new Date(r.fecha_salida))}); indicá una hora posterior.`;
+      return `❌ La llegada (${horaLocal(new Date(r.llegada_propuesta))}) no puede ser anterior a la salida ` +
+        `(${horaLocal(new Date(r.fecha_salida))}). La hora se toma con el día de hoy.`;
     case "LLEGADA_EN_EL_FUTURO":
-      return "❌ Esa hora todavía no pasó. Indicá la hora real de llegada.";
+      return `❌ La llegada (${horaLocal(new Date(r.llegada_propuesta))}) es posterior al momento actual. ` +
+        "La hora se toma con el día de hoy: indicá una hora que ya haya pasado.";
     default:
       return MSG_ERROR;
   }
@@ -538,7 +539,7 @@ async function manejarTexto(p: PersonalRow, msg: WaMessage): Promise<Contenido> 
       const salida = new Date(v.fecha_salida);
       return texto(
         `Indicá la hora de llegada desde *${v.destino}*, por ejemplo *REGRESO 18:30*.\n` +
-          `El día queda fijo en ${diaLocal(salida)} (salida ${soloHora(salida)}); solo se puede elegir la hora.`,
+          `Se toma el día de hoy; tiene que ser posterior a la salida (${horaLocal(salida)}) y no futura.`,
       );
     }
     if (!/^s[ií]$/i.test(sinHora[1])) return texto(textoMotivo({ motivo: "SIN_VIAJE_ABIERTO" }));
