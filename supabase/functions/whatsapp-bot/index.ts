@@ -9,6 +9,8 @@
 //   WHATSAPP_VERIFY_TOKEN      (secret propio)  token elegido al configurar el webhook en Meta
 //   WHATSAPP_APP_SECRET        (secret propio, opcional) App Secret de Meta para validar
 //                              la firma X-Hub-Signature-256. Si no está, se loguea un aviso.
+//   WHATSAPP_ACCESS_TOKEN      (secret propio) token de la app de Meta para la Graph API
+//   WHATSAPP_PHONE_ID          (secret propio) Phone Number ID del número del bot
 //   SUPABASE_URL               (inyectada por Supabase)
 //   SUPABASE_SERVICE_ROLE_KEY  (inyectada por Supabase)
 //
@@ -25,6 +27,12 @@ const VERIFY_TOKEN = Deno.env.get("WHATSAPP_VERIFY_TOKEN") ?? "";
 const APP_SECRET = Deno.env.get("WHATSAPP_APP_SECRET") ?? "";
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
 const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
+const ACCESS_TOKEN = Deno.env.get("WHATSAPP_ACCESS_TOKEN") ?? "";
+const PHONE_ID = Deno.env.get("WHATSAPP_PHONE_ID") ?? "";
+const GRAPH_URL = "https://graph.facebook.com/v26.0";
+
+// Runtime de Supabase: permite seguir trabajando después de responder.
+declare const EdgeRuntime: { waitUntil(p: Promise<unknown>): void } | undefined;
 
 const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, {
   auth: { persistSession: false, autoRefreshToken: false },
@@ -148,26 +156,82 @@ function handleVerify(url: URL): Response {
 }
 
 // -----------------------------------------------------------------------------
+// Respuestas salientes (Graph API de Meta)
+// -----------------------------------------------------------------------------
+const MSG_DENEGADO = "Acceso denegado. Este número no está registrado en el padrón del cuartel.";
+
+/** "Bombero" / "Cabo" ... ; capitaliza si viene todo en mayúsculas. */
+function capitalizar(s: string): string {
+  if (s !== s.toUpperCase()) return s; // ya tiene mayúsculas/minúsculas mixtas
+  return s.toLowerCase().replace(/(^|[\s'-])(\p{L})/gu, (_m, sep, c) => sep + c.toUpperCase());
+}
+
+/** nombre_completo tiene formato "APELLIDO, Nombre" -> "Apellido". */
+function apellidoDe(nombreCompleto: string): string {
+  return capitalizar(nombreCompleto.split(",")[0].trim());
+}
+
+function saludo(p: PersonalRow): string {
+  const grado = p.jerarquia?.trim() ? capitalizar(p.jerarquia.trim()) + " " : "";
+  return `Hola, ${grado}${apellidoDe(p.nombre_completo)}. Sistema FireStation en línea. ¿En qué te puedo ayudar?`;
+}
+
+async function postGraph(to: string, body: string): Promise<{ ok: boolean; status: number; data: any }> {
+  const res = await fetch(`${GRAPH_URL}/${PHONE_ID}/messages`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${ACCESS_TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      messaging_product: "whatsapp",
+      recipient_type: "individual",
+      to,
+      type: "text",
+      text: { preview_url: false, body },
+    }),
+  });
+  const data = await res.json().catch(() => ({}));
+  return { ok: res.ok, status: res.status, data };
+}
+
+/**
+ * Envía un texto al remitente. Peculiaridad de Argentina: Meta entrega el
+ * wa_id como '549...' pero a veces solo acepta enviar a '54...' (sin el 9),
+ * p.ej. con la lista de destinatarios de prueba (error 131030). Se reintenta
+ * una vez sin el 9.
+ */
+async function enviarTexto(to: string, body: string): Promise<void> {
+  if (!ACCESS_TOKEN || !PHONE_ID) {
+    console.error("[whatsapp-bot] Faltan WHATSAPP_ACCESS_TOKEN / WHATSAPP_PHONE_ID: no se responde");
+    return;
+  }
+  let r = await postGraph(to, body);
+  if (!r.ok && r.data?.error?.code === 131030 && to.startsWith("549")) {
+    r = await postGraph(`54${to.slice(3)}`, body);
+  }
+  if (r.ok) {
+    console.log(`[whatsapp-bot] Respuesta enviada a ${mask(`+${to}`)} (wamid ${r.data?.messages?.[0]?.id ?? "?"})`);
+  } else {
+    const e = r.data?.error ?? {};
+    console.error(`[whatsapp-bot] Graph API ${r.status}: code=${e.code} ${e.message ?? JSON.stringify(r.data)}`);
+  }
+}
+
+// -----------------------------------------------------------------------------
 // POST: mensajes entrantes
 // -----------------------------------------------------------------------------
-async function handleMessage(req: Request): Promise<Response> {
+async function procesarWebhook(raw: string, firma: string | null): Promise<void> {
   try {
-    const raw = await req.text();
-
     if (!APP_SECRET) {
       console.warn("[whatsapp-bot] WHATSAPP_APP_SECRET no configurado: firma sin validar");
-    } else if (!(await firmaValida(raw, req.headers.get("x-hub-signature-256")))) {
+    } else if (!(await firmaValida(raw, firma))) {
       console.warn("[whatsapp-bot] Firma X-Hub-Signature-256 inválida: payload descartado");
-      return ok();
+      return;
     }
 
     const payload = JSON.parse(raw) as WaWebhookPayload;
     const msg = payload.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
 
-    if (!msg) {
-      // Notificaciones de estado (sent/delivered/read) u otros eventos sin mensaje.
-      return ok();
-    }
+    // Notificaciones de estado (sent/delivered/read) u otros eventos sin mensaje.
+    if (!msg) return;
 
     const from = msg.from;
     const texto = extraerTexto(msg);
@@ -181,27 +245,45 @@ async function handleMessage(req: Request): Promise<Response> {
       .maybeSingle<PersonalRow>();
 
     if (error) {
+      // Error de base: no se responde "denegado" a alguien que quizá sí está en el padrón.
       console.error(`[whatsapp-bot] Error consultando personal_cloud: ${error.code} ${error.message}`);
-      return ok();
+      return;
     }
 
     if (!data) {
       console.log(`[whatsapp-bot] RECHAZADO ${mask(`+${from}`)}: no pertenece al cuartel | texto="${texto}"`);
+      await enviarTexto(from, MSG_DENEGADO);
     } else if (!data.activo) {
       console.log(
         `[whatsapp-bot] RECHAZADO ${mask(`+${from}`)}: ${data.nombre_completo} está INACTIVO (rol ${data.rol})`,
       );
+      await enviarTexto(from, MSG_DENEGADO);
     } else {
       console.log(
         `[whatsapp-bot] AUTORIZADO ${mask(`+${from}`)}: ${data.jerarquia ?? ""} ${data.nombre_completo} ` +
           `(id ${data.id}, rol ${data.rol}) | tipo=${msg.type} texto="${texto}"`,
       );
+      await enviarTexto(from, saludo(data));
     }
   } catch (err) {
     console.error("[whatsapp-bot] Error procesando el webhook:", err instanceof Error ? err.message : err);
   }
+}
 
-  // SIEMPRE 200 para que Meta no reintente.
+async function handleMessage(req: Request): Promise<Response> {
+  let raw = "";
+  try {
+    raw = await req.text();
+  } catch (err) {
+    console.error("[whatsapp-bot] No se pudo leer el body:", err instanceof Error ? err.message : err);
+    return ok();
+  }
+
+  // Se responde 200 a Meta de inmediato; la consulta y el envío siguen en segundo plano.
+  const tarea = procesarWebhook(raw, req.headers.get("x-hub-signature-256"));
+  if (typeof EdgeRuntime !== "undefined") EdgeRuntime.waitUntil(tarea);
+  else await tarea; // fallback (p.ej. `deno run` local)
+
   return ok();
 }
 
