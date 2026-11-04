@@ -10,6 +10,10 @@
 //                                    · dentro y con ingreso abierto -> egreso
 //             interactive (botón) -> rpc_confirmar_boton_wa (registra el ingreso)
 //             text "QR:XXXX" / token -> rpc_registrar_token_wa (evento con token)
+//             text "VIAJE <destino> EN <vehículo>" -> rpc_registrar_viaje (libro de guardia;
+//                                    el trigger avisa al grupo OPERATIVO y a Alerthor)
+//             text "REGRESO HH:MM" / "HH:MM" -> rpc_cerrar_viaje (día anclado a la salida)
+//             text "SI" / "REGRESO" con viaje abierto -> pide la hora de llegada
 //             text normal         -> saludo + ayuda
 //
 // Variables de entorno:
@@ -155,6 +159,17 @@ function horaLocal(d = new Date()): string {
   }).format(d);
 }
 
+/** Solo el día local, p.ej. "04/11". */
+function diaLocal(d: Date): string {
+  return new Intl.DateTimeFormat("es-AR", { timeZone: TZ, day: "2-digit", month: "2-digit" }).format(d);
+}
+
+/** Solo la hora local, p.ej. "21:35". */
+function soloHora(d: Date): string {
+  return new Intl.DateTimeFormat("es-AR", { timeZone: TZ, hour: "2-digit", minute: "2-digit", hour12: false })
+    .format(d);
+}
+
 function duracion(min: number | null | undefined): string {
   const m = Math.max(0, Math.floor(Number(min ?? 0)));
   const h = Math.floor(m / 60);
@@ -298,7 +313,9 @@ async function enviar(to: string, contenido: Contenido): Promise<void> {
 // -----------------------------------------------------------------------------
 const MSG_DENEGADO = "Acceso denegado. Este número no está registrado en el padrón del cuartel.";
 const MSG_AYUDA = "📍 Para fichar, enviá tu *ubicación actual* desde el cuartel.\n" +
-  "🔑 Para un evento con código, enviá *QR:CODIGO* (ej. QR:AB12CD).";
+  "🔑 Para un evento con código, enviá *QR:CODIGO* (ej. QR:AB12CD).\n" +
+  "🚒 Para registrar un viaje: *VIAJE Río Cuarto EN M-12*.\n" +
+  "🏁 Para marcar el regreso: *REGRESO 18:30*.";
 const MSG_ERROR = "⚠️ No pude procesar tu solicitud en este momento. Probá de nuevo en unos minutos.";
 
 /** "Bombero" / "Cabo" ... ; capitaliza si viene todo en mayúsculas. */
@@ -352,6 +369,21 @@ function textoMotivo(r: RpcResult): string {
       return `ℹ️ Ya registraste tu asistencia completa a${r.descripcion ? ` "${r.descripcion}"` : "l evento"}.`;
     case "BOMBERO_NO_REGISTRADO_O_INACTIVO":
       return MSG_DENEGADO;
+    case "YA_TIENE_VIAJE_ABIERTO":
+      return `ℹ️ Ya tenés un viaje abierto${r.destino ? ` hacia ${r.destino}` : ""}` +
+        `${r.fecha_salida ? ` (salida ${horaLocal(new Date(r.fecha_salida))})` : ""}. ` +
+        "Marcá el regreso con *REGRESO HH:MM* antes de registrar otro.";
+    case "DATOS_INCOMPLETOS":
+      return "❌ Faltan datos. Formato: *VIAJE <destino> EN <vehículo>* (ej. VIAJE Río Cuarto EN M-12).";
+    case "SIN_VIAJE_ABIERTO":
+      return "ℹ️ No tenés ningún viaje abierto.";
+    case "HORA_INVALIDA":
+      return "❌ Hora no válida. Usá el formato *REGRESO HH:MM* (ej. REGRESO 18:30).";
+    case "LLEGADA_ANTERIOR_A_SALIDA":
+      return `❌ La llegada no puede ser anterior a la salida (${horaLocal(new Date(r.fecha_salida))}). ` +
+        `El día queda fijo en el de salida (${diaLocal(new Date(r.fecha_salida))}); indicá una hora posterior.`;
+    case "LLEGADA_EN_EL_FUTURO":
+      return "❌ Esa hora todavía no pasó. Indicá la hora real de llegada.";
     default:
       return MSG_ERROR;
   }
@@ -434,11 +466,83 @@ const RE_QR = /^\s*QR\s*[:\-]\s*([A-Za-z0-9]{4,32})\s*$/i;
 /** Código suelto: 6-32 alfanuméricos con al menos una letra y un dígito (no confunde "Hola"). */
 const RE_TOKEN_SUELTO = /^(?=.*\d)(?=.*[A-Za-z])[A-Za-z0-9]{6,32}$/;
 
+// --- Libro de guardia: viajes -------------------------------------------------
+/** "VIAJE Río Cuarto EN M-12" (corta en el ÚLTIMO " en ": el destino puede contenerlo). */
+const RE_VIAJE = /^\s*viaje\s+(?:a\s+|hacia\s+)?(.+)\s+en\s+(.+?)\s*$/i;
+/** "REGRESO 18:30", "llegué 18.30", "18h30", "18:30 hs". Grupo 1 = palabra clave (opcional). */
+const RE_REGRESO_HORA =
+  /^\s*(regreso|llegada|llegu[eé]|volv[ií])?\s*(?:a\s+las\s+)?([01]?\d|2[0-3])\s*[:.hH]\s*([0-5]\d)\s*(?:hs?\.?)?\s*$/i;
+/** Respuesta al recordatorio sin hora: "Sí", "regreso", "volví". */
+const RE_REGRESO_SIN_HORA = /^\s*(s[ií]|regreso|marcar regreso|llegu[eé]|volv[ií])\s*[.!]*\s*$/i;
+
+async function viajeAbierto(p: PersonalRow) {
+  const { data, error } = await supabase
+    .from("viajes_activos")
+    .select("id, destino, vehiculo, fecha_salida")
+    .eq("bombero_id", p.id)
+    .eq("estado", "EN_VIAJE")
+    .maybeSingle<{ id: string; destino: string; vehiculo: string; fecha_salida: string }>();
+  if (error) console.error(`[whatsapp-bot] Error consultando viajes_activos: ${error.code} ${error.message}`);
+  return data;
+}
+
+async function registrarViaje(p: PersonalRow, destino: string, vehiculo: string): Promise<Contenido> {
+  const r = await rpc("rpc_registrar_viaje", {
+    p_bombero_id: p.id,
+    p_destino: destino,
+    p_vehiculo: vehiculo,
+    p_origen: "BOT",
+  });
+  if (!r) return texto(MSG_ERROR);
+  if (!r.ok) return texto(textoMotivo(r));
+  return texto(
+    `🚒 Viaje registrado: salida ${horaLocal(new Date(r.fecha_salida))} hacia *${r.destino}* en *${r.vehiculo}*.\n` +
+      "Se notificará al grupo operativo. Al volver, enviá *REGRESO HH:MM*.",
+  );
+}
+
+async function cerrarViaje(p: PersonalRow, hora: string): Promise<RpcResult | null> {
+  return await rpc("rpc_cerrar_viaje", { p_bombero_id: p.id, p_hora: hora });
+}
+
+function respuestaCierre(r: RpcResult | null): Contenido {
+  if (!r) return texto(MSG_ERROR);
+  if (!r.ok) return texto(textoMotivo(r));
+  return texto(
+    `🏁 Regreso registrado: ${diaLocal(new Date(r.fecha_llegada))} ${soloHora(new Date(r.fecha_llegada))} ` +
+      `desde *${r.destino}* (${r.vehiculo}). Duración: ${duracion(r.minutos)}. Viaje FINALIZADO.`,
+  );
+}
+
 async function manejarTexto(p: PersonalRow, msg: WaMessage): Promise<Contenido> {
   const body = (msg.text?.body ?? "").trim();
 
   const qr = RE_QR.exec(body);
   if (qr) return respuestaToken(await manejarToken(p, qr[1], msg));
+
+  const viaje = RE_VIAJE.exec(body);
+  if (viaje) return await registrarViaje(p, viaje[1].trim(), viaje[2].trim());
+
+  const regreso = RE_REGRESO_HORA.exec(body);
+  if (regreso) {
+    const hora = `${regreso[2].padStart(2, "0")}:${regreso[3]}`;
+    const r = await cerrarViaje(p, hora);
+    // Una hora suelta sin viaje abierto no es un comando: se responde el saludo.
+    if (regreso[1] || !(r && !r.ok && r.motivo === "SIN_VIAJE_ABIERTO")) return respuestaCierre(r);
+  }
+
+  const sinHora = RE_REGRESO_SIN_HORA.exec(body);
+  if (sinHora) {
+    const v = await viajeAbierto(p);
+    if (v) {
+      const salida = new Date(v.fecha_salida);
+      return texto(
+        `Indicá la hora de llegada desde *${v.destino}*, por ejemplo *REGRESO 18:30*.\n` +
+          `El día queda fijo en ${diaLocal(salida)} (salida ${soloHora(salida)}); solo se puede elegir la hora.`,
+      );
+    }
+    if (!/^s[ií]$/i.test(sinHora[1])) return texto(textoMotivo({ motivo: "SIN_VIAJE_ABIERTO" }));
+  }
 
   if (RE_TOKEN_SUELTO.test(body)) {
     const r = await manejarToken(p, body, msg);

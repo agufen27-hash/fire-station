@@ -5,3 +5,6 @@ project_id = "uzwegoetekpdommmrnrv"
 # no debe exigirlo. Equivale a `supabase functions deploy whatsapp-bot --no-verify-jwt`.
 [functions.whatsapp-bot]
 verify_jwt = false
+
+[functions.despachador-notificaciones]
+verify_jwt = false
