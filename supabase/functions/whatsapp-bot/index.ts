@@ -4,6 +4,13 @@
 // Webhook de WhatsApp Cloud API (Meta):
 //   GET  -> verificación del webhook (hub.mode / hub.verify_token / hub.challenge)
 //   POST -> recepción de mensajes; valida el remitente contra public.personal_cloud
+//           y enruta según el tipo:
+//             location            -> rpc_procesar_ubicacion_wa (geocerca)
+//                                    · dentro y sin ingreso abierto -> botones de actividad
+//                                    · dentro y con ingreso abierto -> egreso
+//             interactive (botón) -> rpc_confirmar_boton_wa (registra el ingreso)
+//             text "QR:XXXX" / token -> rpc_registrar_token_wa (evento con token)
+//             text normal         -> saludo + ayuda
 //
 // Variables de entorno:
 //   WHATSAPP_VERIFY_TOKEN      (secret propio)  token elegido al configurar el webhook en Meta
@@ -14,9 +21,11 @@
 //   SUPABASE_URL               (inyectada por Supabase)
 //   SUPABASE_SERVICE_ROLE_KEY  (inyectada por Supabase)
 //
-// Por qué service_role y no anon: personal_cloud tiene RLS activado SIN políticas
-// y los privilegios de anon/authenticated están revocados (ver migraciones), así
-// que con la anon key la consulta devolvería siempre 0 filas / 42501.
+// Geocerca: las coordenadas y el radio del cuartel NO están en el código; viven en
+// public.zonas_geocerca (ubicacion, radio_tolerancia_metros) y se cambian por SQL.
+//
+// Por qué service_role y no anon: las tablas tienen RLS activado SIN políticas y
+// los privilegios de anon/authenticated están revocados (ver migraciones).
 //
 // La función debe desplegarse con --no-verify-jwt: Meta no envía un JWT de Supabase.
 // =============================================================================
@@ -30,6 +39,7 @@ const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
 const ACCESS_TOKEN = Deno.env.get("WHATSAPP_ACCESS_TOKEN") ?? "";
 const PHONE_ID = Deno.env.get("WHATSAPP_PHONE_ID") ?? "";
 const GRAPH_URL = "https://graph.facebook.com/v26.0";
+const TZ = "America/Argentina/Cordoba";
 
 const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, {
   auth: { persistSession: false, autoRefreshToken: false },
@@ -38,6 +48,14 @@ const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, {
 // -----------------------------------------------------------------------------
 // Tipos mínimos del payload de Meta
 // -----------------------------------------------------------------------------
+interface WaLocation {
+  latitude: number;
+  longitude: number;
+  name?: string;
+  address?: string;
+  url?: string;
+}
+
 interface WaMessage {
   from: string;
   id: string;
@@ -50,7 +68,7 @@ interface WaMessage {
     button_reply?: { id: string; title: string };
     list_reply?: { id: string; title: string };
   };
-  location?: { latitude: number; longitude: number };
+  location?: WaLocation;
 }
 
 interface WaWebhookPayload {
@@ -72,7 +90,14 @@ interface PersonalRow {
   jerarquia: string | null;
   rol: string;
   activo: boolean;
+  telefono_whatsapp: string;
 }
+
+// deno-lint-ignore no-explicit-any
+type RpcResult = Record<string, any>;
+
+// deno-lint-ignore no-explicit-any
+type Contenido = Record<string, any>; // parte "type + {text|interactive}" del mensaje saliente
 
 // -----------------------------------------------------------------------------
 // Utilidades
@@ -93,7 +118,7 @@ function buscarPersonal(from: string) {
   const digits = from.replace(/\D/g, ""); // quita '+', espacios, guiones
   const q = supabase
     .from("personal_cloud")
-    .select("id, nombre_completo, jerarquia, rol, activo");
+    .select("id, nombre_completo, jerarquia, rol, activo, telefono_whatsapp");
   if (digits.startsWith("54") && digits.length >= 12) {
     const local10 = digits.slice(-10); // solo dígitos: seguro dentro de LIKE
     return q.like("telefono_whatsapp", `%${local10}`).limit(1).maybeSingle<PersonalRow>();
@@ -101,7 +126,7 @@ function buscarPersonal(from: string) {
   return q.in("telefono_whatsapp", [digits, `+${digits}`]).limit(1).maybeSingle<PersonalRow>();
 }
 
-/** Texto legible del mensaje según su tipo. */
+/** Texto legible del mensaje según su tipo (para logs). */
 function extraerTexto(msg: WaMessage): string {
   switch (msg.type) {
     case "text":
@@ -117,6 +142,33 @@ function extraerTexto(msg: WaMessage): string {
       return `[${msg.type}]`;
   }
 }
+
+/** Hora local del cuartel, p.ej. "04/11 21:35". */
+function horaLocal(d = new Date()): string {
+  return new Intl.DateTimeFormat("es-AR", {
+    timeZone: TZ,
+    day: "2-digit",
+    month: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(d);
+}
+
+function duracion(min: number | null | undefined): string {
+  const m = Math.max(0, Math.floor(Number(min ?? 0)));
+  const h = Math.floor(m / 60);
+  return h > 0 ? `${h} h ${m % 60} min` : `${m} min`;
+}
+
+const NOMBRE_ACTIVIDAD: Record<string, string> = {
+  CAPACITACION: "Capacitación",
+  MANTENIMIENTO: "Mantenimiento",
+  REUNION: "Reunión",
+  ORDEN_INTERNO: "Orden interno",
+  GUARDIA: "Guardia",
+};
+const actividad = (t: string | null | undefined) => NOMBRE_ACTIVIDAD[t ?? ""] ?? (t ?? "");
 
 /** Valida X-Hub-Signature-256 = sha256=HMAC(app_secret, raw_body). */
 async function firmaValida(rawBody: string, header: string | null): Promise<boolean> {
@@ -158,37 +210,36 @@ function handleVerify(url: URL): Response {
 }
 
 // -----------------------------------------------------------------------------
-// Respuestas salientes (Graph API de Meta)
+// Envío (Graph API de Meta)
 // -----------------------------------------------------------------------------
-const MSG_DENEGADO = "Acceso denegado. Este número no está registrado en el padrón del cuartel.";
+const texto = (body: string): Contenido => ({ type: "text", text: { preview_url: false, body } });
 
-/** "Bombero" / "Cabo" ... ; capitaliza si viene todo en mayúsculas. */
-function capitalizar(s: string): string {
-  if (s !== s.toUpperCase()) return s; // ya tiene mayúsculas/minúsculas mixtas
-  return s.toLowerCase().replace(/(^|[\s'-])(\p{L})/gu, (_m, sep, c) => sep + c.toUpperCase());
+function botones(body: string, ids: string[]): Contenido {
+  return {
+    type: "interactive",
+    interactive: {
+      type: "button",
+      body: { text: body },
+      action: {
+        // WhatsApp admite hasta 3 botones con títulos de hasta 20 caracteres.
+        buttons: ids.slice(0, 3).map((id) => ({
+          type: "reply",
+          reply: { id, title: actividad(id).slice(0, 20) },
+        })),
+      },
+    },
+  };
 }
 
-/** nombre_completo tiene formato "APELLIDO, Nombre" -> "Apellido". */
-function apellidoDe(nombreCompleto: string): string {
-  return capitalizar(nombreCompleto.split(",")[0].trim());
-}
-
-function saludo(p: PersonalRow): string {
-  const grado = p.jerarquia?.trim() ? capitalizar(p.jerarquia.trim()) + " " : "";
-  return `Hola, ${grado}${apellidoDe(p.nombre_completo)}. Sistema FireStation en línea. ¿En qué te puedo ayudar?`;
-}
-
-async function postGraph(to: string, body: string): Promise<{ ok: boolean; status: number; data: any }> {
+async function postGraph(
+  to: string,
+  contenido: Contenido,
+  // deno-lint-ignore no-explicit-any
+): Promise<{ ok: boolean; status: number; data: any }> {
   const res = await fetch(`${GRAPH_URL}/${PHONE_ID}/messages`, {
     method: "POST",
     headers: { Authorization: `Bearer ${ACCESS_TOKEN}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      messaging_product: "whatsapp",
-      recipient_type: "individual",
-      to,
-      type: "text",
-      text: { preview_url: false, body },
-    }),
+    body: JSON.stringify({ messaging_product: "whatsapp", recipient_type: "individual", to, ...contenido }),
   });
   const data = await res.json().catch(() => ({}));
   return { ok: res.ok, status: res.status, data };
@@ -217,7 +268,7 @@ function formatosDestino(to: string): string[] {
 /** Errores de Meta que pueden deberse al formato del destinatario. */
 const ERRORES_FORMATO = new Set([131030, 100]);
 
-async function enviarTexto(to: string, body: string): Promise<void> {
+async function enviar(to: string, contenido: Contenido): Promise<void> {
   if (!ACCESS_TOKEN || !PHONE_ID) {
     console.error("[whatsapp-bot] Faltan WHATSAPP_ACCESS_TOKEN / WHATSAPP_PHONE_ID: no se responde");
     return;
@@ -225,11 +276,11 @@ async function enviarTexto(to: string, body: string): Promise<void> {
   const formatos = formatosDestino(to);
   for (let i = 0; i < formatos.length; i++) {
     const destino = formatos[i];
-    const r = await postGraph(destino, body);
+    const r = await postGraph(destino, contenido);
     if (r.ok) {
       console.log(
-        `[whatsapp-bot] Respuesta enviada a ${mask(`+${destino}`)} (formato ${i + 1}/${formatos.length}, ` +
-          `wamid ${r.data?.messages?.[0]?.id ?? "?"})`,
+        `[whatsapp-bot] Respuesta (${contenido.type}) enviada a ${mask(`+${destino}`)} ` +
+          `(formato ${i + 1}/${formatos.length}, wamid ${r.data?.messages?.[0]?.id ?? "?"})`,
       );
       return;
     }
@@ -240,6 +291,162 @@ async function enviarTexto(to: string, body: string): Promise<void> {
     );
     if (!ERRORES_FORMATO.has(e.code)) return; // token, permisos, etc.: otro formato no lo arregla
   }
+}
+
+// -----------------------------------------------------------------------------
+// Textos de respuesta
+// -----------------------------------------------------------------------------
+const MSG_DENEGADO = "Acceso denegado. Este número no está registrado en el padrón del cuartel.";
+const MSG_AYUDA = "📍 Para fichar, enviá tu *ubicación actual* desde el cuartel.\n" +
+  "🔑 Para un evento con código, enviá *QR:CODIGO* (ej. QR:AB12CD).";
+const MSG_ERROR = "⚠️ No pude procesar tu solicitud en este momento. Probá de nuevo en unos minutos.";
+
+/** "Bombero" / "Cabo" ... ; capitaliza si viene todo en mayúsculas. */
+function capitalizar(s: string): string {
+  if (s !== s.toUpperCase()) return s; // ya tiene mayúsculas/minúsculas mixtas
+  return s.toLowerCase().replace(/(^|[\s'-])(\p{L})/gu, (_m, sep, c) => sep + c.toUpperCase());
+}
+
+/** nombre_completo tiene formato "APELLIDO, Nombre" -> "Apellido". */
+function apellidoDe(nombreCompleto: string): string {
+  return capitalizar(nombreCompleto.split(",")[0].trim());
+}
+
+function trato(p: PersonalRow): string {
+  const grado = p.jerarquia?.trim() ? capitalizar(p.jerarquia.trim()) + " " : "";
+  return `${grado}${apellidoDe(p.nombre_completo)}`;
+}
+
+function saludo(p: PersonalRow): string {
+  return `Hola, ${trato(p)}. Sistema FireStation en línea. ¿En qué te puedo ayudar?\n\n${MSG_AYUDA}`;
+}
+
+/** Motivos de rechazo comunes a las tres RPC. */
+function textoMotivo(r: RpcResult): string {
+  switch (r.motivo) {
+    case "FUERA_DE_ZONA":
+      return `❌ Estás fuera de la zona del ${r.zona}: a ${Math.round(r.distancia_m)} m ` +
+        `(tolerancia ${r.tolerancia_m} m). Acercate al cuartel y volvé a enviar tu ubicación.`;
+    case "UBICACION_NO_EN_VIVO":
+      return "❌ Esa ubicación es un lugar elegido de la lista. Enviá tu *ubicación actual* " +
+        "(📎 → Ubicación → Enviar mi ubicación actual).";
+    case "COORDENADAS_INVALIDAS":
+      return "❌ La ubicación recibida no es válida. Probá enviarla de nuevo.";
+    case "SIN_ZONAS_CONFIGURADAS":
+      return "⚠️ El cuartel todavía no tiene una zona de fichaje configurada. Avisá a la Jefatura.";
+    case "MENSAJE_YA_PROCESADO":
+      return "ℹ️ Ese mensaje ya fue procesado.";
+    case "SIN_SESION_PENDIENTE":
+    case "SESION_EXPIRADA":
+      return "⌛ La selección expiró. Volvé a enviar tu ubicación para fichar.";
+    case "BOTON_INVALIDO":
+      return "❌ Opción no válida. Volvé a enviar tu ubicación para fichar.";
+    case "YA_TIENE_INGRESO_ABIERTO":
+      return "ℹ️ Ya tenés un ingreso abierto. Para cerrarlo enviá tu ubicación (o el mismo código del evento).";
+    case "TOKEN_INVALIDO":
+      return "❌ Código no válido. Revisá que esté bien escrito.";
+    case "SESION_NO_ACTIVA":
+      return `❌ El evento${r.descripcion ? ` "${r.descripcion}"` : ""} no está activo ahora ` +
+        `(válido de ${horaLocal(new Date(r.valido_desde))} a ${horaLocal(new Date(r.valido_hasta))}).`;
+    case "YA_REGISTRADO":
+      return `ℹ️ Ya registraste tu asistencia completa a${r.descripcion ? ` "${r.descripcion}"` : "l evento"}.`;
+    case "BOMBERO_NO_REGISTRADO_O_INACTIVO":
+      return MSG_DENEGADO;
+    default:
+      return MSG_ERROR;
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Handlers por tipo de mensaje (el remitente ya está autenticado y activo)
+// -----------------------------------------------------------------------------
+async function rpc(nombre: string, args: Record<string, unknown>): Promise<RpcResult | null> {
+  const { data, error } = await supabase.rpc(nombre, args);
+  if (error) {
+    console.error(`[whatsapp-bot] RPC ${nombre} falló: ${error.code} ${error.message}`);
+    return null;
+  }
+  console.log(`[whatsapp-bot] RPC ${nombre} -> ${JSON.stringify(data)}`);
+  return data as RpcResult;
+}
+
+async function manejarUbicacion(p: PersonalRow, msg: WaMessage): Promise<Contenido> {
+  const loc = msg.location!;
+  const r = await rpc("rpc_procesar_ubicacion_wa", {
+    p_telefono: p.telefono_whatsapp,
+    p_lat: loc.latitude,
+    p_lng: loc.longitude,
+    p_wa_msg_id: msg.id,
+    p_metadata: loc, // name/address presentes => lugar elegido, no ubicación en vivo
+  });
+  if (!r) return texto(MSG_ERROR);
+  if (!r.ok) return texto(textoMotivo(r));
+
+  if (r.modo === "PEDIR_BOTON_ACTIVIDAD") {
+    return botones(
+      `✅ ${trato(p)}, ubicación validada en ${r.zona} (a ${Math.round(r.distancia_m)} m).\n` +
+        "¿Qué actividad vas a realizar?",
+      r.botones ?? ["CAPACITACION", "MANTENIMIENTO", "REUNION"],
+    );
+  }
+  if (r.modo === "EGRESO_DIRECTO") {
+    return texto(
+      `👋 Egreso registrado por geolocalización en ${r.zona} a las ${horaLocal()}.\n` +
+        `Tiempo computado: ${duracion(r.minutos)}.`,
+    );
+  }
+  return texto(MSG_ERROR);
+}
+
+async function manejarBoton(p: PersonalRow, botonId: string): Promise<Contenido> {
+  const r = await rpc("rpc_confirmar_boton_wa", { p_telefono: p.telefono_whatsapp, p_boton_id: botonId });
+  if (!r) return texto(MSG_ERROR);
+  if (!r.ok) return texto(textoMotivo(r));
+  return texto(
+    `✅ Presente registrado por geolocalización: *${actividad(r.tipo_actividad)}*, ` +
+      `ingreso ${horaLocal()}.\nAl retirarte, enviá de nuevo tu ubicación para registrar el egreso.`,
+  );
+}
+
+async function manejarToken(p: PersonalRow, token: string, msg: WaMessage): Promise<RpcResult | null> {
+  return await rpc("rpc_registrar_token_wa", {
+    p_telefono: p.telefono_whatsapp,
+    p_token: token,
+    p_wa_msg_id: msg.id,
+  });
+}
+
+function respuestaToken(r: RpcResult | null): Contenido {
+  if (!r) return texto(MSG_ERROR);
+  if (!r.ok) return texto(textoMotivo(r));
+  const evento = `*${actividad(r.tipo_actividad)}*${r.descripcion ? ` — ${r.descripcion}` : ""}`;
+  if (r.modo === "EGRESO_REGISTRADO") {
+    return texto(`👋 Egreso registrado en ${evento} a las ${horaLocal()}.\nTiempo computado: ${duracion(r.minutos)}.`);
+  }
+  return texto(
+    `✅ Presente registrado en ${evento}, ingreso ${horaLocal()}.\n` +
+      "Al retirarte, enviá el mismo código para registrar el egreso.",
+  );
+}
+
+/** "QR:AB12CD", "qr - ab12cd" -> token explícito. */
+const RE_QR = /^\s*QR\s*[:\-]\s*([A-Za-z0-9]{4,32})\s*$/i;
+/** Código suelto: 6-32 alfanuméricos con al menos una letra y un dígito (no confunde "Hola"). */
+const RE_TOKEN_SUELTO = /^(?=.*\d)(?=.*[A-Za-z])[A-Za-z0-9]{6,32}$/;
+
+async function manejarTexto(p: PersonalRow, msg: WaMessage): Promise<Contenido> {
+  const body = (msg.text?.body ?? "").trim();
+
+  const qr = RE_QR.exec(body);
+  if (qr) return respuestaToken(await manejarToken(p, qr[1], msg));
+
+  if (RE_TOKEN_SUELTO.test(body)) {
+    const r = await manejarToken(p, body, msg);
+    // Si no es un token conocido, se trata como texto normal.
+    if (!(r && !r.ok && r.motivo === "TOKEN_INVALIDO")) return respuestaToken(r);
+  }
+
+  return texto(saludo(p));
 }
 
 // -----------------------------------------------------------------------------
@@ -264,7 +471,7 @@ async function procesarWebhook(raw: string, firma: string | null): Promise<void>
     }
 
     const from = msg.from;
-    const texto = extraerTexto(msg);
+    const resumen = extraerTexto(msg);
     const { data, error } = await buscarPersonal(from);
 
     if (error) {
@@ -274,20 +481,34 @@ async function procesarWebhook(raw: string, firma: string | null): Promise<void>
     }
 
     if (!data) {
-      console.log(`[whatsapp-bot] RECHAZADO ${mask(`+${from}`)}: no pertenece al cuartel | texto="${texto}"`);
-      await enviarTexto(from, MSG_DENEGADO);
-    } else if (!data.activo) {
+      console.log(`[whatsapp-bot] RECHAZADO ${mask(`+${from}`)}: no pertenece al cuartel | texto="${resumen}"`);
+      await enviar(from, texto(MSG_DENEGADO));
+      return;
+    }
+    if (!data.activo) {
       console.log(
         `[whatsapp-bot] RECHAZADO ${mask(`+${from}`)}: ${data.nombre_completo} está INACTIVO (rol ${data.rol})`,
       );
-      await enviarTexto(from, MSG_DENEGADO);
-    } else {
-      console.log(
-        `[whatsapp-bot] AUTORIZADO ${mask(`+${from}`)}: ${data.jerarquia ?? ""} ${data.nombre_completo} ` +
-          `(id ${data.id}, rol ${data.rol}) | tipo=${msg.type} texto="${texto}"`,
-      );
-      await enviarTexto(from, saludo(data));
+      await enviar(from, texto(MSG_DENEGADO));
+      return;
     }
+
+    console.log(
+      `[whatsapp-bot] AUTORIZADO ${mask(`+${from}`)}: ${data.jerarquia ?? ""} ${data.nombre_completo} ` +
+        `(id ${data.id}, rol ${data.rol}) | tipo=${msg.type} texto="${resumen}"`,
+    );
+
+    let respuesta: Contenido;
+    if (msg.type === "location" && msg.location) {
+      respuesta = await manejarUbicacion(data, msg);
+    } else if (msg.type === "interactive" && msg.interactive?.button_reply) {
+      respuesta = await manejarBoton(data, msg.interactive.button_reply.id);
+    } else if (msg.type === "text") {
+      respuesta = await manejarTexto(data, msg);
+    } else {
+      respuesta = texto(saludo(data));
+    }
+    await enviar(from, respuesta);
   } catch (err) {
     console.error("[whatsapp-bot] Error procesando el webhook:", err instanceof Error ? err.message : err);
   }
@@ -303,7 +524,7 @@ async function handleMessage(req: Request): Promise<Response> {
     return ok();
   }
 
-  // Se procesa todo (consulta + envío a Meta, ~1-2 s) ANTES de responder: así el
+  // Se procesa todo (consulta + envío a Meta, ~1-3 s) ANTES de responder: así el
   // runtime no puede cortar trabajo pendiente. Meta tolera esa latencia.
   // procesarWebhook nunca lanza (try/catch interno), así que el 200 está garantizado.
   await procesarWebhook(raw, req.headers.get("x-hub-signature-256"));
