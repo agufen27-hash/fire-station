@@ -3310,7 +3310,7 @@ class MainWindow(QMainWindow):
         datos: dict = {}
         if ruta.exists():
             try:
-                datos = json.loads(ruta.read_text(encoding="utf-8"))
+                datos = json.loads(ruta.read_text(encoding="utf-8-sig"))
             except (json.JSONDecodeError, OSError):
                 datos = {}
 
@@ -3343,7 +3343,7 @@ class MainWindow(QMainWindow):
             )
             return
         try:
-            datos = json.loads(self._ruta_config_json().read_text(encoding="utf-8"))
+            datos = json.loads(self._ruta_config_json().read_text(encoding="utf-8-sig"))
             if not isinstance(datos, dict):
                 datos = {}
         except (OSError, ValueError):

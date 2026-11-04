@@ -46,6 +46,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app.services.supabase_client import (
+    SupabaseConfigError,
+    SupabaseCredenciales,
+    cargar_credenciales,
+    guardar_credenciales,
+)
 from app.services.libro_guardia_service import (
     ESTADO_EN_CURSO,
     ESTADO_FINALIZADO,
@@ -280,6 +286,106 @@ class DialogoMarcarRegreso(QDialog):
         self.accept()
 
 
+class DialogoCredencialesSupabase(QDialog):
+    """Carga (una sola vez por PC) la conexión a la nube: URL del proyecto
+    (precargada) y service key. Se prueba contra Supabase ANTES de guardarla
+    en data/config.json; la clave nunca viaja en el ejecutable ni en el repo."""
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        from app.paths import URL_SUPABASE_PREDETERMINADA, leer_config_json
+
+        self.setWindowTitle("Configurar conexión a la nube")
+        self.setMinimumWidth(520)
+        self._tarea: Optional[TareaLibroGuardia] = None
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 16)
+        layout.setSpacing(12)
+
+        titulo = QLabel("Conexión con Supabase", self)
+        titulo.setObjectName("tituloSeccion")
+        layout.addWidget(titulo)
+        ayuda = QLabel(
+            "Pegá la <b>service_role key</b> del proyecto (Supabase → Project Settings → API keys). "
+            "Se guarda solo en esta PC, en data/config.json, y se usa para el Libro de Guardia y "
+            "la sincronización del padrón.", self)
+        ayuda.setObjectName("ayudaSeccion")
+        ayuda.setWordWrap(True)
+        layout.addWidget(ayuda)
+
+        seccion = leer_config_json().get("supabase")
+        seccion = seccion if isinstance(seccion, dict) else {}
+        form = QFormLayout()
+        form.setSpacing(10)
+        self.campo_url = QLineEdit(str(seccion.get("url") or URL_SUPABASE_PREDETERMINADA), self)
+        self.campo_key = QLineEdit(self)
+        self.campo_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.campo_key.setPlaceholderText("eyJhbGciOi…  o  sb_secret_…")
+        form.addRow(theme.etiqueta_requerida("URL del proyecto"), self.campo_url)
+        form.addRow(theme.etiqueta_requerida("Service key"), self.campo_key)
+        layout.addLayout(form)
+
+        self.label_estado = QLabel("", self)
+        self.label_estado.setObjectName("chip")
+        self.label_estado.setWordWrap(True)
+        self.label_estado.setVisible(False)
+        layout.addWidget(self.label_estado)
+
+        self.botones = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, self)
+        self.boton_ok = self.botones.button(QDialogButtonBox.StandardButton.Ok)
+        self.boton_ok.setText("Probar y guardar")
+        self.botones.accepted.connect(self._probar)
+        self.botones.rejected.connect(self.reject)
+        layout.addWidget(self.botones)
+        for campo in (self.campo_url, self.campo_key):
+            campo.textChanged.connect(self._validar)
+        self._validar()
+
+    def _validar(self) -> None:
+        url = self.campo_url.text().strip()
+        self.boton_ok.setEnabled(url.startswith("https://") and len(self.campo_key.text().strip()) > 20)
+
+    def _estado(self, texto: str, tono: str) -> None:
+        self.label_estado.setText(texto)
+        theme.set_tono(self.label_estado, tono)
+        self.label_estado.setVisible(True)
+
+    def _probar(self) -> None:
+        if self._tarea is not None:
+            return
+        credenciales = SupabaseCredenciales(self.campo_url.text().strip().rstrip("/"), self.campo_key.text().strip())
+        self.boton_ok.setEnabled(False)
+        self._estado("Probando la conexión…", "info")
+        tarea = self._tarea = TareaLibroGuardia(lambda: LibroGuardiaCliente(credenciales).resumen(), self)
+        tarea.terminado.connect(lambda _r: self._guardar(credenciales))
+        tarea.error.connect(self._fallo)
+        tarea.finished.connect(self._liberar)
+        tarea.start()
+
+    def _liberar(self) -> None:
+        if self._tarea is not None:
+            self._tarea.deleteLater()
+            self._tarea = None
+        self._validar()
+
+    def _fallo(self, mensaje: str) -> None:
+        self._estado(f"No se pudo conectar con esa clave: {mensaje}", "error")
+
+    def _guardar(self, credenciales: SupabaseCredenciales) -> None:
+        try:
+            guardar_credenciales(credenciales.url, credenciales.service_key)
+        except OSError as e:
+            self._estado(f"La conexión anda pero no se pudo guardar data/config.json: {e}", "error")
+            return
+        self.accept()
+
+    def done(self, resultado: int) -> None:  # noqa: D401 - no cerrar con la prueba en curso
+        if self._tarea is not None:
+            self._tarea.wait(15000)
+        super().done(resultado)
+
+
 class DialogoExportarMes(QDialog):
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -424,6 +530,11 @@ class PaginaLibroGuardia(QWidget):
         self.boton_exportar.setObjectName("botonLimpiar")
         self.boton_exportar.setToolTip("Excel con la presencia del personal del mes (Seguro / ART).")
         self.boton_exportar.clicked.connect(self._exportar_planilla)
+        self.boton_configurar = QPushButton("🔑 Configurar conexión", contenido)
+        self.boton_configurar.setObjectName("botonPrimarioAzul")
+        self.boton_configurar.setToolTip("Cargar la service key de Supabase en esta PC (una sola vez).")
+        self.boton_configurar.setVisible(False)
+        self.boton_configurar.clicked.connect(self.configurar_conexion)
         self.boton_refrescar = QPushButton("⟳ Actualizar", contenido)
         self.boton_refrescar.setObjectName("botonHerramienta")
         self.boton_refrescar.clicked.connect(self.refrescar)
@@ -431,6 +542,7 @@ class PaginaLibroGuardia(QWidget):
             boton.setCursor(Qt.CursorShape.PointingHandCursor)
             acciones.addWidget(boton)
         acciones.addStretch(1)
+        acciones.addWidget(self.boton_configurar)
         acciones.addWidget(self.boton_refrescar)
         layout_contenido.addLayout(acciones)
 
@@ -488,9 +600,48 @@ class PaginaLibroGuardia(QWidget):
 
     # -- Carga ----------------------------------------------------------------------
 
+    def _faltan_credenciales(self) -> Optional[str]:
+        """Chequeo local (sin red) antes de salir a la nube. Solo con el cliente
+        real: los tests inyectan un cliente falso que no necesita credenciales."""
+        if self._cliente_factory is not LibroGuardiaCliente:
+            return None
+        try:
+            cargar_credenciales()
+        except SupabaseConfigError as e:
+            return str(e)
+        return None
+
+    def _mostrar_sin_credenciales(self, mensaje: str) -> None:
+        self._set_chip("🔑 Conexión sin configurar", "alerta", mensaje)
+        for tarjeta in (self.tarjeta_viajes, self.tarjeta_cuartel, self.tarjeta_guardias):
+            tarjeta.set_valor("—")
+        for boton in (self.boton_registrar, self.boton_exportar):
+            boton.setEnabled(False)
+        self.boton_configurar.setVisible(True)
+        self.label_vacio.setText("Esta PC todavía no tiene la conexión con la nube.\n"
+                                 "Tocá \"🔑 Configurar conexión\" y pegá la service key de Supabase (una sola vez).")
+        self.label_vacio.setVisible(True)
+
+    def configurar_conexion(self) -> None:
+        if DialogoCredencialesSupabase(self).exec() != QDialog.DialogCode.Accepted:
+            return
+        self.boton_configurar.setVisible(False)
+        for boton in (self.boton_registrar, self.boton_exportar):
+            boton.setEnabled(True)
+        self.label_vacio.setVisible(False)
+        self.refrescar()
+
     def refrescar(self) -> None:
         if self._cargando:
             return
+        faltan = self._faltan_credenciales()
+        if faltan:
+            self._timer.stop()
+            self._mostrar_sin_credenciales(faltan)
+            return
+        if self.isVisible() and not self._timer.isActive():
+            self._timer.start()
+        self.boton_configurar.setVisible(False)
         self._cargando = True
         self.boton_refrescar.setEnabled(False)
         self._set_chip("☁️ Sincronizando…", "neutro")

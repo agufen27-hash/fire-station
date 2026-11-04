@@ -68,21 +68,84 @@ def get_writable_dir(relative_subdir: str) -> Path:
     return destino
 
 
+# Secciones que toda config.json debe tener (se agregan si faltan). La URL del
+# proyecto Supabase no es secreta; la service key SÍ y nunca viaja en el bundle
+# ni en el repo: se carga una vez por PC (diálogo del Libro de Guardia o a mano).
+URL_SUPABASE_PREDETERMINADA = "https://uzwegoetekpdommmrnrv.supabase.co"
+SECCIONES_PREDETERMINADAS = {
+    "supabase": {"url": URL_SUPABASE_PREDETERMINADA, "service_key": ""},
+}
+
+
+def leer_config_json(ruta: "Path | None" = None) -> dict:
+    """data/config.json como dict ({} si no existe o es ilegible). Tolera BOM
+    (Bloc de notas lo agrega al guardar en UTF-8)."""
+    import json
+
+    ruta = ruta or get_writable_dir("data") / "config.json"
+    try:
+        datos = json.loads(ruta.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return {}
+    return datos if isinstance(datos, dict) else {}
+
+
+def completar_config(existente: dict, plantilla: dict) -> tuple[dict, bool]:
+    """Agrega a `existente` las secciones / claves de `plantilla` que falten.
+    Nunca pisa un valor ya cargado (ni siquiera uno vacío). Devuelve
+    (config completada, hubo_cambios)."""
+    resultado = dict(existente)
+    cambio = False
+    for seccion, valores in plantilla.items():
+        actual = resultado.get(seccion)
+        if seccion not in resultado:
+            resultado[seccion] = dict(valores) if isinstance(valores, dict) else valores
+            cambio = True
+        elif isinstance(actual, dict) and isinstance(valores, dict):
+            faltantes = {k: v for k, v in valores.items() if k not in actual}
+            if faltantes:
+                resultado[seccion] = {**actual, **faltantes}
+                cambio = True
+    return resultado, cambio
+
+
 def asegurar_config_inicial() -> None:
-    """Si todavía no existe `data/config.json` al lado del .exe (primer
-    arranque en una máquina nueva), lo crea a partir del esqueleto
-    embebido `data/config.example.json` -- sin credenciales reales adentro
-    del bundle, ver tools/build_exe.py. No hace nada si config.json ya
-    existe (nunca pisa credenciales ya cargadas)."""
+    """Primer arranque en una máquina nueva: crea `data/config.json` desde el
+    esqueleto embebido `data/config.example.json` (sin credenciales reales,
+    ver tools/build_exe.py). Si ya existe, le AGREGA las secciones que
+    versiones nuevas necesitan y le faltan (p. ej. "supabase" en una
+    instalación anterior a la nube), sin tocar nada de lo cargado; antes de
+    reescribirlo deja una copia en config.json.bak."""
+    import json
+    import shutil
+
     destino = get_writable_dir("data") / "config.json"
-    if destino.exists():
+    ejemplo = leer_config_json(get_resource_path("data/config.example.json"))
+    # Esqueleto embebido + valores por defecto (los de SECCIONES_PREDETERMINADAS ganan:
+    # el esqueleto trae la URL vacía).
+    plantilla = dict(ejemplo)
+    for seccion, valores in SECCIONES_PREDETERMINADAS.items():
+        base = ejemplo.get(seccion)
+        plantilla[seccion] = {**base, **valores} if isinstance(base, dict) else dict(valores)
+
+    if not destino.exists():
+        try:
+            destino.write_text(json.dumps(plantilla, indent=2, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            pass
         return
 
-    origen = get_resource_path("data/config.example.json")
-    if origen.exists():
-        import shutil
-
-        shutil.copy(origen, destino)
+    existente = leer_config_json(destino)
+    if not existente and destino.stat().st_size > 0:
+        return  # JSON roto: mejor no reescribirlo y perder lo que el usuario tenga
+    completa, cambio = completar_config(existente, plantilla)
+    if not cambio:
+        return
+    try:
+        shutil.copy(destino, destino.with_name("config.json.bak"))
+        destino.write_text(json.dumps(completa, indent=2, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass  # sin permisos de escritura: las credenciales se piden igual desde la UI
 
 
 def configurar_entorno_playwright() -> None:

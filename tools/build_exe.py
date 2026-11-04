@@ -176,7 +176,7 @@ def _preparar_config_example() -> Path:
         },
         # Puente cloud (app/services/supabase_client.py). También se puede
         # usar SUPABASE_URL / SUPABASE_SERVICE_KEY como variables de entorno.
-        "supabase": {"url": "", "service_key": ""},
+        "supabase": {"url": "https://uzwegoetekpdommmrnrv.supabase.co", "service_key": ""},
     }
     if origen.exists():
         try:

@@ -44,24 +44,64 @@ class SupabaseCredenciales:
     service_key: str
 
 
-def cargar_credenciales() -> SupabaseCredenciales:
-    """Env vars primero; si faltan, la sección "supabase" de data/config.json."""
-    seccion: dict = {}
-    try:
-        datos = json.loads((get_writable_dir("data") / "config.json").read_text(encoding="utf-8"))
-        if isinstance(datos, dict) and isinstance(datos.get("supabase"), dict):
-            seccion = datos["supabase"]
-    except (OSError, ValueError):
-        pass
+# Nombres aceptados (env var y clave dentro de la sección "supabase").
+_ENV_URL = ("SUPABASE_URL",)
+_ENV_KEY = ("SUPABASE_SERVICE_KEY", "SUPABASE_SERVICE_ROLE_KEY")
+_CLAVES_URL = ("url", "supabase_url")
+_CLAVES_KEY = ("service_key", "service_role_key", "supabase_service_key")
 
-    url = (os.environ.get("SUPABASE_URL") or seccion.get("url") or "").strip().rstrip("/")
-    key = (os.environ.get("SUPABASE_SERVICE_KEY") or seccion.get("service_key") or "").strip()
-    if not url or not key:
+
+def _ruta_config() -> "os.PathLike":
+    return get_writable_dir("data") / "config.json"
+
+
+def _primero(fuente, claves) -> str:
+    for clave in claves:
+        valor = fuente.get(clave)
+        if isinstance(valor, str) and valor.strip():
+            return valor.strip()
+    return ""
+
+
+def _seccion_supabase(datos: dict) -> dict:
+    """La sección "supabase" (sin distinguir mayúsculas); si no hay, claves
+    sueltas en la raíz (SUPABASE_URL / SUPABASE_SERVICE_KEY copiadas tal cual)."""
+    for nombre, valor in datos.items():
+        if str(nombre).lower() == "supabase" and isinstance(valor, dict):
+            return valor
+    return {k.lower(): v for k, v in datos.items() if isinstance(k, str) and k.lower().startswith("supabase_")}
+
+
+def cargar_credenciales() -> SupabaseCredenciales:
+    """Variables de entorno primero; si faltan, data/config.json (sección
+    "supabase"). La URL tiene valor por defecto (la del proyecto, no es
+    secreta); la service key no: se carga una vez por PC."""
+    from app.paths import URL_SUPABASE_PREDETERMINADA, leer_config_json
+
+    seccion = _seccion_supabase(leer_config_json(_ruta_config()))
+    url = (_primero(os.environ, _ENV_URL) or _primero(seccion, _CLAVES_URL)
+           or URL_SUPABASE_PREDETERMINADA).rstrip("/")
+    key = _primero(os.environ, _ENV_KEY) or _primero(seccion, _CLAVES_KEY)
+    if not key:
         raise SupabaseConfigError(
-            "Faltan credenciales de Supabase: definí SUPABASE_URL y SUPABASE_SERVICE_KEY "
-            "(variables de entorno) o la sección \"supabase\" de data/config.json."
+            "Falta la service key de Supabase en esta PC. Cargala desde Libro de Guardia → "
+            "🔑 Configurar conexión, o en data/config.json → \"supabase\": {\"service_key\": \"...\"} "
+            "(también sirve la variable de entorno SUPABASE_SERVICE_KEY)."
         )
     return SupabaseCredenciales(url=url, service_key=key)
+
+
+def guardar_credenciales(url: str, service_key: str) -> None:
+    """Escribe la sección "supabase" de data/config.json conservando todo lo
+    demás (RUBA, cuartel, mapa, actualizaciones...)."""
+    from app.paths import leer_config_json
+
+    ruta = _ruta_config()
+    datos = leer_config_json(ruta)
+    seccion = dict(_seccion_supabase(datos)) if isinstance(datos.get("supabase"), dict) else {}
+    seccion.update({"url": url.strip().rstrip("/"), "service_key": service_key.strip()})
+    datos["supabase"] = seccion
+    ruta.write_text(json.dumps(datos, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 # -- Teléfonos argentinos -> formato WhatsApp Cloud (549 + área + número) -------
