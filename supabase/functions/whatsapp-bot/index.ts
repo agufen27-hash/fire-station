@@ -84,16 +84,21 @@ const ok = (body = "EVENT_RECEIVED") =>
 const mask = (tel: string) => (tel.length > 4 ? tel.slice(0, -4) + "****" : "****");
 
 /**
- * Meta envía `from` sin '+' (ej. '5493581234567'). En la base está en E.164
- * ('+549358...'). Para Argentina se prueban ambas variantes (con y sin el 9
- * de celular) por si el padrón se cargó de una u otra forma.
+ * Meta envía `from` sin '+' (ej. '5493581234567'). En personal_cloud el número
+ * puede estar cargado con o sin '+', con o sin 54 / 9 ('549358...' hoy).
+ * Para Argentina (54...) se busca por los últimos 10 dígitos (área + número
+ * local), que son iguales en todas esas variantes; si no, coincidencia exacta.
  */
-function candidatosTelefono(from: string): string[] {
-  const digits = from.replace(/\D/g, "");
-  const set = new Set<string>([`+${digits}`]);
-  if (digits.startsWith("549")) set.add(`+54${digits.slice(3)}`);
-  else if (digits.startsWith("54")) set.add(`+549${digits.slice(2)}`);
-  return [...set];
+function buscarPersonal(from: string) {
+  const digits = from.replace(/\D/g, ""); // quita '+', espacios, guiones
+  const q = supabase
+    .from("personal_cloud")
+    .select("id, nombre_completo, jerarquia, rol, activo");
+  if (digits.startsWith("54") && digits.length >= 12) {
+    const local10 = digits.slice(-10); // solo dígitos: seguro dentro de LIKE
+    return q.like("telefono_whatsapp", `%${local10}`).limit(1).maybeSingle<PersonalRow>();
+  }
+  return q.in("telefono_whatsapp", [digits, `+${digits}`]).limit(1).maybeSingle<PersonalRow>();
 }
 
 /** Texto legible del mensaje según su tipo. */
@@ -235,14 +240,7 @@ async function procesarWebhook(raw: string, firma: string | null): Promise<void>
 
     const from = msg.from;
     const texto = extraerTexto(msg);
-    const candidatos = candidatosTelefono(from);
-
-    const { data, error } = await supabase
-      .from("personal_cloud")
-      .select("id, nombre_completo, jerarquia, rol, activo")
-      .in("telefono_whatsapp", candidatos)
-      .limit(1)
-      .maybeSingle<PersonalRow>();
+    const { data, error } = await buscarPersonal(from);
 
     if (error) {
       // Error de base: no se responde "denegado" a alguien que quizá sí está en el padrón.
