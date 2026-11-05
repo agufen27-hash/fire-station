@@ -3380,8 +3380,14 @@ class MainWindow(QMainWindow):
         boton_imagen = QPushButton("Cargar nueva imagen de mapa (.png, .jpg)", caja)
         boton_imagen.setObjectName("botonHerramienta")
         boton_imagen.clicked.connect(self._cargar_imagen_mapa)
+        boton_satelital = QPushButton("🛰️ Descargar imagen satelital", caja)
+        boton_satelital.setObjectName("botonHerramienta")
+        boton_satelital.setToolTip("Baja de Google Earth Engine un compuesto Sentinel-2 sin nubes de la zona "
+                                   "y lo deja como imagen base, con los límites ya calibrados.")
+        boton_satelital.clicked.connect(self._descargar_imagen_satelital)
         fila_imagen.addWidget(self._label_imagen_mapa, 1)
         fila_imagen.addWidget(boton_imagen)
+        fila_imagen.addWidget(boton_satelital)
         form.addRow("Imagen base", fila_imagen)
 
         def spin(minimo: float, maximo: float) -> QDoubleSpinBox:
@@ -3421,9 +3427,13 @@ class MainWindow(QMainWindow):
         self._spin_cuartel_lat.setValue(calibracion.cuartel_lat)
         self._spin_cuartel_lon.setValue(calibracion.cuartel_lon)
         ruta = cartografia.ruta_imagen_base()
-        self._label_imagen_mapa.setText(
-            str(ruta) if ruta else f"(sin imagen: se muestra la cuadrícula) -> {cartografia.carpeta_imagen()}"
-        )
+        texto = str(ruta) if ruta else f"(sin imagen: se muestra la cuadrícula) -> {cartografia.carpeta_imagen()}"
+        from app.services import imagen_satelital
+
+        origen = imagen_satelital.origen_actual() if ruta else None
+        if origen:
+            texto += f"\n🛰️ {origen.get('atribucion', '')} · período {' a '.join(origen.get('periodo', []))}"
+        self._label_imagen_mapa.setText(texto)
 
     def _calibracion_de_formulario(self) -> "cartografia.CalibracionMapa":
         return cartografia.CalibracionMapa(
@@ -3443,6 +3453,10 @@ class MainWindow(QMainWindow):
         except (OSError, ValueError) as e:
             QMessageBox.critical(self, "No se pudo cargar la imagen", str(e))
             return
+        from app.services import imagen_satelital
+
+        # La imagen ya no es la satelital: su origen/atribución deja de aplicar.
+        (cartografia.carpeta_imagen() / imagen_satelital.ARCHIVO_ORIGEN).unlink(missing_ok=True)
         self._recargar_mapas()
         self._cargar_config_mapa()
         QMessageBox.information(
@@ -3450,6 +3464,17 @@ class MainWindow(QMainWindow):
             f"Se copió a:\n{destino}\n\nRevisá que los límites norte/sur/oeste/este de abajo "
             "correspondan a los bordes de ESTA imagen y guardá la configuración.",
         )
+
+    def _descargar_imagen_satelital(self) -> None:
+        """Abre la descarga desde Earth Engine con los límites que están en el
+        formulario (aunque todavía no se hayan guardado)."""
+        from app.ui.satelital_dialog import DescargaSatelitalDialog
+
+        dialogo = DescargaSatelitalDialog(self._calibracion_de_formulario(), self)
+        dialogo.exec()
+        if dialogo.instalada:
+            self._recargar_mapas()
+            self._cargar_config_mapa()  # los spins toman los límites nuevos: "Guardar" no los pisa
 
     def _recargar_mapas(self) -> None:
         for mapa in (getattr(self, "mapa", None), getattr(getattr(self, "_pagina_mapa", None), "mapa", None)):

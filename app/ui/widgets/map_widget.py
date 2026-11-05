@@ -139,7 +139,7 @@ def generar_fondo_cuadricula(calibracion: CalibracionMapa, ancho: int = ANCHO_FO
     pintor.setFont(fuente_sub)
     pintor.setPen(QColor("#64748b"))
     pintor.drawText(caja.adjusted(0, caja.height() * 0.45, 0, 0), Qt.AlignmentFlag.AlignCenter,
-                    "Configuración → Cargar nueva imagen de mapa (.png, .jpg)")
+                    "Configuración → 🛰️ Descargar imagen satelital  ·  o  Cargar nueva imagen de mapa (.png, .jpg)")
     pintor.end()
     return pixmap
 

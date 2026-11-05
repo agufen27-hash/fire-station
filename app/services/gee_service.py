@@ -55,6 +55,7 @@ GEE_SCOPES = (
 )
 ARCHIVO_CREDENCIALES = "gee_service_account.json"
 TIMEOUT_SEGUNDOS = (5, 30)            # (conexión, lectura)
+TIMEOUT_CALCULO = (5, 240)            # computePixels: un compuesto de meses puede tardar minutos
 REINTENTOS_TRANSITORIOS = 2           # 429 / 500 / 502 / 503 / 504
 ESPERA_BASE_SEGUNDOS = 1.0            # backoff exponencial: 1 s, 2 s
 HTTP_TRANSITORIOS = {429, 500, 502, 503, 504}
@@ -211,9 +212,11 @@ class GeeService:
 
     # -- HTTP --------------------------------------------------------------------------
 
-    def _pedir(self, metodo: str, ruta: str, **kwargs) -> dict:
+    def _pedir(self, metodo: str, ruta: str, *, crudo: bool = False, timeout=None, **kwargs):
         """Llamada autenticada. Renueva el token y reintenta UNA vez ante 401;
-        reintenta con backoff los errores transitorios (429 / 5xx / red)."""
+        reintenta con backoff los errores transitorios (429 / 5xx / red).
+        Devuelve el JSON de la respuesta, o los bytes tal cual si `crudo`
+        (píxeles de computePixels)."""
         url = f"{GEE_API_URL}/{ruta.lstrip('/')}"
         renovado = False
         intento = 0
@@ -221,7 +224,8 @@ class GeeService:
             headers = {"Authorization": f"Bearer {self._token()}",
                        "Content-Type": "application/json"}
             try:
-                resp = self._http.request(metodo, url, headers=headers, timeout=self._timeout, **kwargs)
+                resp = self._http.request(metodo, url, headers=headers, timeout=timeout or self._timeout,
+                                          **kwargs)
             except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
                 if intento < REINTENTOS_TRANSITORIOS:
                     intento += 1
@@ -243,6 +247,8 @@ class GeeService:
                 continue
             if resp.status_code >= 400:
                 raise self._error_api(resp)
+            if crudo:
+                return resp.content
             try:
                 return resp.json() if resp.content else {}
             except ValueError as exc:
@@ -295,6 +301,19 @@ class GeeService:
         log.info("Mapa de Earth Engine creado: %s", nombre)
         return MapaGee(name=nombre, url_format=url_format)
 
+    def calcular_pixeles(self, cuerpo: Mapping[str, Any], timeout=TIMEOUT_CALCULO) -> bytes:
+        """`POST /v1/projects/{project}/image:computePixels`: calcula la
+        expresión sobre la grilla pedida y devuelve los píxeles codificados
+        en `fileFormat` (p. ej. los bytes de un PNG). Ver `validar_pedido_pixeles`."""
+        cuerpo = validar_pedido_pixeles(cuerpo)
+        datos = self._pedir(
+            "POST", f"projects/{self.project_id}/image:computePixels", crudo=True, timeout=timeout,
+            data=json.dumps(cuerpo, allow_nan=False, ensure_ascii=False).encode("utf-8"),
+        )
+        if not datos:
+            raise GeeApiError("Earth Engine devolvió una imagen vacía.")
+        return datos
+
 
 # =============================================================================
 # Esquema de la API v1 (developers.google.com/earth-engine/reference/rest/v1)
@@ -323,6 +342,13 @@ CAMPOS_VISUALIZACION = {"ranges", "paletteColors", "gamma", "opacity"}
 # ZIPPED_GEO_TIFF* solo de miniaturas; UNSPECIFIED no es un valor útil).
 FORMATOS_MAPA = {"JPEG", "PNG", "AUTO_JPEG_PNG", "NPY", "GEO_TIFF"}
 FORMATOS_8_BITS = {"JPEG", "PNG", "AUTO_JPEG_PNG"}   # salida de 1 o 3 bandas
+# projects.image.computePixels
+CAMPOS_PIXELES = {"expression", "fileFormat", "grid", "bandIds", "visualizationOptions", "workloadTag"}
+FORMATOS_PIXELES = FORMATOS_MAPA
+CAMPOS_GRILLA = {"dimensions", "affineTransform", "crsCode", "crsWkt"}
+CAMPOS_AFIN = {"scaleX", "shearX", "translateX", "shearY", "scaleY", "translateY"}
+MAX_LADO_PIXELES = 32768                   # "at most 32K pixels in either dimension"
+MAX_BYTES_PIXELES = 48 * 1024 * 1024       # "limited to 48MB in uncompressed data per request"
 _RE_COLOR = re.compile(r"^(#?[0-9A-Fa-f]{3}|#?[0-9A-Fa-f]{6}|[A-Za-z]+)$")
 _RE_ENTERO = re.compile(r"^-?\d+$")
 
@@ -522,6 +548,61 @@ def validar_payload_mapa(payload: Any) -> dict:
     if isinstance(payload, Mapping) and "name" in payload:
         raise _error("name", "es un campo de salida (lo asigna Google); no va en el pedido")
     payload = _solo_campos(payload, CAMPOS_MAPA, "payload")
+    return _validar_imagen_comun(payload, FORMATOS_MAPA)
+
+
+def _validar_grilla(grid: Any, ruta: str = "grid") -> dict:
+    """PixelGrid {dimensions {width, height}, affineTransform {...}, crsCode | crsWkt}."""
+    grid = _solo_campos(grid, CAMPOS_GRILLA, ruta)
+    salida: dict = {}
+    if "dimensions" in grid:
+        dim = _solo_campos(grid["dimensions"], {"width", "height"}, f"{ruta}.dimensions")
+        for lado in ("width", "height"):
+            v = dim.get(lado)
+            if not isinstance(v, int) or isinstance(v, bool) or not 1 <= v <= MAX_LADO_PIXELES:
+                raise _error(f"{ruta}.dimensions.{lado}", f"entero entre 1 y {MAX_LADO_PIXELES} (llegó {v!r})")
+        salida["dimensions"] = {"width": dim["width"], "height": dim["height"]}
+    if "affineTransform" in grid:
+        at = _solo_campos(grid["affineTransform"], CAMPOS_AFIN, f"{ruta}.affineTransform")
+        salida["affineTransform"] = {k: _numero_finito(at.get(k, 0), f"{ruta}.affineTransform.{k}")
+                                     for k in ("scaleX", "shearX", "translateX", "shearY", "scaleY", "translateY")}
+        if salida["affineTransform"]["scaleX"] == 0 or salida["affineTransform"]["scaleY"] == 0:
+            raise _error(f"{ruta}.affineTransform", "scaleX / scaleY no pueden ser 0")
+    crs = [c for c in ("crsCode", "crsWkt") if c in grid]
+    if len(crs) > 1:
+        raise _error(ruta, "lleva 'crsCode' o 'crsWkt', no ambos")
+    for c in crs:
+        if not isinstance(grid[c], str) or not grid[c].strip():
+            raise _error(f"{ruta}.{c}", "debe ser un string no vacío (ej. 'EPSG:4326')")
+        salida[c] = grid[c]
+    return salida
+
+
+def validar_pedido_pixeles(pedido: Any) -> dict:
+    """Valida el cuerpo de `projects.image.computePixels` (esquema v1):
+    {expression, fileFormat, grid, bandIds, visualizationOptions, workloadTag}.
+    Controla además el límite documentado: 48 MB sin comprimir (ancho x alto x
+    bandas x bytes por banda; 1 byte en PNG / JPEG visualizados) y 32K píxeles
+    por lado."""
+    pedido = _solo_campos(pedido, CAMPOS_PIXELES, "pedido")
+    cuerpo = _validar_imagen_comun(pedido, FORMATOS_PIXELES)
+    if pedido.get("grid") is not None:
+        cuerpo["grid"] = _validar_grilla(pedido["grid"])
+    if pedido.get("workloadTag") is not None:
+        if not isinstance(pedido["workloadTag"], str):
+            raise _error("workloadTag", "debe ser un string")
+        cuerpo["workloadTag"] = pedido["workloadTag"]
+    dim = cuerpo.get("grid", {}).get("dimensions")
+    if dim and cuerpo.get("fileFormat") in FORMATOS_8_BITS:
+        bandas = len(cuerpo.get("bandIds") or [None, None, None])
+        if dim["width"] * dim["height"] * bandas > MAX_BYTES_PIXELES:
+            raise _error("grid.dimensions",
+                         f"{dim['width']}x{dim['height']}x{bandas} bandas supera el límite de 48 MB por pedido")
+    return cuerpo
+
+
+def _validar_imagen_comun(payload: Mapping, formatos: set) -> dict:
+    """Campos compartidos por maps.create y computePixels."""
     if "expression" not in payload:
         raise _error("expression", "falta la expresión de Earth Engine")
     cuerpo: dict = {"expression": validar_expresion(payload["expression"])}
@@ -537,8 +618,8 @@ def validar_payload_mapa(payload: Any) -> dict:
 
     formato = payload.get("fileFormat")
     if formato is not None:
-        if not isinstance(formato, str) or formato not in FORMATOS_MAPA:
-            raise _error("fileFormat", f"{formato!r} no sirve para teselas; usar uno de {sorted(FORMATOS_MAPA)}")
+        if not isinstance(formato, str) or formato not in formatos:
+            raise _error("fileFormat", f"{formato!r} no sirve para teselas; usar uno de {sorted(formatos)}")
         if formato in FORMATOS_8_BITS and bandas is not None and bandas not in (1, 3):
             raise _error("fileFormat", f"{formato} necesita 1 o 3 bandas y bandIds tiene {bandas}")
         cuerpo["fileFormat"] = formato
