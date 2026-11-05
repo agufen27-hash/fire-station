@@ -229,6 +229,11 @@ def main() -> None:
         "--noconfirm",
         "--collect-all", "playwright",
         "--hidden-import", "sqlalchemy.dialects.sqlite",
+        # Cliente de Google Earth Engine: todavía no lo importa ninguna pantalla,
+        # pero tiene que viajar en el .exe (la clave va aparte, en config/).
+        "--hidden-import", "app.services.gee_service",
+        "--hidden-import", "google.oauth2.service_account",
+        "--hidden-import", "google.auth.transport.requests",
         "--icon", str(ICONO_APP),
         "--add-data", f"{ICONO_APP}{sep}resources",
         "--add-data", f"{LOGO_INSTITUCIONAL}{sep}resources",

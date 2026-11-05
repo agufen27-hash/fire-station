@@ -18,8 +18,15 @@ playwright==1.47.0
 # Certificados HTTPS actualizados (ruteo OSRM: en PCs con la raíz de Windows vencida)
 certifi==2026.05.20
 
-# Puente cloud: API REST de Supabase (app/services/supabase_client.py)
+# Puente cloud: API REST de Supabase (app/services/supabase_client.py) y de
+# Google Earth Engine (app/services/gee_service.py). Pin fijo; cumple >=2.28.0.
 requests==2.34.2
+
+# Google Earth Engine (REST): OAuth 2.0 con cuenta de servicio
+google-auth>=2.0.0
+
+# Exportación de zonas operativas a KMZ (app/utils/kmz_exporter.py)
+simplekml>=1.3.6
 
 # Códigos QR de los activos: generación (segno, Python puro) y lectura por
 # cámara (zxing-cpp, decodificador nativo chico; usa numpy)

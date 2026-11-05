@@ -480,7 +480,13 @@ class MapWidget(QWidget):
         boton_exportar.clicked.connect(self._exportar_kml)
         fila.addWidget(boton_exportar)
 
-        for boton in (boton_buscar, boton_importar, boton_exportar):
+        boton_kmz = QPushButton("📦 Exportar KMZ", self)
+        boton_kmz.setToolTip("Exporta el polígono dibujado como zona operativa (perímetro, despliegue, "
+                             "búsqueda o exclusión) en un .kmz con estilo semitransparente.")
+        boton_kmz.clicked.connect(self._exportar_kmz)
+        fila.addWidget(boton_kmz)
+
+        for boton in (boton_buscar, boton_importar, boton_exportar, boton_kmz):
             boton.setObjectName("botonHerramienta")
         return fila
 
@@ -891,6 +897,22 @@ class MapWidget(QWidget):
             return
         QMessageBox.information(self, "KML exportado", f"Se guardó en:\n{ruta_texto}")
 
+    def _exportar_kmz(self) -> None:
+        if len(self._anillo) < 3:
+            QMessageBox.information(self, "Nada para exportar",
+                                    "Dibujá (o importá) un polígono primero.")
+            return
+        from app.ui.kmz_export_dialog import ExportarZonasKmzDialog, ZonaExportable
+
+        parte = self._numero_parte_actual
+        nombre = f"Parte N° {parte}" if parte else "Zona operativa"
+        detalle = f"Superficie {self._superficie_ha:.2f} ha · perímetro {self._perimetro_m:.0f} m"
+        punto = self.punto()
+        zona = ZonaExportable(nombre, [(lat, lon) for lon, lat in self._anillo], detalle, punto=punto)
+        archivo = f"zona_parte_{parte.replace('/', '-')}.kmz" if parte else None
+        ExportarZonasKmzDialog([zona], self, nombre_documento=f"Fire Station - {nombre}",
+                               nombre_archivo=archivo).exec()
+
     # -- Capa de solo lectura (vista de operaciones) ------------------------------
 
     def limpiar_solo_lectura(self) -> None:
@@ -1140,9 +1162,17 @@ class OperationsMapWindow(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
 
+        fila = QHBoxLayout()
         boton_actualizar = QPushButton("Actualizar", self)
         boton_actualizar.clicked.connect(self.refrescar)
-        layout.addWidget(boton_actualizar, 0)
+        boton_kmz = QPushButton("📦 Exportar zonas a KMZ", self)
+        boton_kmz.setToolTip("Exporta los polígonos de los partes (perímetros, áreas de despliegue, "
+                             "zonas de búsqueda) a un .kmz para Google Earth / Avenza.")
+        boton_kmz.clicked.connect(self.exportar_zonas_kmz)
+        fila.addWidget(boton_actualizar)
+        fila.addStretch(1)
+        fila.addWidget(boton_kmz)
+        layout.addLayout(fila, 0)
 
         self.mapa = MapWidget(self, modo_operativo=True)
         layout.addWidget(self.mapa, 1)
@@ -1162,3 +1192,45 @@ class OperationsMapWindow(QWidget):
         self.mapa.limpiar_solo_lectura()
         for numero_parte, lat, lng, geojson in datos:
             self.mapa.agregar_incidente_solo_lectura(lat, lng, numero_parte or "", geojson)
+
+    def zonas_exportables(self) -> list:
+        """Partes con polígono guardado -> ZonaExportable (más recientes primero)."""
+        from app.db import get_session
+        from app.models import Incidente
+        from app.ui.kmz_export_dialog import ZonaExportable
+
+        with get_session() as session:
+            filas = [
+                (inc.numero_parte, inc.fecha, inc.latitud, inc.longitud, inc.superficie_ha,
+                 inc.geometria_geojson, inc.calle_altura, inc.localidad)
+                for inc in session.query(Incidente)
+                .filter(Incidente.geometria_geojson.isnot(None))
+                .order_by(Incidente.fecha.desc(), Incidente.id.desc())
+                .all()
+            ]
+        zonas = []
+        for parte, fecha, lat, lng, sup, geojson, calle, localidad in filas:
+            try:
+                anillo = _anillo_de_geojson(geojson)
+            except (ValueError, KeyError, TypeError, IndexError):
+                continue
+            if len(anillo) < 3:
+                continue
+            detalle = " · ".join(x for x in (
+                fecha.strftime("%d/%m/%Y") if fecha else "",
+                f"{sup:.2f} ha" if sup else "",
+                ", ".join(y for y in (calle, localidad) if y),
+            ) if x)
+            punto = (lat, lng) if lat is not None and lng is not None else None
+            zonas.append(ZonaExportable(f"Parte N° {parte}", [(la, lo) for lo, la in anillo], detalle,
+                                        punto=punto))
+        return zonas
+
+    def exportar_zonas_kmz(self) -> None:
+        from app.ui.kmz_export_dialog import ExportarZonasKmzDialog
+
+        zonas = self.zonas_exportables()
+        if not zonas:
+            QMessageBox.information(self, "Sin zonas", "Ningún parte guardado tiene un polígono dibujado.")
+            return
+        ExportarZonasKmzDialog(zonas, self).exec()

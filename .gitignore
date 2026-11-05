@@ -7,6 +7,8 @@ data/
 *.db-journal
 *.sqlite3
 config/config.json
+# Clave privada de la cuenta de servicio de Google Earth Engine
+config/gee_service_account.json
 .env
 
 # Planillas e informes generados: tienen nombres y DNI de casos reales.
