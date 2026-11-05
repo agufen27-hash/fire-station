@@ -52,7 +52,7 @@ def test_mapeo_y_telefono_duplicado_queda_sin_telefono():
         _persona(1, "0358 15 564-6300", legajo="59-027", id_ruba=10),
         _persona(2, "3585646300", activo=False, legajo=""),
     ])
-    assert filas[0] == {"id": 1, "legajo": "59-027", "id_ruba": 10, "nombre_completo": "Perez1, Ana",
+    assert filas[0] == {"id": 1, "legajo": "59-027", "id_ruba": 10, "dni": None, "nombre_completo": "Perez1, Ana",
                         "jerarquia": None, "telefono_whatsapp": "5493585646300",
                         "rol": "BOMBERO", "activo": True}
     assert filas[1]["telefono_whatsapp"] is None and filas[1]["legajo"] is None and not filas[1]["activo"]
@@ -102,3 +102,61 @@ def test_credenciales_env_y_faltantes(monkeypatch, tmp_path):
     assert cargar_credenciales() == SupabaseCredenciales("https://cfg.co", "k1")
     monkeypatch.setenv("SUPABASE_SERVICE_KEY", "k-env")
     assert cargar_credenciales().service_key == "k-env"
+
+
+# -- Legajos digitales -> Storage ------------------------------------------------
+
+def _resp(json_data=None):
+    r = mock.Mock(status_code=200, content=b"x")
+    r.raise_for_status.return_value = None
+    r.json.return_value = json_data
+    return r
+
+
+def test_mapeo_documentos_ruta_storage_sin_tildes(tmp_path):
+    from datetime import datetime
+
+    archivo = tmp_path / "DNI frente ñandú.pdf"
+    archivo.write_bytes(b"%PDF-1.4 hola")
+    doc = SimpleNamespace(id=7, personal_id=3, tipo_documento="DNI", nombre_archivo=archivo.name,
+                          ruta_archivo=str(archivo), fecha_subida=datetime(2026, 11, 5, 10, 0))
+    fila = SupabaseBridge.mapear_documentos([doc])[0]
+    assert fila["storage_path"] == "3/7_DNI_frente_nandu.pdf"
+    assert fila["tamanio_bytes"] == len(b"%PDF-1.4 hola")
+    assert fila["mime_type"] == "application/pdf"
+
+
+def test_subir_documentos_sube_nuevos_salta_iguales_y_borra_huerfanos(tmp_path):
+    a = tmp_path / "a.pdf"; a.write_bytes(b"12345")
+    b = tmp_path / "b.pdf"; b.write_bytes(b"123")
+    locales = [
+        {"id": 1, "personal_id": 3, "tipo_documento": "DNI", "nombre_archivo": "a.pdf",
+         "storage_path": "3/1_a.pdf", "tamanio_bytes": 5, "mime_type": "application/pdf",
+         "fecha_subida": None, "_ruta_local": a},
+        {"id": 2, "personal_id": 3, "tipo_documento": "Libreta Operativa", "nombre_archivo": "b.pdf",
+         "storage_path": "3/2_b.pdf", "tamanio_bytes": 3, "mime_type": "application/pdf",
+         "fecha_subida": None, "_ruta_local": b},
+        {"id": 4, "personal_id": 3, "tipo_documento": "DNI", "nombre_archivo": "falta.pdf",
+         "storage_path": "3/4_falta.pdf", "tamanio_bytes": None, "mime_type": "application/pdf",
+         "fecha_subida": None, "_ruta_local": tmp_path / "falta.pdf"},
+    ]
+    remotos = [{"id": 1, "storage_path": "3/1_a.pdf", "tamanio_bytes": 5},
+               {"id": 9, "storage_path": "5/9_viejo.pdf", "tamanio_bytes": 1}]
+    session = requests.Session()
+    with mock.patch.object(session, "request", side_effect=[_resp(remotos)] + [_resp()] * 5) as req:
+        res = _bridge(session).subir_documentos(locales)
+    assert (res.subidos, res.sin_cambios, res.eliminados, len(res.omitidos)) == (1, 1, 1, 1)
+    llamadas = [(c.args[0], c.args[1].split("supabase.co/")[1]) for c in req.call_args_list]
+    assert llamadas == [
+        ("GET", "rest/v1/legajo_documentos"),
+        ("POST", "storage/v1/object/legajos/3/2_b.pdf"),
+        ("POST", "rest/v1/legajo_documentos"),
+        ("DELETE", "storage/v1/object/legajos"),
+        ("DELETE", "rest/v1/legajo_documentos"),
+    ]
+    subida = req.call_args_list[1].kwargs
+    assert subida["headers"]["x-upsert"] == "true" and subida["data"] == b"123"
+    assert req.call_args_list[2].kwargs["json"][0]["id"] == 2
+    assert "_ruta_local" not in req.call_args_list[2].kwargs["json"][0]
+    assert req.call_args_list[3].kwargs["json"] == {"prefixes": ["5/9_viejo.pdf"]}
+    assert req.call_args_list[4].kwargs["params"] == {"id": "in.(9)"}

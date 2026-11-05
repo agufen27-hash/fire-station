@@ -1,6 +1,9 @@
 """
 Puente local -> cloud: sincroniza el padrón de SQLite (`personal`) con la
-tabla `public.personal_cloud` de Supabase vía la API REST (PostgREST).
+tabla `public.personal_cloud` de Supabase vía la API REST (PostgREST), y los
+documentos del legajo digital (`documentos_personal` + archivos en
+data/legajos/) con el bucket privado `legajos` de Storage y la tabla
+`public.legajo_documentos` (los consulta el bot de WhatsApp).
 
 Credenciales (NUNCA en el código fuente), en este orden de prioridad:
   1. Variables de entorno  SUPABASE_URL  y  SUPABASE_SERVICE_KEY
@@ -15,9 +18,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+import mimetypes
 import re
-from dataclasses import dataclass
+import unicodedata
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Iterable, Optional
+from urllib.parse import quote
 
 import requests
 
@@ -26,6 +33,9 @@ from app.paths import get_writable_dir
 log = logging.getLogger(__name__)
 
 TABLA_PERSONAL = "personal_cloud"
+TABLA_DOCUMENTOS = "legajo_documentos"
+BUCKET_LEGAJOS = "legajos"
+TAMANIO_MAX_DOCUMENTO = 25 * 1024 * 1024   # = file_size_limit del bucket
 TIMEOUT_SEGUNDOS = (5, 20)          # (conexión, lectura)
 TAMANIO_LOTE = 500
 
@@ -142,6 +152,26 @@ def normalizar_telefono_ar(crudo: Optional[str]) -> Optional[str]:
     return None
 
 
+def _nombre_storage(nombre: str) -> str:
+    """Nombre de archivo apto para una clave de Storage (sin tildes ni símbolos raros)."""
+    base = unicodedata.normalize("NFKD", nombre).encode("ascii", "ignore").decode("ascii")
+    base = re.sub(r"[^A-Za-z0-9._-]+", "_", base).strip("._") or "documento"
+    return base[-120:]
+
+
+def ruta_storage_documento(personal_id: int, documento_id: int, nombre_archivo: str) -> str:
+    """Clave del archivo en el bucket `legajos`: {personal_id}/{documento_id}_{archivo}."""
+    return f"{personal_id}/{documento_id}_{_nombre_storage(nombre_archivo)}"
+
+
+@dataclass
+class ResultadoDocumentos:
+    subidos: int = 0
+    sin_cambios: int = 0
+    eliminados: int = 0
+    omitidos: list[str] = field(default_factory=list)   # faltantes / muy grandes / con error
+
+
 # -- Bridge ------------------------------------------------------------------------
 
 class SupabaseBridge:
@@ -177,6 +207,7 @@ class SupabaseBridge:
                 "id": p.id,
                 "legajo": (p.legajo or None),
                 "id_ruba": p.id_ruba,
+                "dni": (str(getattr(p, "dni", "") or "").strip() or None),
                 "nombre_completo": p.nombre_completo(),
                 "jerarquia": p.jerarquia,
                 "telefono_whatsapp": tel,
@@ -217,4 +248,121 @@ class SupabaseBridge:
             return 0
         enviadas = self.upsert_personal(filas)
         log.info("Padrón sincronizado con Supabase: %d personas.", enviadas)
+        # Los documentos van después (legajo_documentos.personal_id -> personal_cloud).
+        # Un fallo acá no invalida el padrón ya subido: se registra y sigue.
+        try:
+            res = self.sincronizar_documentos_legajo()
+            log.info("Legajos digitales: %d subidos, %d sin cambios, %d eliminados, %d omitidos.",
+                     res.subidos, res.sin_cambios, res.eliminados, len(res.omitidos))
+        except SupabaseSyncError as exc:
+            log.warning("No se pudieron sincronizar los documentos de legajo: %s", exc)
         return enviadas
+
+    # -- Documentos del legajo digital -------------------------------------------
+
+    def _llamar(self, metodo: str, ruta: str, **kwargs) -> requests.Response:
+        """`ruta` relativa a la URL del proyecto (rest/v1/..., storage/v1/...)."""
+        url = f"{self._cred.url.rstrip('/')}/{ruta}"
+        kwargs.setdefault("timeout", self._timeout)
+        try:
+            resp = self._http.request(metodo, url, **kwargs)
+            resp.raise_for_status()
+            return resp
+        except requests.exceptions.Timeout as exc:
+            raise SupabaseSyncError(f"Timeout con Supabase ({ruta}).") from exc
+        except requests.exceptions.HTTPError as exc:
+            r = exc.response
+            raise SupabaseSyncError(
+                f"Supabase respondió {r.status_code if r is not None else '?'}: "
+                f"{(r.text if r is not None else '')[:500]}"
+            ) from exc
+        except requests.exceptions.RequestException as exc:
+            raise SupabaseSyncError(f"Error de red con Supabase: {exc}") from exc
+
+    @staticmethod
+    def mapear_documentos(documentos: Iterable) -> list[dict]:
+        """DocumentoPersonal (ORM) -> filas de legajo_documentos. Incluye
+        `_ruta_local` (no es columna) para que el llamador lea el archivo."""
+        filas: list[dict] = []
+        for d in documentos:
+            ruta = Path(d.ruta_archivo)
+            filas.append({
+                "id": d.id,
+                "personal_id": d.personal_id,
+                "tipo_documento": d.tipo_documento,
+                "nombre_archivo": d.nombre_archivo,
+                "storage_path": ruta_storage_documento(d.personal_id, d.id, d.nombre_archivo),
+                "tamanio_bytes": ruta.stat().st_size if ruta.is_file() else None,
+                "mime_type": mimetypes.guess_type(d.nombre_archivo)[0] or "application/octet-stream",
+                "fecha_subida": d.fecha_subida.isoformat() if d.fecha_subida else None,
+                "_ruta_local": ruta,
+            })
+        return filas
+
+    def sincronizar_documentos_legajo(self) -> ResultadoDocumentos:
+        """Sube a Storage los documentos nuevos o modificados (cambió el tamaño
+        o la ruta), actualiza `legajo_documentos` y borra de la nube los que
+        ya no existen en la base local."""
+        from app.db import get_session
+        from app.models import DocumentoPersonal
+
+        with get_session() as session:
+            locales = self.mapear_documentos(
+                session.query(DocumentoPersonal).order_by(DocumentoPersonal.id).all())
+        return self.subir_documentos(locales)
+
+    def subir_documentos(self, locales: list[dict]) -> ResultadoDocumentos:
+        remotos = {
+            f["id"]: f for f in self._llamar(
+                "GET", f"rest/v1/{TABLA_DOCUMENTOS}",
+                params={"select": "id,storage_path,tamanio_bytes"}).json()
+        }
+        res = ResultadoDocumentos()
+        a_registrar: list[dict] = []
+        for fila in locales:
+            fila = dict(fila)
+            ruta: Path = fila.pop("_ruta_local")
+            if fila["tamanio_bytes"] is None:
+                res.omitidos.append(f"{fila['nombre_archivo']} (no se encuentra el archivo)")
+                continue
+            if fila["tamanio_bytes"] > TAMANIO_MAX_DOCUMENTO:
+                res.omitidos.append(f"{fila['nombre_archivo']} (supera 25 MB)")
+                continue
+            previo = remotos.get(fila["id"])
+            if (previo and previo["storage_path"] == fila["storage_path"]
+                    and previo["tamanio_bytes"] == fila["tamanio_bytes"]):
+                res.sin_cambios += 1
+                continue
+            try:
+                self._llamar(
+                    "POST", f"storage/v1/object/{BUCKET_LEGAJOS}/{quote(fila['storage_path'])}",
+                    data=ruta.read_bytes(),
+                    headers={"Content-Type": fila["mime_type"], "x-upsert": "true"},
+                    timeout=(5, 120),
+                )
+            except (OSError, SupabaseSyncError) as exc:
+                log.warning("No se pudo subir %s: %s", ruta, exc)
+                res.omitidos.append(f"{fila['nombre_archivo']} ({exc})")
+                continue
+            if previo and previo["storage_path"] != fila["storage_path"]:
+                self._borrar_objetos([previo["storage_path"]])
+            a_registrar.append(fila)
+            res.subidos += 1
+
+        for i in range(0, len(a_registrar), TAMANIO_LOTE):
+            self._llamar("POST", f"rest/v1/{TABLA_DOCUMENTOS}", params={"on_conflict": "id"},
+                         json=a_registrar[i:i + TAMANIO_LOTE],
+                         headers={"Prefer": "resolution=merge-duplicates,return=minimal"})
+
+        ids_locales = {f["id"] for f in locales}
+        huerfanos = [f for id_, f in remotos.items() if id_ not in ids_locales]
+        if huerfanos:
+            self._borrar_objetos([f["storage_path"] for f in huerfanos])
+            ids = ",".join(str(f["id"]) for f in huerfanos)
+            self._llamar("DELETE", f"rest/v1/{TABLA_DOCUMENTOS}", params={"id": f"in.({ids})"})
+            res.eliminados = len(huerfanos)
+        return res
+
+    def _borrar_objetos(self, rutas: list[str]) -> None:
+        if rutas:
+            self._llamar("DELETE", f"storage/v1/object/{BUCKET_LEGAJOS}", json={"prefixes": rutas})
