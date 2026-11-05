@@ -10,10 +10,14 @@ from app.services.gee_service import (
     GeeApiError,
     GeeAuthError,
     GeeConfigError,
+    GeePayloadError,
     GeeService,
     GeeSinConexion,
     cargar_info_cuenta_servicio,
+    expresion_asset,
+    payload_asset,
     payload_mapa,
+    validar_payload_mapa,
 )
 
 PAYLOAD = payload_mapa({"result": "0", "values": {"0": {"constantValue": 1}}}, file_format="PNG",
@@ -75,8 +79,11 @@ def test_solicitar_mapa_devuelve_url_format():
     assert mapa.url_tesela(5, 10, 20).endswith("/tiles/5/10/20")
     args, kwargs = req.call_args
     assert args == ("POST", "https://earthengine.googleapis.com/v1/projects/mi-proyecto/maps")
-    assert kwargs["json"]["fileFormat"] == "PNG" and "expression" in kwargs["json"]
+    cuerpo = json.loads(kwargs["data"])
+    assert cuerpo["fileFormat"] == "PNG" and "expression" in cuerpo
+    assert kwargs["params"] == {"fields": "name"}
     assert kwargs["headers"]["Authorization"] == "Bearer tok-1"
+    assert kwargs["headers"]["Content-Type"] == "application/json"
     assert cred.refrescos == 1
 
 
@@ -206,3 +213,136 @@ def test_cuenta_de_servicio_real_firma_con_rsa():
                                   "token_uri": "https://oauth2.googleapis.com/token"})
     assert srv.project_id == "p"
     assert "https://www.googleapis.com/auth/earthengine" in srv._cred.scopes
+
+
+# -- Esquema del payload de projects.maps.create (API v1) -------------------------------
+
+SRTM_ESPERADO = {
+    "expression": {
+        "values": {"0": {"functionInvocationValue": {
+            "functionName": "Image.load",
+            "arguments": {"id": {"constantValue": "USGS/SRTMGL1_003"}},
+        }}},
+        "result": "0",
+    },
+    "fileFormat": "PNG",
+    "bandIds": ["elevation"],
+    "visualizationOptions": {
+        "ranges": [{"min": 0, "max": 3000}],
+        "paletteColors": ["006633", "E5FFCC", "662A00", "D8D8D8", "F5F5F5"],
+        "gamma": 1.2,
+        "opacity": 0.8,
+    },
+}
+
+
+def _expr(values, result="0"):
+    return {"expression": {"values": values, "result": result}}
+
+
+def test_payload_asset_srtm_coincide_con_el_esquema_v1():
+    payload = payload_asset("USGS/SRTMGL1_003", minimo=0, maximo=3000, banda="elevation",
+                            paleta=SRTM_ESPERADO["visualizationOptions"]["paletteColors"],
+                            gamma=1.2, opacidad=0.8)
+    assert payload == SRTM_ESPERADO
+
+
+def test_asset_srtm_se_envia_tal_cual_con_respuesta_mockeada():
+    srv, _, pedir = _servicio([_resp(200, {"name": "projects/mi-proyecto/maps/srtm1"})])
+    with pedir as req:
+        mapa = srv.solicitar_mapa(SRTM_ESPERADO)
+    kwargs = req.call_args.kwargs
+    enviado = json.loads(kwargs["data"].decode("utf-8"))
+    assert enviado == SRTM_ESPERADO                      # sin campos agregados ni perdidos
+    assert set(enviado) <= {"expression", "fileFormat", "bandIds", "visualizationOptions"}
+    assert "json" not in kwargs and kwargs["params"] == {"fields": "name"}
+    assert mapa.url_format.endswith("/v1/projects/mi-proyecto/maps/srtm1/tiles/{z}/{x}/{y}")
+
+
+def test_expresion_asset_con_version_usa_integer_value_string():
+    expr = expresion_asset("USGS/SRTMGL1_003", version=3)
+    args = expr["values"]["0"]["functionInvocationValue"]["arguments"]
+    assert args == {"id": {"constantValue": "USGS/SRTMGL1_003"}, "version": {"integerValue": "3"}}
+
+
+def test_normaliza_integer_value_y_descarta_visualizacion_vacia():
+    cuerpo = validar_payload_mapa({**_expr({"0": {"integerValue": 7}}), "visualizationOptions": {}})
+    assert cuerpo == {"expression": {"values": {"0": {"integerValue": "7"}}, "result": "0"}}
+
+
+def test_expresion_compuesta_valida_con_referencias_y_funciones():
+    payload = {
+        **_expr({
+            "img": {"functionInvocationValue": {"functionName": "Image.load",
+                                                "arguments": {"id": {"constantValue": "USGS/SRTMGL1_003"}}}},
+            "f": {"functionDefinitionValue": {"argumentNames": ["x"], "body": "cuerpo"}},
+            "cuerpo": {"functionInvocationValue": {"functionName": "Image.select",
+                                                   "arguments": {"input": {"argumentReference": "x"},
+                                                                 "bandSelectors": {"arrayValue": {"values": [
+                                                                     {"constantValue": "elevation"}]}}}}},
+            "0": {"functionInvocationValue": {"functionReference": "f",
+                                              "arguments": {"x": {"valueReference": "img"}}}},
+        }),
+        "fileFormat": "AUTO_JPEG_PNG",
+    }
+    assert validar_payload_mapa(payload) == payload
+
+
+@pytest.mark.parametrize("payload, fragmento", [
+    ({**_expr({"0": {"constantValue": 1}}), "name": "projects/p/maps/x"}, "campo de salida"),
+    ({**_expr({"0": {"constantValue": 1}}), "min": 0}, "desconocido"),
+    ({**_expr({"0": {"constantValue": 1}}), "palette": ["red"]}, "desconocido"),
+    ({"fileFormat": "PNG"}, "falta la expresión"),
+    ({"expression": {"values": {"0": {"constantValue": 1}}, "result": "0", "extra": 1}}, "desconocido"),
+    (_expr({"0": {"constantValue": 1}}, result="1"), "no es una clave"),
+    (_expr({}), "no vacío"),
+    (_expr({"0": {}}), "exactamente una variante"),
+    (_expr({"0": {"constantValue": 1, "integerValue": "1"}}), "exactamente una variante"),
+    (_expr({"0": {"nullValue": None}}), "desconocido"),
+    (_expr({"0": {"constantValue": float("nan")}}), "número finito"),
+    (_expr({"0": {"integerValue": "1.5"}}), "entero"),
+    (_expr({"0": {"bytesValue": "no es base64!"}}), "base64"),
+    (_expr({"0": {"valueReference": "nada"}}), "no existe"),
+    (_expr({"0": {"valueReference": "1"}, "1": {"valueReference": "0"}}), "cíclicas"),
+    (_expr({"0": {"functionInvocationValue": {"arguments": {}}}}), "uno y solo uno"),
+    (_expr({"0": {"functionInvocationValue": {"functionName": "Image.load", "functionReference": "0"}}}),
+     "uno y solo uno"),
+    (_expr({"0": {"functionInvocationValue": {"functionName": "Image.load", "args": {}}}}), "desconocido"),
+    ({**_expr({"0": {"constantValue": 1}}), "fileFormat": "TF_RECORD_IMAGE"}, "no sirve para teselas"),
+    ({**_expr({"0": {"constantValue": 1}}), "fileFormat": "png"}, "no sirve para teselas"),
+    ({**_expr({"0": {"constantValue": 1}}), "fileFormat": "PNG", "bandIds": ["a", "b"]}, "1 o 3 bandas"),
+    ({**_expr({"0": {"constantValue": 1}}), "bandIds": []}, "lista no vacía"),
+    ({**_expr({"0": {"constantValue": 1}}), "visualizationOptions": {"min": 0}}, "desconocido"),
+    ({**_expr({"0": {"constantValue": 1}}), "visualizationOptions": {"gamma": {"value": 1}}}, "número finito"),
+    ({**_expr({"0": {"constantValue": 1}}), "visualizationOptions": {"gamma": 0}}, "mayor que 0"),
+    ({**_expr({"0": {"constantValue": 1}}), "visualizationOptions": {"opacity": 1.5}}, "entre 0 y 1"),
+    ({**_expr({"0": {"constantValue": 1}}), "visualizationOptions": {"ranges": [{"min": 0}]}}, "'min' y 'max'"),
+    ({**_expr({"0": {"constantValue": 1}}), "visualizationOptions": {"ranges": [{"min": 0, "max": True}]}},
+     "número finito"),
+    ({**_expr({"0": {"constantValue": 1}}), "bandIds": ["r", "g", "b"],
+      "visualizationOptions": {"paletteColors": ["red", "blue"]}}, "1 banda"),
+    ({**_expr({"0": {"constantValue": 1}}), "bandIds": ["r", "g", "b"],
+      "visualizationOptions": {"ranges": [{"min": 0, "max": 1}] * 2}}, "rangos para 3 bandas"),
+    ({**_expr({"0": {"constantValue": 1}}), "visualizationOptions": {"paletteColors": ["rgb(1,2,3)"]}},
+     "color CSS"),
+])
+def test_payload_invalido_se_rechaza_sin_llamar_a_la_api(payload, fragmento):
+    srv, _, pedir = _servicio([])
+    with pedir as req, pytest.raises(GeePayloadError, match=fragmento.replace("(", r"\(").replace(")", r"\)")):
+        srv.solicitar_mapa(payload)
+    req.assert_not_called()
+
+
+def test_payload_error_sigue_siendo_gee_api_error():
+    with pytest.raises(GeeApiError):
+        validar_payload_mapa({"expression": {"values": {"0": {}}, "result": "0"}})
+
+
+def test_400_del_servidor_con_payload_valido_se_traduce():
+    cuerpo = {"error": {"code": 400, "status": "INVALID_ARGUMENT",
+                        "message": "Image.load: Image asset 'USGS/NO_EXISTE' not found."}}
+    srv, _, pedir = _servicio([_resp(400, cuerpo)])
+    with pedir, pytest.raises(GeeApiError) as exc:
+        srv.solicitar_mapa(payload_asset("USGS/NO_EXISTE", minimo=0, maximo=1))
+    assert not isinstance(exc.value, GeePayloadError)
+    assert exc.value.status_api == "INVALID_ARGUMENT" and "not found" in str(exc.value)

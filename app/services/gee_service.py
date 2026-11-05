@@ -17,7 +17,10 @@ proyecto (rol "Earth Engine Resource Viewer" o superior).
 
 Uso:
     servicio = GeeService()
-    mapa = servicio.solicitar_mapa({"expression": {...}, "fileFormat": "PNG"})
+    mapa = servicio.solicitar_mapa(payload_asset("USGS/SRTMGL1_003", minimo=0, maximo=3000,
+                                                 banda="elevation"))
+    # o un EarthEngineMap armado a mano: {"expression": {...}, "fileFormat": "PNG", ...}
+    # (se valida contra el esquema v1 antes de enviarlo: ver validar_payload_mapa)
     mapa.url_format   # https://earthengine.googleapis.com/v1/projects/.../maps/.../tiles/{z}/{x}/{y}
 
 Todas las llamadas son BLOQUEANTES: desde la UI se corren en un QThread.
@@ -25,15 +28,19 @@ Todas las llamadas son BLOQUEANTES: desde la UI se corren en un QThread.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
+import math
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass
 from datetime import timezone
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, Sequence
 
 import requests
 
@@ -80,6 +87,11 @@ class GeeApiError(GeeError):
         super().__init__(mensaje)
         self.status_http = status_http
         self.status_api = status_api
+
+
+class GeePayloadError(GeeApiError):
+    """El payload no respeta el esquema de la API v1: se rechaza ANTES de
+    enviarlo (Google respondería 400 INVALID_ARGUMENT)."""
 
 
 # -- Resultado ----------------------------------------------------------------------
@@ -261,13 +273,21 @@ class GeeService:
     # -- API pública -----------------------------------------------------------------------
 
     def solicitar_mapa(self, payload: Mapping[str, Any]) -> MapaGee:
-        """`POST /v1/projects/{project}/maps` con un payload de Earth Engine
+        """`POST /v1/projects/{project}/maps` con un EarthEngineMap
         (`{"expression": {...}, "fileFormat": ..., "bandIds": [...],
         "visualizationOptions": {...}}`) y devuelve el mapa con su plantilla
-        de teselas XYZ (`urlFormat`)."""
-        if not isinstance(payload, Mapping) or not isinstance(payload.get("expression"), Mapping):
-            raise GeeApiError("El payload del mapa debe incluir un objeto 'expression' de Earth Engine.")
-        datos = self._pedir("POST", f"projects/{self.project_id}/maps", json=dict(payload))
+        de teselas XYZ (`urlFormat`).
+
+        El payload se valida y normaliza con `validar_payload_mapa` (un error
+        de esquema es `GeePayloadError`, sin llamar a la API) y se serializa
+        como JSON estricto (sin NaN / Infinity). `fields=name`: Google
+        devuelve solo el nombre del mapa en vez de repetir todo el pedido."""
+        cuerpo = validar_payload_mapa(payload)
+        datos = self._pedir(
+            "POST", f"projects/{self.project_id}/maps",
+            params={"fields": "name"},
+            data=json.dumps(cuerpo, allow_nan=False, ensure_ascii=False).encode("utf-8"),
+        )
         nombre = datos.get("name")
         if not nombre:
             raise GeeApiError(f"Earth Engine no devolvió el nombre del mapa: {json.dumps(datos)[:200]}")
@@ -276,14 +296,298 @@ class GeeService:
         return MapaGee(name=nombre, url_format=url_format)
 
 
+# =============================================================================
+# Esquema de la API v1 (developers.google.com/earth-engine/reference/rest/v1)
+#
+#   EarthEngineMap        {expression, fileFormat, bandIds[], visualizationOptions}
+#                         (`name` es de salida: no va en el pedido)
+#   Expression            {values: {clave: ValueNode}, result: clave}
+#   ValueNode             EXACTAMENTE una variante de VARIANTES_VALUE_NODE
+#   FunctionInvocation    {functionName | functionReference, arguments: {nombre: ValueNode}}
+#   FunctionDefinition    {argumentNames: [str], body: clave}
+#   VisualizationOptions  {ranges: [{min, max}], paletteColors: [str], gamma: número, opacity: 0-1}
+#
+# Un asset se carga como lo serializa el cliente oficial (ee.Image('ID')):
+#   {"functionInvocationValue": {"functionName": "Image.load",
+#                                "arguments": {"id": {"constantValue": "USGS/SRTMGL1_003"}}}}
+# =============================================================================
+
+CAMPOS_MAPA = {"expression", "fileFormat", "bandIds", "visualizationOptions"}
+CAMPOS_EXPRESION = {"values", "result"}
+VARIANTES_VALUE_NODE = {
+    "constantValue", "integerValue", "bytesValue", "arrayValue", "dictionaryValue",
+    "functionDefinitionValue", "functionInvocationValue", "argumentReference", "valueReference",
+}
+CAMPOS_VISUALIZACION = {"ranges", "paletteColors", "gamma", "opacity"}
+# ImageFileFormat válidos para teselas (TF_RECORD_IMAGE es solo de exportación y
+# ZIPPED_GEO_TIFF* solo de miniaturas; UNSPECIFIED no es un valor útil).
+FORMATOS_MAPA = {"JPEG", "PNG", "AUTO_JPEG_PNG", "NPY", "GEO_TIFF"}
+FORMATOS_8_BITS = {"JPEG", "PNG", "AUTO_JPEG_PNG"}   # salida de 1 o 3 bandas
+_RE_COLOR = re.compile(r"^(#?[0-9A-Fa-f]{3}|#?[0-9A-Fa-f]{6}|[A-Za-z]+)$")
+_RE_ENTERO = re.compile(r"^-?\d+$")
+
+
+def _error(ruta: str, mensaje: str) -> GeePayloadError:
+    return GeePayloadError(f"Payload de Earth Engine inválido en '{ruta}': {mensaje}")
+
+
+def _es_numero(v: Any) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _numero_finito(v: Any, ruta: str) -> float:
+    if not _es_numero(v) or not math.isfinite(v):
+        raise _error(ruta, f"se esperaba un número finito y llegó {v!r}")
+    return v
+
+
+def _solo_campos(obj: Any, permitidos: set, ruta: str) -> Mapping:
+    if not isinstance(obj, Mapping):
+        raise _error(ruta, f"se esperaba un objeto JSON y llegó {type(obj).__name__}")
+    desconocidos = sorted(set(obj) - permitidos)
+    if desconocidos:
+        raise _error(ruta, f"campo(s) desconocido(s) {desconocidos}; permitidos: {sorted(permitidos)}")
+    return obj
+
+
+def _json_constante(v: Any, ruta: str) -> Any:
+    """constantValue = google.protobuf.Value: null, bool, número finito, string,
+    lista u objeto con claves string. Devuelve una copia JSON pura."""
+    if v is None or isinstance(v, (bool, str)):
+        return v
+    if _es_numero(v):
+        return _numero_finito(v, ruta)
+    if isinstance(v, Mapping):
+        if not all(isinstance(k, str) for k in v):
+            raise _error(ruta, "las claves de un objeto constante deben ser strings")
+        return {k: _json_constante(x, f"{ruta}.{k}") for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_json_constante(x, f"{ruta}[{i}]") for i, x in enumerate(v)]
+    raise _error(ruta, f"tipo no serializable como constante: {type(v).__name__}")
+
+
+class _ValidadorExpresion:
+    def __init__(self, valores: Mapping[str, Any]) -> None:
+        self.claves = set(valores)
+        self.referencias: dict = {k: set() for k in valores}   # para detectar ciclos
+
+    def nodo(self, nodo: Any, ruta: str, origen: str) -> dict:
+        nodo = _solo_campos(nodo, VARIANTES_VALUE_NODE, ruta)
+        if len(nodo) != 1:
+            raise _error(ruta, f"un ValueNode lleva exactamente una variante y tiene {len(nodo)}: {sorted(nodo)}")
+        (variante, v), = nodo.items()
+        r = f"{ruta}.{variante}"
+        if variante == "constantValue":
+            return {variante: _json_constante(v, r)}
+        if variante == "integerValue":  # int64 -> string en JSON
+            if _es_numero(v) and float(v).is_integer():
+                v = str(int(v))
+            if not isinstance(v, str) or not _RE_ENTERO.match(v):
+                raise _error(r, f"se esperaba un entero (como string) y llegó {v!r}")
+            return {variante: v}
+        if variante == "bytesValue":
+            try:
+                base64.b64decode(v, validate=True)
+            except (binascii.Error, TypeError, ValueError) as exc:
+                raise _error(r, "se esperaba un string en base64") from exc
+            return {variante: v}
+        if variante == "arrayValue":
+            v = _solo_campos(v, {"values"}, r)
+            items = v.get("values", [])
+            if not isinstance(items, (list, tuple)):
+                raise _error(f"{r}.values", "se esperaba una lista de ValueNode")
+            return {variante: {"values": [self.nodo(x, f"{r}.values[{i}]", origen) for i, x in enumerate(items)]}}
+        if variante == "dictionaryValue":
+            v = _solo_campos(v, {"values"}, r)
+            return {variante: {"values": self.mapa_nodos(v.get("values", {}), f"{r}.values", origen)}}
+        if variante == "functionInvocationValue":
+            v = _solo_campos(v, {"functionName", "functionReference", "arguments"}, r)
+            nombres = [c for c in ("functionName", "functionReference") if c in v]
+            if len(nombres) != 1:
+                raise _error(r, "lleva 'functionName' o 'functionReference' (uno y solo uno)")
+            clave = nombres[0]
+            if not isinstance(v[clave], str) or not v[clave].strip():
+                raise _error(f"{r}.{clave}", "debe ser un string no vacío")
+            if clave == "functionReference":
+                self.referencia(v[clave], f"{r}.{clave}", origen)
+            salida = {clave: v[clave]}
+            if "arguments" in v:
+                salida["arguments"] = self.mapa_nodos(v["arguments"], f"{r}.arguments", origen)
+            return {variante: salida}
+        if variante == "functionDefinitionValue":
+            v = _solo_campos(v, {"argumentNames", "body"}, r)
+            nombres = v.get("argumentNames", [])
+            if not isinstance(nombres, (list, tuple)) or not all(isinstance(n, str) and n for n in nombres):
+                raise _error(f"{r}.argumentNames", "se esperaba una lista de strings")
+            self.referencia(v.get("body"), f"{r}.body", origen)
+            return {variante: {"argumentNames": list(nombres), "body": v["body"]}}
+        if variante == "argumentReference":
+            if not isinstance(v, str) or not v:
+                raise _error(r, "debe ser el nombre (string) de un argumento de la función")
+            return {variante: v}
+        # valueReference
+        self.referencia(v, r, origen)
+        return {variante: v}
+
+    def mapa_nodos(self, valores: Any, ruta: str, origen: str) -> dict:
+        if not isinstance(valores, Mapping) or not all(isinstance(k, str) for k in valores):
+            raise _error(ruta, "se esperaba un objeto {nombre: ValueNode}")
+        return {k: self.nodo(x, f"{ruta}.{k}", origen) for k, x in valores.items()}
+
+    def referencia(self, clave: Any, ruta: str, origen: str) -> None:
+        if not isinstance(clave, str) or clave not in self.claves:
+            raise _error(ruta, f"referencia a {clave!r}, que no existe en expression.values")
+        self.referencias[origen].add(clave)
+
+    def sin_ciclos(self) -> None:
+        estado: dict = {}
+
+        def visitar(k: str, camino: list) -> None:
+            if estado.get(k) == "listo":
+                return
+            if estado.get(k) == "visitando":
+                raise _error("expression.values", f"referencias cíclicas: {' -> '.join(camino + [k])}")
+            estado[k] = "visitando"
+            for dest in self.referencias[k]:
+                visitar(dest, camino + [k])
+            estado[k] = "listo"
+
+        for k in self.referencias:
+            visitar(k, [])
+
+
+def validar_expresion(expresion: Any, ruta: str = "expression") -> dict:
+    """Valida un Expression ({values, result}) y devuelve una copia JSON pura."""
+    expresion = _solo_campos(expresion, CAMPOS_EXPRESION, ruta)
+    valores = expresion.get("values")
+    if not isinstance(valores, Mapping) or not valores:
+        raise _error(f"{ruta}.values", "debe ser un objeto no vacío {clave: ValueNode}")
+    if not all(isinstance(k, str) and k for k in valores):
+        raise _error(f"{ruta}.values", "las claves deben ser strings no vacíos")
+    resultado = expresion.get("result")
+    if not isinstance(resultado, str) or resultado not in valores:
+        raise _error(f"{ruta}.result", f"{resultado!r} no es una clave de {ruta}.values")
+    validador = _ValidadorExpresion(valores)
+    salida = {k: validador.nodo(n, f"{ruta}.values.{k}", origen=k) for k, n in valores.items()}
+    validador.sin_ciclos()
+    return {"values": salida, "result": resultado}
+
+
+def validar_visualizacion(vis: Any, bandas: Optional[int] = None,
+                          ruta: str = "visualizationOptions") -> dict:
+    vis = _solo_campos(vis, CAMPOS_VISUALIZACION, ruta)
+    salida: dict = {}
+    if "ranges" in vis:
+        rangos = vis["ranges"]
+        if not isinstance(rangos, (list, tuple)) or not rangos:
+            raise _error(f"{ruta}.ranges", "se esperaba una lista no vacía de {min, max}")
+        if bandas is not None and len(rangos) not in (1, bandas):
+            raise _error(f"{ruta}.ranges", f"hay {len(rangos)} rangos para {bandas} bandas (va 1 o uno por banda)")
+        salida["ranges"] = []
+        for i, rango in enumerate(rangos):
+            r = f"{ruta}.ranges[{i}]"
+            rango = _solo_campos(rango, {"min", "max"}, r)
+            if set(rango) != {"min", "max"}:
+                raise _error(r, "cada rango lleva 'min' y 'max'")
+            salida["ranges"].append({"min": _numero_finito(rango["min"], f"{r}.min"),
+                                     "max": _numero_finito(rango["max"], f"{r}.max")})
+    if "paletteColors" in vis:
+        paleta = vis["paletteColors"]
+        if not isinstance(paleta, (list, tuple)) or not paleta:
+            raise _error(f"{ruta}.paletteColors", "se esperaba una lista no vacía de colores")
+        for i, color in enumerate(paleta):
+            if not isinstance(color, str) or not _RE_COLOR.match(color):
+                raise _error(f"{ruta}.paletteColors[{i}]", f"color CSS inválido: {color!r}")
+        if bandas is not None and bandas != 1:
+            raise _error(f"{ruta}.paletteColors", f"una paleta solo se aplica a 1 banda (bandIds tiene {bandas})")
+        salida["paletteColors"] = list(paleta)
+    if "gamma" in vis:  # número, no un objeto {"value": ...}
+        gamma = _numero_finito(vis["gamma"], f"{ruta}.gamma")
+        if gamma <= 0:
+            raise _error(f"{ruta}.gamma", "debe ser mayor que 0")
+        salida["gamma"] = gamma
+    if "opacity" in vis:
+        opacidad = _numero_finito(vis["opacity"], f"{ruta}.opacity")
+        if not 0 <= opacidad <= 1:
+            raise _error(f"{ruta}.opacity", "debe estar entre 0 y 1")
+        salida["opacity"] = opacidad
+    return salida
+
+
+def validar_payload_mapa(payload: Any) -> dict:
+    """Valida un EarthEngineMap para `projects.maps.create` contra el esquema
+    v1 y devuelve una copia JSON pura y normalizada. Campos desconocidos,
+    variantes mezcladas, referencias rotas o números no finitos se rechazan
+    con `GeePayloadError` (lo que la API respondería con 400)."""
+    if isinstance(payload, Mapping) and "name" in payload:
+        raise _error("name", "es un campo de salida (lo asigna Google); no va en el pedido")
+    payload = _solo_campos(payload, CAMPOS_MAPA, "payload")
+    if "expression" not in payload:
+        raise _error("expression", "falta la expresión de Earth Engine")
+    cuerpo: dict = {"expression": validar_expresion(payload["expression"])}
+
+    bandas: Optional[int] = None
+    if payload.get("bandIds") is not None:
+        ids = payload["bandIds"]
+        if (not isinstance(ids, (list, tuple)) or not ids
+                or not all(isinstance(b, str) and b.strip() for b in ids)):
+            raise _error("bandIds", "se esperaba una lista no vacía de nombres de banda")
+        cuerpo["bandIds"] = list(ids)
+        bandas = len(ids)
+
+    formato = payload.get("fileFormat")
+    if formato is not None:
+        if not isinstance(formato, str) or formato not in FORMATOS_MAPA:
+            raise _error("fileFormat", f"{formato!r} no sirve para teselas; usar uno de {sorted(FORMATOS_MAPA)}")
+        if formato in FORMATOS_8_BITS and bandas is not None and bandas not in (1, 3):
+            raise _error("fileFormat", f"{formato} necesita 1 o 3 bandas y bandIds tiene {bandas}")
+        cuerpo["fileFormat"] = formato
+
+    if payload.get("visualizationOptions") is not None:
+        vis = validar_visualizacion(payload["visualizationOptions"], bandas)
+        if vis:  # como el cliente oficial: vacío no se envía (cambia el comportamiento del servidor)
+            cuerpo["visualizationOptions"] = vis
+    return cuerpo
+
+
+# -- Constructores --------------------------------------------------------------------
+
+def expresion_asset(asset_id: str, version: Optional[int] = None) -> dict:
+    """Expression que carga un asset de imagen, igual que ee.Image('ID')."""
+    if not isinstance(asset_id, str) or not asset_id.strip():
+        raise _error("expression", "el ID del asset no puede estar vacío")
+    argumentos: dict = {"id": {"constantValue": asset_id.strip()}}
+    if version is not None:
+        argumentos["version"] = {"integerValue": str(int(version))}
+    return {"values": {"0": {"functionInvocationValue": {"functionName": "Image.load", "arguments": argumentos}}},
+            "result": "0"}
+
+
 def payload_mapa(expression: Mapping[str, Any], *, file_format: str = "AUTO_JPEG_PNG",
-                 band_ids: Optional[list] = None,
+                 band_ids: Optional[Sequence[str]] = None,
                  visualizacion: Optional[Mapping[str, Any]] = None) -> dict:
-    """Arma el cuerpo de `projects.maps.create` a partir de una expresión
-    serializada de Earth Engine."""
-    cuerpo: dict = {"expression": dict(expression), "fileFormat": file_format}
+    """Arma (y valida) el cuerpo de `projects.maps.create` a partir de una
+    expresión serializada de Earth Engine."""
+    cuerpo: dict = {"expression": expression, "fileFormat": file_format}
     if band_ids:
         cuerpo["bandIds"] = list(band_ids)
     if visualizacion:
-        cuerpo["visualizationOptions"] = dict(visualizacion)
-    return cuerpo
+        cuerpo["visualizationOptions"] = visualizacion
+    return validar_payload_mapa(cuerpo)
+
+
+def payload_asset(asset_id: str, *, minimo: float, maximo: float, banda: Optional[str] = None,
+                  paleta: Optional[Sequence[str]] = None, gamma: Optional[float] = None,
+                  opacidad: Optional[float] = None, file_format: str = "PNG") -> dict:
+    """Mapa de una banda de un asset con estirado min/max y paleta opcional.
+    Ej. relieve SRTM: payload_asset("USGS/SRTMGL1_003", minimo=0, maximo=3000,
+    banda="elevation", paleta=["006633", "E5FFCC", "662A00", "D8D8D8", "F5F5F5"])."""
+    vis: dict = {"ranges": [{"min": minimo, "max": maximo}]}
+    if paleta:
+        vis["paletteColors"] = list(paleta)
+    if gamma is not None:
+        vis["gamma"] = gamma
+    if opacidad is not None:
+        vis["opacity"] = opacidad
+    return payload_mapa(expresion_asset(asset_id), file_format=file_format,
+                        band_ids=[banda] if banda else None, visualizacion=vis)
