@@ -49,14 +49,15 @@ class DialogoAutorizacionRoles(QDialog):
     """Pide la cuenta institucional de RUBA (o la clave maestra si no hay
     cuenta guardada). Se cierra aceptado solo con la credencial correcta."""
 
-    def __init__(self, parent: Optional[QWidget] = None) -> None:
+    def __init__(self, parent: Optional[QWidget] = None, titulo: str = "Autorizar cambio de roles",
+                 accion: str = "cambiar roles", texto_boton: str = "Autorizar y guardar") -> None:
         super().__init__(parent)
-        self.setWindowTitle("Autorizar cambio de roles")
+        self.setWindowTitle(titulo)
         self.setModal(True)
         self.setMinimumWidth(400)
         self.usa_ruba = autorizacion_roles_usa_ruba()
         layout = QVBoxLayout(self)
-        texto = ("Para cambiar roles ingresá la cuenta institucional de RUBA configurada en el sistema."
+        texto = (f"Para {accion} ingresá la cuenta institucional de RUBA configurada en el sistema."
                  if self.usa_ruba else
                  "Todavía no hay credenciales de RUBA guardadas: autorizá con la clave maestra del cuartel.")
         explicacion = QLabel(texto, self)
@@ -79,7 +80,7 @@ class DialogoAutorizacionRoles(QDialog):
         self.label_error.hide()
         layout.addWidget(self.label_error)
         botones = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, self)
-        botones.button(QDialogButtonBox.StandardButton.Ok).setText("Autorizar y guardar")
+        botones.button(QDialogButtonBox.StandardButton.Ok).setText(texto_boton)
         botones.accepted.connect(self._confirmar)
         botones.rejected.connect(self.reject)
         layout.addWidget(botones)

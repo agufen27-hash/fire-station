@@ -15,6 +15,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import math
 import re
 import shutil
 import threading
@@ -34,6 +35,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QCompleter,
     QDialog,
+    QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -990,7 +992,18 @@ class MainWindow(QMainWindow):
         grid_servicio.addWidget(QLabel("N° Parte"), 0, 0)
         self.label_numero_parte = QLineEdit(marco)
         self.label_numero_parte.setReadOnly(True)
-        grid_servicio.addWidget(self.label_numero_parte, 0, 1)
+        self.label_numero_parte.setMaxLength(20)  # columna incidentes.numero_parte
+        # Tilde "Editar": el N° se sugiere solo (NNN/AAAA) pero se puede corregir
+        # a mano (p. ej. para seguir la numeración del libro en papel).
+        self.check_editar_numero_parte = QCheckBox("Editar", marco)
+        self.check_editar_numero_parte.setToolTip(
+            "Tildá para modificar el N° de Parte a mano. Tiene que tener dígitos y no repetirse.")
+        self.check_editar_numero_parte.toggled.connect(self._on_editar_numero_parte)
+        fila_numero = QHBoxLayout()
+        fila_numero.setContentsMargins(0, 0, 0, 0)
+        fila_numero.addWidget(self.label_numero_parte, 1)
+        fila_numero.addWidget(self.check_editar_numero_parte)
+        grid_servicio.addLayout(fila_numero, 0, 1)
 
         grid_servicio.addWidget(QLabel("Fecha"), 0, 2)
         self.campo_fecha = DateField(marco)
@@ -1444,10 +1457,29 @@ class MainWindow(QMainWindow):
 
     # -- Validación y guardado -------------------------------------------------
 
+    def _on_editar_numero_parte(self, editable: bool) -> None:
+        self.label_numero_parte.setReadOnly(not editable)
+        if editable:
+            self.label_numero_parte.setFocus()
+            self.label_numero_parte.selectAll()
+        else:
+            self.label_numero_parte.setText(self.label_numero_parte.text().strip())
+
+    def _errores_numero_parte(self) -> List[str]:
+        """N° con dígitos (RUBA) y sin repetir otro parte de la base."""
+        numero = self.label_numero_parte.text().strip()
+        if not numero_parte_ruba(numero):
+            return ["El N° de Parte no es válido (RUBA necesita dígitos)."]
+        with get_session() as session:
+            consulta = session.query(Incidente.id).filter(Incidente.numero_parte == numero)
+            if self._incidente_en_edicion is not None:
+                consulta = consulta.filter(Incidente.id != self._incidente_en_edicion)
+            if consulta.first() is not None:
+                return [f"Ya existe otro parte con el N° {numero}."]
+        return []
+
     def _validar(self) -> list[str]:
-        errores = []
-        if not numero_parte_ruba(self.label_numero_parte.text()):
-            errores.append("El N° de Parte no es válido (RUBA necesita dígitos).")
+        errores = list(self._errores_numero_parte())
         falta_tipo = self.combo_tipo.currentData() is None
         falta_categoria = self.combo_categoria.currentData() is None
         falta_calle = not self.entry_calle.text().strip()
@@ -1471,9 +1503,7 @@ class MainWindow(QMainWindow):
         """Servicio en curso: solo lo que impide guardar (N° de parte, personas
         fuera del padrón o repetidas, unidades sin móvil). Sin regreso, sin
         Encargado y sin datos de cierre está permitido."""
-        errores = []
-        if not numero_parte_ruba(self.label_numero_parte.text()):
-            errores.append("El N° de Parte no es válido (RUBA necesita dígitos).")
+        errores = list(self._errores_numero_parte())
         errores.extend(self.panel_damnificados.validar(parcial=True))
         errores.extend(self.panel_dotaciones.validar(parcial=True))
         errores.extend(self._validar_personas_del_servicio())
@@ -1583,6 +1613,8 @@ class MainWindow(QMainWindow):
             if incidente is not None:
                 for campo, valor in campos.items():
                     setattr(incidente, campo, valor)
+                # N° corregido a mano con el tilde "Editar" (ya validado: no se repite).
+                incidente.numero_parte = self.label_numero_parte.text().strip() or incidente.numero_parte
                 # Corregido tras un error: vuelve a PENDIENTE para cargarlo desde el
                 # Historial (conserva ruba_id_remoto: el reintento retoma ese incidente).
                 if incidente.estado_ruba != EstadoRuba.SINCRONIZADO.value:
@@ -1595,7 +1627,7 @@ class MainWindow(QMainWindow):
                     relacion.clear()
                 session.flush()
             else:
-                incidente = Incidente(numero_parte=self.label_numero_parte.text(),
+                incidente = Incidente(numero_parte=self.label_numero_parte.text().strip(),
                                       estado_ruba=EstadoRuba.PENDIENTE.value, **campos)
                 session.add(incidente)
                 session.flush()  # asigna incidente.id
@@ -2184,6 +2216,7 @@ class MainWindow(QMainWindow):
         }
 
     def _cargar_formulario(self, d: Dict[str, Any]) -> None:
+        self.check_editar_numero_parte.setChecked(False)
         self.label_numero_parte.setText(d["numero_parte"])
         if d["fecha"]:
             self.campo_fecha.set_value(d["fecha"])
@@ -2278,6 +2311,7 @@ class MainWindow(QMainWindow):
         self._incidente_en_edicion = None  # lo próximo que se guarde es un servicio nuevo
         self._edicion_de_cerrado = False
         self._edicion_de_sincronizado = False
+        self.check_editar_numero_parte.setChecked(False)
         with get_session() as session:
             self.label_numero_parte.setText(siguiente_numero_parte(session))
 
@@ -3287,7 +3321,8 @@ class MainWindow(QMainWindow):
         texto = QLabel(
             "Reiniciar partes: borra TODOS los partes/incidentes para empezar la carga limpia del año. "
             "Se conservan el personal, las unidades, los contactos y la configuración del cuartel. "
-            "Antes se guarda un respaldo completo de la base en data/respaldos/.", caja)
+            "Antes se guarda un respaldo completo de la base en data/respaldos/. "
+            "Requiere autorizar con el usuario y la clave de RUBA del cuartel.", caja)
         texto.setWordWrap(True)
         texto.setProperty("muted", True)
         layout.addWidget(texto)
@@ -3310,30 +3345,30 @@ class MainWindow(QMainWindow):
         if cantidad == 0:
             QMessageBox.information(self, "Reiniciar partes", "No hay partes cargados: la base ya está en cero.")
             return
-        dialogo = QDialog(self)
-        dialogo.setWindowTitle("Reiniciar partes")
-        layout = QVBoxLayout(dialogo)
-        aviso = QLabel(
-            f"Se van a borrar los {cantidad} partes cargados (con sus dotaciones, damnificados y estados "
-            "de RUBA). El personal, las unidades y la configuración se conservan y se guarda un respaldo "
-            "de la base antes de borrar.\n\nPara confirmar escribí BORRAR:", dialogo)
-        aviso.setWordWrap(True)
-        layout.addWidget(aviso)
-        entrada = QLineEdit(dialogo)
-        layout.addWidget(entrada)
-        fila = QHBoxLayout()
-        fila.addStretch(1)
-        boton_cancelar = QPushButton("Cancelar", dialogo)
-        boton_cancelar.clicked.connect(dialogo.reject)
-        boton_borrar = QPushButton("Borrar todos los partes", dialogo)
-        boton_borrar.setObjectName("botonQuitarFila")
-        boton_borrar.setEnabled(False)
-        boton_borrar.clicked.connect(dialogo.accept)
-        entrada.textChanged.connect(lambda t: boton_borrar.setEnabled(t.strip() == "BORRAR"))
-        fila.addWidget(boton_cancelar)
-        fila.addWidget(boton_borrar)
-        layout.addLayout(fila)
-        if dialogo.exec() != QDialog.DialogCode.Accepted:
+        from app.services.personal_service import autorizacion_roles_usa_ruba
+        from app.ui.roles_widgets import DialogoAutorizacionRoles
+
+        # Formatear la base exige la cuenta institucional de RUBA (no alcanza la clave maestra).
+        if not autorizacion_roles_usa_ruba():
+            QMessageBox.warning(
+                self, "Falta la cuenta de RUBA",
+                "Para reiniciar los partes hay que autorizar con el usuario de RUBA del cuartel. "
+                "Cargalo primero en Configuración → RUBA y guardá.")
+            return
+        if QMessageBox.warning(
+                self, "Reiniciar partes",
+                f"Se van a borrar los {cantidad} partes cargados (con sus dotaciones, damnificados y estados "
+                "de RUBA) para empezar a usar la app sin registros. El personal, las unidades y la "
+                "configuración se conservan y se guarda un respaldo de la base antes de borrar.\n\n"
+                "¿Continuar? A continuación se pide el usuario de RUBA para autorizar.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        autorizacion = DialogoAutorizacionRoles(self, titulo="Autorizar reinicio de partes",
+                                                accion="borrar todos los partes",
+                                                texto_boton="Autorizar y borrar")
+        if autorizacion.exec() != QDialog.DialogCode.Accepted:
             return
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
@@ -3377,18 +3412,41 @@ class MainWindow(QMainWindow):
         self._label_imagen_mapa = QLabel(caja)
         self._label_imagen_mapa.setWordWrap(True)
         self._label_imagen_mapa.setProperty("muted", True)
-        boton_imagen = QPushButton("Cargar nueva imagen de mapa (.png, .jpg)", caja)
+        boton_imagen = QPushButton("Cargar nueva imagen de mapa (.png, .jpg, .tiff)", caja)
         boton_imagen.setObjectName("botonHerramienta")
         boton_imagen.clicked.connect(self._cargar_imagen_mapa)
+        boton_restaurar = QPushButton("↺ Mapa de la zona (de fábrica)", caja)
+        boton_restaurar.setObjectName("botonHerramienta")
+        boton_restaurar.setToolTip("Vuelve al mapa que viene con la app y a sus límites "
+                                   "(borra la imagen propia cargada).")
+        boton_restaurar.clicked.connect(self._restaurar_mapa_predeterminado)
         boton_satelital = QPushButton("🛰️ Descargar imagen satelital", caja)
         boton_satelital.setObjectName("botonHerramienta")
         boton_satelital.setToolTip("Baja de Google Earth Engine un compuesto Sentinel-2 sin nubes de la zona "
                                    "y lo deja como imagen base, con los límites ya calibrados.")
         boton_satelital.clicked.connect(self._descargar_imagen_satelital)
         fila_imagen.addWidget(self._label_imagen_mapa, 1)
-        fila_imagen.addWidget(boton_imagen)
-        fila_imagen.addWidget(boton_satelital)
+        columna_botones = QVBoxLayout()
+        columna_botones.addWidget(boton_imagen)
+        columna_botones.addWidget(boton_satelital)
+        columna_botones.addWidget(boton_restaurar)
+        fila_imagen.addLayout(columna_botones)
         form.addRow("Imagen base", fila_imagen)
+
+        fila_proyeccion = QHBoxLayout()
+        self._combo_proyeccion = QComboBox(caja)
+        self._combo_proyeccion.addItem("Web Mercator (EPSG:3857 · GeoTIFF de QGIS/Google)",
+                                       cartografia.PROYECCION_MERCATOR)
+        self._combo_proyeccion.addItem("Lat/Lon (EPSG:4326 · imagen satelital, cartas)",
+                                       cartografia.PROYECCION_EQUIRECTANGULAR)
+        boton_metros = QPushButton("Límites en metros (EPSG:3857)…", caja)
+        boton_metros.setObjectName("botonHerramienta")
+        boton_metros.setToolTip("Cargá los bordes Norte/Sur/Este/Oeste en metros Web Mercator "
+                                "(como los muestra QGIS); se convierten a latitud/longitud.")
+        boton_metros.clicked.connect(self._ingresar_limites_mercator)
+        fila_proyeccion.addWidget(self._combo_proyeccion, 1)
+        fila_proyeccion.addWidget(boton_metros)
+        form.addRow("Proyección de la imagen", fila_proyeccion)
 
         def spin(minimo: float, maximo: float) -> QDoubleSpinBox:
             s = QDoubleSpinBox(caja)
@@ -3426,11 +3484,18 @@ class MainWindow(QMainWindow):
         self._spin_mapa_este.setValue(calibracion.lon_este)
         self._spin_cuartel_lat.setValue(calibracion.cuartel_lat)
         self._spin_cuartel_lon.setValue(calibracion.cuartel_lon)
+        indice = self._combo_proyeccion.findData(calibracion.proyeccion)
+        self._combo_proyeccion.setCurrentIndex(max(0, indice))
         ruta = cartografia.ruta_imagen_base()
-        texto = str(ruta) if ruta else f"(sin imagen: se muestra la cuadrícula) -> {cartografia.carpeta_imagen()}"
+        if ruta is None:
+            texto = f"(sin imagen: se muestra la cuadrícula) -> {cartografia.carpeta_imagen()}"
+        elif cartografia.usa_imagen_predeterminada():
+            texto = "Mapa de la zona que viene con la app (Web Mercator)."
+        else:
+            texto = str(ruta)
         from app.services import imagen_satelital
 
-        origen = imagen_satelital.origen_actual() if ruta else None
+        origen = imagen_satelital.origen_actual() if cartografia.ruta_imagen_propia() else None
         if origen:
             texto += f"\n🛰️ {origen.get('atribucion', '')} · período {' a '.join(origen.get('periodo', []))}"
         self._label_imagen_mapa.setText(texto)
@@ -3440,30 +3505,117 @@ class MainWindow(QMainWindow):
             lat_norte=self._spin_mapa_norte.value(), lat_sur=self._spin_mapa_sur.value(),
             lon_oeste=self._spin_mapa_oeste.value(), lon_este=self._spin_mapa_este.value(),
             cuartel_lat=self._spin_cuartel_lat.value(), cuartel_lon=self._spin_cuartel_lon.value(),
+            proyeccion=self._combo_proyeccion.currentData() or cartografia.PROYECCION_EQUIRECTANGULAR,
         )
 
     def _cargar_imagen_mapa(self) -> None:
         ruta_texto, _ = QFileDialog.getOpenFileName(
-            self, "Cargar nueva imagen de mapa", "", "Imágenes (*.png *.jpg *.jpeg)"
+            self, "Cargar nueva imagen de mapa", "", "Imágenes (*.png *.jpg *.jpeg *.tif *.tiff)"
         )
         if not ruta_texto:
             return
+        origen = Path(ruta_texto)
+        es_mercator = origen.suffix.lower() in cartografia.EXTENSIONES_TIFF and cartografia.es_geotiff_mercator(origen)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            destino = cartografia.instalar_imagen_base(Path(ruta_texto))
+            destino = cartografia.instalar_imagen_base(origen)
         except (OSError, ValueError) as e:
+            QApplication.restoreOverrideCursor()
             QMessageBox.critical(self, "No se pudo cargar la imagen", str(e))
             return
+        QApplication.restoreOverrideCursor()
         from app.services import imagen_satelital
 
         # La imagen ya no es la satelital: su origen/atribución deja de aplicar.
         (cartografia.carpeta_imagen() / imagen_satelital.ARCHIVO_ORIGEN).unlink(missing_ok=True)
+        # Conserva los límites que el usuario esté editando (no se guardaron todavía).
+        calibracion = self._calibracion_de_formulario()
         self._recargar_mapas()
         self._cargar_config_mapa()
+        self._poner_calibracion_en_formulario(calibracion)
+        if es_mercator:
+            self._combo_proyeccion.setCurrentIndex(self._combo_proyeccion.findData(cartografia.PROYECCION_MERCATOR))
+        aviso_proyeccion = ("\n\nEl TIFF está en Web Mercator (EPSG:3857): se eligió esa proyección. "
+                            "Si tenés los bordes en metros usá «Límites en metros (EPSG:3857)…»."
+                            if es_mercator else "")
         QMessageBox.information(
             self, "Imagen de mapa cargada",
             f"Se copió a:\n{destino}\n\nRevisá que los límites norte/sur/oeste/este de abajo "
-            "correspondan a los bordes de ESTA imagen y guardá la configuración.",
+            f"correspondan a los bordes de ESTA imagen y guardá la configuración.{aviso_proyeccion}",
         )
+
+    def _poner_calibracion_en_formulario(self, calibracion: "cartografia.CalibracionMapa") -> None:
+        self._spin_mapa_norte.setValue(calibracion.lat_norte)
+        self._spin_mapa_sur.setValue(calibracion.lat_sur)
+        self._spin_mapa_oeste.setValue(calibracion.lon_oeste)
+        self._spin_mapa_este.setValue(calibracion.lon_este)
+        self._spin_cuartel_lat.setValue(calibracion.cuartel_lat)
+        self._spin_cuartel_lon.setValue(calibracion.cuartel_lon)
+        self._combo_proyeccion.setCurrentIndex(max(0, self._combo_proyeccion.findData(calibracion.proyeccion)))
+
+    def _ingresar_limites_mercator(self) -> None:
+        """Bordes en metros EPSG:3857 (acepta coma decimal: '-3944122,2065')."""
+        dialogo = QDialog(self)
+        dialogo.setWindowTitle("Límites en metros (Web Mercator EPSG:3857)")
+        form = QFormLayout(dialogo)
+        actual = self._calibracion_de_formulario()
+        valores_actuales = {
+            "norte": cartografia.lat_a_mercator(actual.lat_norte),
+            "sur": cartografia.lat_a_mercator(actual.lat_sur),
+            "este": math.radians(actual.lon_este) * cartografia.RADIO_MERCATOR_M,
+            "oeste": math.radians(actual.lon_oeste) * cartografia.RADIO_MERCATOR_M,
+        }
+        entradas: Dict[str, QLineEdit] = {}
+        for clave, etiqueta in (("norte", "Norte (Y arriba)"), ("sur", "Sur (Y abajo)"),
+                                ("este", "Este (X derecha)"), ("oeste", "Oeste (X izquierda)")):
+            entrada = QLineEdit(f"{valores_actuales[clave]:.4f}".replace(".", ","), dialogo)
+            form.addRow(etiqueta, entrada)
+            entradas[clave] = entrada
+        botones = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+                                   dialogo)
+        botones.accepted.connect(dialogo.accept)
+        botones.rejected.connect(dialogo.reject)
+        form.addRow(botones)
+        if dialogo.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            metros = {k: float(e.text().strip().replace(" ", "").replace(",", ".")) for k, e in entradas.items()}
+        except ValueError:
+            QMessageBox.warning(self, "Límites inválidos", "Ingresá números (ej. -3944122,2065).")
+            return
+        calibracion = cartografia.CalibracionMapa.desde_mercator(
+            metros["norte"], metros["sur"], metros["este"], metros["oeste"],
+            actual.cuartel_lat, actual.cuartel_lon)
+        if not calibracion.es_valida():
+            QMessageBox.warning(self, "Límites inválidos",
+                                "El norte tiene que ser mayor que el sur y el este mayor que el oeste.")
+            return
+        self._poner_calibracion_en_formulario(calibracion)
+        self.statusBar().showMessage("Límites convertidos a lat/lon. Guardá la configuración para aplicarlos.", 8000)
+
+    def _restaurar_mapa_predeterminado(self) -> None:
+        if not self._permitido("configurar", "Restaurar el mapa de la zona"):
+            return
+        if cartografia.ruta_imagen_predeterminada() is None:
+            QMessageBox.warning(self, "Mapa de la zona", "Esta instalación no trae el mapa de la zona.")
+            return
+        if QMessageBox.question(
+                self, "Mapa de la zona",
+                "¿Volver al mapa de la zona que viene con la app? Se borra la imagen propia cargada "
+                "y se reemplazan los límites del mapa (se conserva la ubicación del cuartel).",
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        from app.services import imagen_satelital
+
+        try:
+            cartografia.restaurar_mapa_predeterminado(self._spin_cuartel_lat.value(), self._spin_cuartel_lon.value())
+            (cartografia.carpeta_imagen() / imagen_satelital.ARCHIVO_ORIGEN).unlink(missing_ok=True)
+        except (OSError, ValueError) as e:
+            QMessageBox.critical(self, "No se pudo restaurar el mapa", str(e))
+            return
+        self._recargar_mapas()
+        self._cargar_config_mapa()
+        self.statusBar().showMessage("Mapa de la zona restaurado.", 6000)
 
     def _descargar_imagen_satelital(self) -> None:
         """Abre la descarga desde Earth Engine con los límites que están en el

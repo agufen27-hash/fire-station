@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple
 
 from app.services import cartografia
-from app.services.cartografia import CalibracionMapa
+from app.services.cartografia import PROYECCION_EQUIRECTANGULAR, CalibracionMapa
 from app.services.gee_service import (
     MAX_BYTES_PIXELES,
     MAX_LADO_PIXELES,
@@ -91,8 +91,9 @@ class PedidoImagen:
             raise ImagenSatelitalError("Sentinel-2 no tiene más detalle que 10 m por píxel.")
 
     def calibracion(self, cuartel_lat: float, cuartel_lon: float) -> CalibracionMapa:
+        # La grilla se pide en EPSG:4326: la imagen es equirectangular.
         return CalibracionMapa(self.lat_norte, self.lat_sur, self.lon_oeste, self.lon_este,
-                               cuartel_lat, cuartel_lon)
+                               cuartel_lat, cuartel_lon, PROYECCION_EQUIRECTANGULAR)
 
 
 @dataclass(frozen=True)
