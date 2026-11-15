@@ -6,6 +6,8 @@ import pytest
 
 from app.services import cartografia as c
 
+pytestmark = pytest.mark.rapido
+
 
 @pytest.fixture
 def carpetas(tmp_path, monkeypatch):

@@ -58,6 +58,7 @@ from openpyxl import load_workbook
 from openpyxl.cell.cell import MergedCell
 from openpyxl.drawing.image import Image as ImagenExcel
 from openpyxl.styles import Alignment, Color, Font
+from openpyxl.worksheet.cell_range import CellRange
 from openpyxl.worksheet.worksheet import Worksheet
 
 from app.core.horarios import fecha_fin_ajustada
@@ -87,6 +88,7 @@ DIAS_SEMANA = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", 
 
 MAPEO_PCS: Dict[str, Any] = {
     "numero_parte": "C6", "dia": "J6", "fecha": "T6",
+    "rango_fecha": "T6:Y6",  # la fecha va combinada en todo el recuadro de la cabecera
     "denunciante": "D9", "hora_llamado": "W9", "domicilio": "D10", "contacto": "D11", "dni": "D12",
     "recibio": "D13", "alarma": "D14", "hora_alarma": "Q14",
     "tipo_siniestro": "D17", "localidad": "D19", "calle": "D20", "zona": "D21",
@@ -221,6 +223,20 @@ def _insertar_firma(escritor: EscritorVerificado, coordenada: str, ruta_firma: O
 # ---------------------------------------------------------------------------
 # Utilidades
 # ---------------------------------------------------------------------------
+
+def _asegurar_combinada(hoja: Worksheet, rango: str) -> None:
+    """Garantiza que `rango` quede combinado aunque la plantilla de la PC sea
+    una versión vieja sin esa combinación. Si ya está, no toca nada; si se
+    superpone con otra combinación, deshace esa primero (la cabecera manda)."""
+    objetivo = CellRange(rango)
+    for existente in list(hoja.merged_cells.ranges):
+        if existente.coord == objetivo.coord:
+            return
+        if not existente.isdisjoint(objetivo):
+            hoja.unmerge_cells(existente.coord)
+    hoja.merge_cells(rango)
+    hoja[rango.split(":")[0]].alignment = Alignment(horizontal="center", vertical="center")
+
 
 def _ubicar_plantilla(nombre_archivo: str) -> Path:
     candidato = TEMPLATES_DIR / nombre_archivo
@@ -387,6 +403,7 @@ def _completar_pcs(incidente: Incidente) -> ResultadoPlanilla:
     wb = load_workbook(_ubicar_plantilla(PCS_TEMPLATE_NOMBRE))
     e = EscritorVerificado(wb.active, "PCS")
     m = MAPEO_PCS
+    _asegurar_combinada(wb.active, m["rango_fecha"])
 
     e.escribir(m["numero_parte"], incidente.numero_parte, "N° de parte")
     if incidente.fecha:
