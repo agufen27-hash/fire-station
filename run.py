@@ -15,6 +15,7 @@ from app.services.cartografia import asegurar_calibracion_en_config
 from app.ui.actualizaciones import iniciar_actualizaciones
 from app.ui.main_window import MainWindow
 from app.ui.theme import aplicar_tema
+from app.ui.widgets import instalar_filtro_rueda
 
 
 def _identificar_app_en_windows() -> None:
@@ -43,6 +44,7 @@ def main() -> None:
     if icono is not None:
         app.setWindowIcon(QIcon(str(icono)))  # también lo heredan los diálogos
     aplicar_tema(app)
+    instalar_filtro_rueda(app)  # la rueda no cambia fechas/horas/combos sin foco
 
     ventana = MainWindow()
     ventana.show()

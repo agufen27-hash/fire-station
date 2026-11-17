@@ -155,6 +155,10 @@ TIMEOUT_OPCIONAL_MS = 1500
 # Campos condicionales de Tipo/Subtipo (tipoLugarForestal, tipoLugar, causaIncendio...):
 # si RUBA no los dibuja en 2 s, no aplican a este subtipo y se omiten.
 TIMEOUT_CONDICIONAL_MS = 2000
+# Incidente climático: Evacuación y Superficie evacuada son obligatorios en RUBA.
+SELECTOR_EVACUACION_CLIMATICO = "#bomberos_estructurabundle_incidenteClimaticoType_evacuacion"
+SELECTOR_SUPERFICIE_CLIMATICO = "#bomberos_estructurabundle_incidenteClimaticoType_superficieEvacuada"
+EVACUACION_NO_SE_EVACUO = "1"  # opción "No se evacuó"
 # Pantalla de Vehículos intervinientes. Las filas se buscan por su row_id real
 # (la colección Symfony no arranca en 0) y nunca en el prototipo `__name__`.
 PREFIJO_VEHICULOS = "bomberos_estructurabundle_intervencionType_vehiculos"
@@ -784,6 +788,7 @@ class RubaServiceAutomation:
         self._cargar_personas_damnificadas(sel, datos)
 
         self._cargar_condicionales(datos.get("condicionales"))
+        self._cargar_evacuacion_climatico(datos.get("condicionales"))
         self._cargar_medios_aereos(datos)
         self._cargar_vehiculos_accidente(self.payload.get("vehiculos_accidentes") or [])
         if self.payload.get("damnificados", {}).get("bienes"):
@@ -1062,6 +1067,46 @@ class RubaServiceAutomation:
                 log.warning("Paso 3: no se pudo cargar %s.%s: %s", formulario, campo, detalle)
                 self.advertencias.append(f"{formulario}: no se pudo cargar '{campo}' ({detalle}); revisalo en RUBA.")
         self._avisar_combos_obligatorios_vacios(formulario, bloque, campos)
+
+    def _cargar_evacuacion_climatico(self, condicionales: Optional[Dict[str, Any]]) -> None:
+        """Incidente climático: RUBA rechaza el guardado si "Evacuación" o
+        "Superficie evacuada" quedan vacíos. Evacuación sin dato (vacío, None
+        o 0) -> "No se evacuó" (value=1); superficie sin dato -> "0". Si el
+        formulario no es climático (el combo no está en el DOM) no hace nada."""
+        bloque = (self.sel["editar_general"].get("condicionales", {}) or {}).get("climatico") or {}
+        sel_evac = bloque.get("evacuacion") or SELECTOR_EVACUACION_CLIMATICO
+        sel_sup = bloque.get("superficie_evacuada") or SELECTOR_SUPERFICIE_CLIMATICO
+        try:
+            if self.page.locator(sel_evac).count() == 0:
+                return  # no es un incidente climático
+        except PlaywrightError:
+            return
+
+        campos: Dict[str, Any] = {}
+        if condicionales and condicionales.get("formulario") == "climatico":
+            campos = condicionales.get("campos") or {}
+        evacuacion = campos.get("evacuacion")
+        superficie = campos.get("superficie_evacuada")
+
+        valor_evac = EVACUACION_NO_SE_EVACUO
+        if not _vacio(evacuacion) and str(evacuacion).strip() != "0":
+            valor_evac = str(evacuacion).strip()
+        try:
+            opciones = {o["value"] for o in self.page.locator(sel_evac).first.evaluate(_JS_OPCIONES)}
+            if valor_evac not in opciones:
+                self.advertencias.append(
+                    f"climatico: la evacuación '{valor_evac}' no existe en RUBA; se cargó 'No se evacuó'.")
+                valor_evac = EVACUACION_NO_SE_EVACUO
+            self._seleccionar(sel_evac, valor_evac)
+        except (RubaAutomationError, PlaywrightError) as e:
+            detalle = e.detalle if isinstance(e, RubaAutomationError) else str(e).splitlines()[0]
+            log.warning("Paso 3: no se pudo cargar la evacuación del climático: %s", detalle)
+            self.advertencias.append(f"climatico: no se pudo cargar 'Evacuación' ({detalle}); revisalo en RUBA.")
+
+        valor_sup = "0" if _vacio(superficie) else str(superficie).strip()
+        if not self._llenar_opcional(sel_sup, valor_sup, timeout_ms=0):
+            log.info("Paso 3: RUBA no mostró 'Superficie evacuada' (%s): se omite.", sel_sup)
+        log.info("Paso 3: climático -> evacuación=%s, superficie evacuada=%s", valor_evac, valor_sup)
 
     def _avisar_combos_obligatorios_vacios(self, formulario: str, bloque: Dict[str, Any],
                                            campos: Dict[str, Any]) -> None:

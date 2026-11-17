@@ -2,439 +2,276 @@
 <html lang="es">
 <head>
 <meta charset="utf-8">
-<title>Fire Station — Cartografía Táctica</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="stylesheet" href="leaflet.css">
-<link rel="stylesheet" href="leaflet.draw.css">
 <style>
-  /* Fondo blanco mientras llegan los mosaicos (antes quedaba en negro). */
-  html, body, #mapa { height: 100%; margin: 0; padding: 0; background-color: #FFFFFF; }
+  html, body, #mapa { height: 100%; width: 100%; margin: 0; padding: 0; background: #e5e9f0; }
+  body { font-family: "Segoe UI", sans-serif; }
   .leaflet-control-attribution { font-size: 10px; }
+  .leaflet-container.modo-cruz { cursor: crosshair; }
 
-  /* Marcador táctico propio (evita depender de los PNG por defecto de Leaflet) */
-  .marcador-incidente {
-    width: 30px; height: 30px;
-    display: flex; align-items: center; justify-content: center;
-    font-size: 20px;
-    filter: drop-shadow(0 0 3px rgba(0,0,0,0.8));
-    cursor: grab;
+  .rotulo {
+    position: absolute; z-index: 1000; pointer-events: none;
+    background: rgba(255,255,255,0.93); color: #1a1d21; border: 1px solid #cfd6e2;
+    border-radius: 6px; padding: 4px 9px; font-size: 12px; display: none;
   }
+  #rotulo-distancia { top: 10px; left: 54px; }
+  #rotulo-cursor { bottom: 22px; left: 10px; font-size: 11px; }
+  #aviso-sin-conexion { top: 10px; right: 54px; background: #fff3e0; border-color: #ffb74d; color: #e65100; }
 
-  /* Selector de capas propio, estilo institucional oscuro (reemplaza el
-     control de capas por defecto de Leaflet, que viene en blanco) */
-  #selector-capas {
-    position: absolute; top: 10px; right: 10px; z-index: 1000;
-    background: rgba(26,29,33,0.92); border: 1px solid #3a3f44; border-radius: 6px;
-    padding: 6px 10px; font: 12px/1.6 "Segoe UI", sans-serif; color: #e8e8e8;
-    box-shadow: 0 2px 6px rgba(0,0,0,0.4);
+  .marcador-cuartel div {
+    width: 30px; height: 30px; border-radius: 50%; background: #1565c0; border: 3px solid #fff;
+    box-shadow: 0 1px 4px rgba(0,0,0,.5); display: flex; align-items: center; justify-content: center;
+    font-size: 16px; box-sizing: border-box;
   }
-  #selector-capas label { display: block; cursor: pointer; user-select: none; }
-  #selector-capas input { margin-right: 6px; }
-
-  /* Pin rojo del Lugar del Siniestro */
-  .marcador-siniestro { background: transparent; border: none; }
-  .marcador-siniestro .pin {
-    width: 26px; height: 26px; border-radius: 50% 50% 50% 0;
-    background: #d32f2f; border: 2px solid #fff; transform: rotate(-45deg);
-    box-shadow: 0 0 4px rgba(0,0,0,0.6); cursor: grab;
+  .marcador-siniestro svg { filter: drop-shadow(0 1px 2px rgba(0,0,0,.55)); }
+  .vertice div {
+    width: 12px; height: 12px; border-radius: 50%; background: #fff; border: 2px solid #ff5722;
+    box-sizing: border-box; cursor: move;
   }
-  .marcador-siniestro .pin::after {
-    content: ""; position: absolute; width: 10px; height: 10px; border-radius: 50%;
-    background: #fff; top: 8px; left: 8px;
-  }
-
-  /* Base: Cuartel de Bomberos */
-  .marcador-cuartel { background: transparent; border: none; }
-  .marcador-cuartel .base {
-    width: 32px; height: 32px; border-radius: 6px; background: #1565c0; border: 2px solid #fff;
-    display: flex; align-items: center; justify-content: center; font-size: 18px;
-    box-shadow: 0 0 4px rgba(0,0,0,0.6);
-  }
-
-  /* Distancia / tiempo de la ruta, sobre el mapa */
-  #panel-ruta {
-    position: absolute; top: 10px; left: 56px; z-index: 1000; display: none;
-    background: rgba(255,255,255,0.95); color: #1a1d21; border: 1px solid #cfd6e2; border-radius: 6px;
-    padding: 5px 10px; font: 12px/1.5 "Segoe UI", sans-serif; box-shadow: 0 2px 6px rgba(0,0,0,0.25);
-  }
-  #panel-ruta b { font-size: 14px; }
-  #panel-ruta .aviso { color: #e65100; }
-
-  #banner-sin-conexion {
-    position: absolute; bottom: 10px; left: 10px; z-index: 1000;
-    background: rgba(239,108,0,0.92); color: #fff; font: 12px/1.4 "Segoe UI", sans-serif;
-    padding: 4px 10px; border-radius: 4px; display: none;
-  }
+  /* Ícono del selector de capas sin depender de images/layers.png */
+  .leaflet-control-layers-toggle { background-image: none !important; display: flex !important;
+    align-items: center; justify-content: center; font-size: 20px; text-decoration: none; }
+  .leaflet-control-layers-toggle::after { content: "🗺️"; }
+  /* La atribución va en la franja de la imagen exportada (acá saldría recortada) */
+  body.captura .leaflet-control-zoom, body.captura .leaflet-control-layers,
+  body.captura .leaflet-control-attribution, body.captura .rotulo { display: none !important; }
 </style>
 </head>
 <body>
 <div id="mapa"></div>
-<div id="selector-capas">
-  <label><input type="radio" name="capa" value="voyager" checked> Callejero (CARTO)</label>
-  <label><input type="radio" name="capa" value="satelital"> Satelital (Esri)</label>
-  <label><input type="radio" name="capa" value="satelital_google"> Satelital (Google)</label>
-  <label><input type="radio" name="capa" value="callejero"> OpenStreetMap</label>
-  <label><input type="radio" name="capa" value="oscuro"> Oscuro</label>
-</div>
-<div id="panel-ruta"></div>
-<div id="banner-sin-conexion">Sin conexión: las imágenes del mapa pueden no cargar.</div>
-
-<script src="qwebchannel.js"></script>
+<div id="rotulo-distancia" class="rotulo"></div>
+<div id="rotulo-cursor" class="rotulo"></div>
+<div id="aviso-sin-conexion" class="rotulo">⚠ Sin conexión: el fondo del mapa no carga (marcar puntos sigue funcionando).</div>
 <script src="leaflet.js"></script>
-<script src="leaflet.draw.js"></script>
+<script src="qwebchannel.js"></script>
 <script>
 "use strict";
+// Visor de Fire Station. Python (app/ui/widgets/map_widget.py) es dueño del
+// estado: esta página solo DIBUJA lo que le mandan por `fs.*` (runJavaScript)
+// y AVISA clics, teclas y vértices movidos por el objeto `puente` (QWebChannel).
+// Todo en WGS84 (lat/lon): Leaflet proyecta a Web Mercator solo para dibujar.
 
-// ---------------------------------------------------------------------
-// Estado global e inicialización del mapa
-// ---------------------------------------------------------------------
+const COLOR_SINIESTRO = "#d32f2f", COLOR_CUARTEL = "#1565c0", COLOR_POLIGONO = "#ff5722";
 
-const ADELIA_MARIA = [-33.6324, -64.0195];
-const ZOOM_OPERATIVO = 14;
+const mapa = L.map("mapa", { zoomControl: true, minZoom: 3, maxZoom: 19, doubleClickZoom: true })
+  .setView([-33.6315, -64.0152], 14);
+mapa.attributionControl.setPrefix(false);
 
-// minZoom: 3 evita que se pueda alejar tanto que Leaflet pida teselas que
-// ningún proveedor tiene (pantalla en negro por error 400/404 en cascada).
-const mapa = L.map("mapa", { zoomControl: true, attributionControl: true, minZoom: 3 })
-  .setView(ADELIA_MARIA, ZOOM_OPERATIVO);
-
-const OPCIONES_CAPA = { maxZoom: 19, minZoom: 3 };
-
+const capaCalles = L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+  maxZoom: 19, attribution: "&copy; colaboradores de OpenStreetMap",
+});
 const capaSatelital = L.tileLayer(
   "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-  { ...OPCIONES_CAPA, attribution: "Esri World Imagery" }
-);
-// Alternativa/fallback si Esri no responde (servidor caído, firewall,
-// etc.): Google Satelital Híbrido, con nombres de calle superpuestos.
-const capaSatelitalGoogle = L.tileLayer(
-  "https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
-  { ...OPCIONES_CAPA, attribution: "Google Hybrid" }
-);
-// Capa por defecto: CARTO Voyager (no exige Referer, a diferencia de las
-// teselas de OSM, que desde un file:// de QtWebEngine devolvían error y
-// dejaban el mapa en negro).
-const capaVoyager = L.tileLayer(
-  "https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png",
-  { ...OPCIONES_CAPA, attribution: "&copy; OpenStreetMap &copy; CARTO", subdomains: "abcd" }
-);
-const capaCallejero = L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
-  ...OPCIONES_CAPA, attribution: "&copy; OpenStreetMap",
-});
-const capaOscura = L.tileLayer(
-  "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
-  { ...OPCIONES_CAPA, attribution: "&copy; OpenStreetMap &copy; CARTO", subdomains: "abcd" }
-);
+  { maxZoom: 19, maxNativeZoom: 18, attribution: "Imágenes &copy; Esri" });
+capaCalles.addTo(mapa);
+L.control.layers({ "Calles (OpenStreetMap)": capaCalles, "Satelital (Esri)": capaSatelital }, null,
+                 { position: "topright" }).addTo(mapa);
 
-capaVoyager.addTo(mapa);
-let capaActual = capaVoyager;
-
-const CAPAS_POR_NOMBRE = {
-  voyager: capaVoyager,
-  satelital: capaSatelital,
-  satelital_google: capaSatelitalGoogle,
-  callejero: capaCallejero,
-  oscuro: capaOscura,
-};
-
-function cambiarCapa(nombre) {
-  mapa.removeLayer(capaActual);
-  capaActual = CAPAS_POR_NOMBRE[nombre] || capaVoyager;
-  capaActual.addTo(mapa);
-}
-document.querySelectorAll('#selector-capas input[name="capa"]').forEach((radio) => {
-  radio.addEventListener("change", (ev) => cambiarCapa(ev.target.value));
-});
-
-// El contenedor del mapa vive dentro de un QScrollArea con scroll dinámico
-// (Fase 9): si Leaflet se inicializa mientras el widget todavía no tiene su
-// tamaño final (pestaña oculta, layout en curso), calcula mal el tamaño del
-// lienzo y queda en negro/cortado hasta que algo lo obligue a recalcular.
-window.addEventListener("resize", () => mapa.invalidateSize());
-setTimeout(() => mapa.invalidateSize(), 300);
-
-// Se muestra un aviso discreto si las teselas no llegan a cargar (sin
-// internet) -- no bloquea nada, el mapa sigue usable para colocar el
-// marcador y dibujar el polígono sobre fondo gris.
-let erroresDeTesela = 0;
-[capaVoyager, capaSatelital, capaSatelitalGoogle, capaCallejero, capaOscura].forEach((capa) => {
+let erroresTesela = 0;
+[capaCalles, capaSatelital].forEach((capa) => {
   capa.on("tileerror", () => {
-    erroresDeTesela += 1;
-    if (erroresDeTesela > 3) {
-      document.getElementById("banner-sin-conexion").style.display = "block";
-    }
+    if (++erroresTesela > 3) document.getElementById("aviso-sin-conexion").style.display = "block";
+  });
+  capa.on("tileload", () => {
+    erroresTesela = 0;
+    document.getElementById("aviso-sin-conexion").style.display = "none";
   });
 });
 
-const iconoIncidente = L.divIcon({
-  className: "marcador-incidente",
-  html: "🔥",
-  iconSize: [30, 30],
-  iconAnchor: [15, 26],
-});
+// El widget puede crearse oculto (pestaña, diálogo sin mostrar): sin esto
+// Leaflet calcula mal el tamaño y queda gris o cortado.
+// Un encuadre pedido mientras el widget todavía no tiene su tamaño real
+// (Qt arranca los widgets en ~100 px) daría un zoom demasiado alejado: se
+// guarda y se aplica cuando el mapa toma su tamaño.
+const ANCHO_MINIMO_ENCUADRE = 300;
+let encuadrePendiente = null;
+new ResizeObserver(() => {
+  mapa.invalidateSize();
+  if (encuadrePendiente && mapa.getSize().x >= ANCHO_MINIMO_ENCUADRE) {
+    const [lat, lng, km] = encuadrePendiente;
+    encuadrePendiente = null;
+    fs.encuadrar(lat, lng, km);
+  }
+}).observe(document.getElementById("mapa"));
 
-const iconoSiniestro = L.divIcon({
-  className: "marcador-siniestro",
-  html: '<div class="pin"></div>',
-  iconSize: [30, 30],
-  iconAnchor: [15, 30],
-});
+const iconoCuartel = L.divIcon({ className: "marcador-cuartel", html: "<div>🚒</div>",
+                                 iconSize: [30, 30], iconAnchor: [15, 15] });
+function iconoSiniestro(escala) {
+  const w = Math.round(28 * escala), h = Math.round(38 * escala);
+  return L.divIcon({
+    className: "marcador-siniestro", iconSize: [w, h], iconAnchor: [w / 2, h],
+    html: `<svg width="${w}" height="${h}" viewBox="0 0 28 38"><path d="M14 1C7 1 1.5 6.4 1.5 13.2 1.5 22 14 37 14 37S26.5 22 26.5 13.2C26.5 6.4 21 1 14 1z" fill="${COLOR_SINIESTRO}" stroke="#fff" stroke-width="2"/><circle cx="14" cy="13" r="4.6" fill="#fff"/></svg>`,
+  });
+}
+const iconoVertice = L.divIcon({ className: "vertice", html: "<div></div>", iconSize: [12, 12], iconAnchor: [6, 6] });
 
-const iconoCuartel = L.divIcon({
-  className: "marcador-cuartel",
-  html: '<div class="base">🚒</div>',
-  iconSize: [36, 36],
-  iconAnchor: [18, 18],
-});
-
-// Python llama a configurar() al terminar la carga. Hasta entonces el mapa
-// NO acepta clics (así la vista de solo lectura nunca coloca un marcador).
+let puente = null;
 let editable = false;
-let marcadorCuartel = L.marker(ADELIA_MARIA, { icon: iconoCuartel, keyboard: false, zIndexOffset: 1000 })
-  .bindTooltip("Cuartel de Bomberos", { direction: "top", offset: [0, -16] })
-  .addTo(mapa);
-let capaRuta = new L.FeatureGroup().addTo(mapa);
+let modo = "normal";  // "normal" | "dibujo" | "edicion"
+let cuartel = null, siniestro = null, lineas = [], poligono = null, trazo = null;
+let vertices = [], capaSoloLectura = L.featureGroup().addTo(mapa);
 
-let marcador = null;
-let ignorarClicsHasta = 0;
-let edicionPoligonoActiva = false;
-let capaDibujo = new L.FeatureGroup().addTo(mapa);
-let capaSoloLectura = new L.FeatureGroup().addTo(mapa);
-let poligonoActual = null;
-let controladorDibujo = null;
-let bridge = null;
+// ---------------------------------------------------------------------------
+// Eventos hacia Python
+// ---------------------------------------------------------------------------
+let ultimoClic = { t: 0, x: -99, y: -99 };
+mapa.on("click", (e) => {
+  if (!editable || !puente) return;
+  // En modo dibujo el doble clic produce dos "click": el segundo no es un vértice.
+  const ahora = Date.now(), p = e.containerPoint;
+  const repetido = ahora - ultimoClic.t < 400 && Math.abs(p.x - ultimoClic.x) + Math.abs(p.y - ultimoClic.y) <= 5;
+  ultimoClic = { t: ahora, x: p.x, y: p.y };
+  if (modo === "dibujo" && repetido) return;
+  puente.clic(e.latlng.lat, e.latlng.lng);
+});
+mapa.on("dblclick", () => { if (editable && puente && modo === "dibujo") puente.doble_clic(); });
+mapa.on("mousemove", (e) => {
+  const r = document.getElementById("rotulo-cursor");
+  r.textContent = `${e.latlng.lat.toFixed(5)}, ${e.latlng.lng.toFixed(5)}`;
+  r.style.display = "block";
+});
+mapa.on("mouseout", () => { document.getElementById("rotulo-cursor").style.display = "none"; });
+document.addEventListener("keydown", (e) => {
+  if (!puente) return;
+  if (e.key === "Enter") puente.tecla("enter");
+  else if (e.key === "Escape") puente.tecla("escape");
+});
 
-// ---------------------------------------------------------------------
-// Marcador del incidente (punto)
-// ---------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// API para Python
+// ---------------------------------------------------------------------------
+const fs = {
+  configurar(esEditable) { editable = !!esEditable; },
 
-function colocarMarcador(lat, lng, notificarPython) {
-  if (marcador) {
-    marcador.setLatLng([lat, lng]);
-  } else {
-    marcador = L.marker([lat, lng], { icon: iconoSiniestro, draggable: editable })
-      .bindTooltip("Lugar del Siniestro", { direction: "top", offset: [0, -28] })
-      .addTo(mapa);
-    marcador.on("dragend", () => {
-      const p = marcador.getLatLng();
-      if (bridge) bridge.actualizar_marcador(p.lat, p.lng);
+  cuartel(lat, lng) {
+    if (cuartel) cuartel.setLatLng([lat, lng]);
+    else cuartel = L.marker([lat, lng], { icon: iconoCuartel, keyboard: false, zIndexOffset: 1000, interactive: true })
+      .bindTooltip("Cuartel de Bomberos", { direction: "top", offset: [0, -14] }).addTo(mapa);
+  },
+
+  // Chincheta + línea punteada al cuartel. lat === null la quita.
+  siniestro(lat, lng, rotuloHtml) {
+    lineas.forEach((l) => mapa.removeLayer(l));
+    lineas = [];
+    if (lat === null || lat === undefined) {
+      if (siniestro) { mapa.removeLayer(siniestro); siniestro = null; }
+      fs.rotulo(null);
+      return;
+    }
+    if (siniestro) siniestro.setLatLng([lat, lng]);
+    else siniestro = L.marker([lat, lng], { icon: iconoSiniestro(1), keyboard: false, zIndexOffset: 900,
+                                            interactive: false }).addTo(mapa);
+    if (cuartel) {
+      const tramo = [cuartel.getLatLng(), [lat, lng]];
+      lineas.push(L.polyline(tramo, { color: "#fff", weight: 6, opacity: 0.9, interactive: false }).addTo(mapa));
+      lineas.push(L.polyline(tramo, { color: COLOR_CUARTEL, weight: 3, dashArray: "8 6", interactive: false }).addTo(mapa));
+    }
+    fs.rotulo(rotuloHtml);
+  },
+
+  rotulo(html) {
+    const r = document.getElementById("rotulo-distancia");
+    r.innerHTML = html || "";
+    r.style.display = html ? "block" : "none";
+  },
+
+  // anillo: [[lat, lng], ...] sin cerrar. modoNuevo: "normal" | "dibujo" | "edicion".
+  poligono(anillo, modoNuevo) {
+    modo = modoNuevo;
+    [poligono, trazo].forEach((c) => { if (c) mapa.removeLayer(c); });
+    poligono = trazo = null;
+    document.getElementById("mapa").classList.toggle("modo-cruz", modo === "dibujo");
+    if (modo === "dibujo") mapa.doubleClickZoom.disable(); else mapa.doubleClickZoom.enable();
+    if (!anillo || !anillo.length) return;
+    if (modo === "dibujo") {
+      trazo = L.featureGroup([
+        L.polyline(anillo, { color: COLOR_POLIGONO, weight: 2, dashArray: "6 5", interactive: false }),
+        ...anillo.map((p) => L.circleMarker(p, { radius: 4, color: COLOR_POLIGONO, weight: 2, fillColor: "#fff",
+                                                 fillOpacity: 1, interactive: false })),
+      ]).addTo(mapa);
+    } else {
+      poligono = L.polygon(anillo, { color: COLOR_POLIGONO, weight: 3, fillOpacity: 0.25, interactive: false }).addTo(mapa);
+    }
+  },
+
+  // Vértices arrastrables (modo edición). null los quita.
+  vertices(anillo) {
+    vertices.forEach((v) => mapa.removeLayer(v));
+    vertices = [];
+    (anillo || []).forEach((p, i) => {
+      const v = L.marker(p, { icon: iconoVertice, draggable: true, zIndexOffset: 2000, keyboard: false }).addTo(mapa);
+      v.on("drag", (e) => {
+        const ll = e.target.getLatLng();
+        if (poligono) {
+          const puntos = poligono.getLatLngs()[0];
+          puntos[i] = ll;
+          poligono.setLatLngs(puntos);
+        }
+      });
+      v.on("dragend", (e) => {
+        const ll = e.target.getLatLng();
+        if (puente) puente.vertice_movido(i, ll.lat, ll.lng);
+      });
+      v.on("click", (e) => L.DomEvent.stopPropagation(e));  // un clic en el vértice no termina la edición
+      vertices.push(v);
     });
-  }
-  if (notificarPython && bridge) bridge.actualizar_marcador(lat, lng);
-}
-
-function quitarMarcador() {
-  if (marcador) {
-    mapa.removeLayer(marcador);
-    marcador = null;
-  }
-  limpiarRuta();
-}
-
-// Un clic en el mapa coloca (o mueve) el Lugar del Siniestro, salvo
-// mientras se dibuja o edita el polígono: ahí los clics son vértices.
-mapa.on("click", (ev) => {
-  if (!editable) return;
-  if (controladorDibujo && controladorDibujo.enabled()) return;
-  if (Date.now() < ignorarClicsHasta) return;  // el clic que cerró el polígono
-  if (edicionPoligonoActiva) {
-    // Clic fuera de los vértices = terminar la edición (no mueve el marcador).
-    deshabilitarEdicionPoligono();
-    return;
-  }
-  colocarMarcador(ev.latlng.lat, ev.latlng.lng, true);
-  modoColocarMarcador = false;
-  mapa.getContainer().style.cursor = "";
-});
-
-let modoColocarMarcador = false;
-function activarModoColocarMarcador() {
-  modoColocarMarcador = true;
-  mapa.getContainer().style.cursor = "crosshair";
-}
-
-// ---------------------------------------------------------------------
-// Polígono del área afectada + cálculo de superficie/perímetro
-// ---------------------------------------------------------------------
-
-function calcularAreaYPerimetro(layer) {
-  const latlngs = layer.getLatLngs()[0];
-  const areaM2 = L.GeometryUtil.geodesicArea(latlngs);
-  let perimetroM = 0;
-  for (let i = 0; i < latlngs.length; i++) {
-    const a = latlngs[i];
-    const b = latlngs[(i + 1) % latlngs.length];
-    perimetroM += a.distanceTo(b);
-  }
-  return { areaM2, perimetroM };
-}
-
-function notificarPoligono(layer) {
-  if (!bridge) return;
-  const { areaM2, perimetroM } = calcularAreaYPerimetro(layer);
-  const geojson = JSON.stringify(layer.toGeoJSON());
-  bridge.actualizar_poligono(geojson, areaM2, perimetroM);
-}
-
-function dibujarPoligonoDesdeGeoJSON(geojsonTexto) {
-  limpiarPoligono(false);
-  const datos = JSON.parse(geojsonTexto);
-  const capa = L.geoJSON(datos, {
-    style: { color: "#ff5722", weight: 3, fillColor: "#ff5722", fillOpacity: 0.25 },
-  });
-  capa.eachLayer((l) => {
-    poligonoActual = l;
-    capaDibujo.addLayer(l);
-  });
-  if (poligonoActual) {
-    mapa.fitBounds(poligonoActual.getBounds(), { padding: [40, 40] });
-    notificarPoligono(poligonoActual);
-  }
-}
-
-function iniciarDibujoPoligono() {
-  if (controladorDibujo) controladorDibujo.disable();
-  limpiarPoligono(true);
-  controladorDibujo = new L.Draw.Polygon(mapa, {
-    shapeOptions: { color: "#ff5722", weight: 3, fillColor: "#ff5722", fillOpacity: 0.25 },
-  });
-  controladorDibujo.enable();
-}
-
-function cancelarDibujoPoligono() {
-  if (controladorDibujo) {
-    controladorDibujo.disable();
-    controladorDibujo = null;
-  }
-}
-
-function limpiarPoligono(notificar) {
-  if (poligonoActual) {
-    if (poligonoActual.editing) poligonoActual.editing.disable();
-    capaDibujo.removeLayer(poligonoActual);
-    poligonoActual = null;
-    edicionPoligonoActiva = false;
-  }
-  if (notificar && bridge) bridge.actualizar_poligono("", 0, 0);
-}
-
-mapa.on(L.Draw.Event.CREATED, (ev) => {
-  poligonoActual = ev.layer;
-  capaDibujo.addLayer(poligonoActual);
-  notificarPoligono(poligonoActual);
-  controladorDibujo = null;
-  ignorarClicsHasta = Date.now() + 400;
-});
-
-// Permite re-arrastrar vértices de un polígono ya dibujado/importado
-// (L.Edit.Poly, que Leaflet.draw agrega a todo L.Polygon como `.editing`).
-function habilitarEdicionPoligono() {
-  if (!poligonoActual || !poligonoActual.editing) return;
-  poligonoActual.editing.enable();
-  edicionPoligonoActiva = true;
-  poligonoActual.on("edit", () => notificarPoligono(poligonoActual));
-}
-
-function deshabilitarEdicionPoligono() {
-  if (poligonoActual && poligonoActual.editing) poligonoActual.editing.disable();
-  edicionPoligonoActiva = false;
-}
-
-// ---------------------------------------------------------------------
-// Ruta cuartel -> siniestro (la calcula Python contra OSRM y la manda acá)
-// ---------------------------------------------------------------------
-
-function limpiarRuta() {
-  capaRuta.clearLayers();
-  const panel = document.getElementById("panel-ruta");
-  panel.style.display = "none";
-  panel.innerHTML = "";
-}
-
-function mostrarRutaCalculando() {
-  const panel = document.getElementById("panel-ruta");
-  panel.innerHTML = "Calculando ruta desde el cuartel…";
-  panel.style.display = "block";
-}
-
-// coordsLonLat: [[lon, lat], ...] (GeoJSON). offline=true -> línea recta
-// discontinua (sin internet / OSRM no disponible).
-function dibujarRuta(coordsLonLat, textoDistancia, textoDuracion, offline) {
-  capaRuta.clearLayers();
-  const latlngs = coordsLonLat.map((c) => [c[1], c[0]]);
-  if (latlngs.length < 2) return;
-  if (!offline) {
-    // Contorno blanco debajo para que la ruta se lea sobre cualquier capa.
-    L.polyline(latlngs, { color: "#ffffff", weight: 8, opacity: 0.9, interactive: false }).addTo(capaRuta);
-  }
-  L.polyline(latlngs, {
-    color: offline ? "#d32f2f" : "#1565c0",
-    weight: offline ? 3 : 5,
-    opacity: 0.9,
-    dashArray: offline ? "8 8" : null,
-    interactive: false,
-  }).addTo(capaRuta);
-
-  const panel = document.getElementById("panel-ruta");
-  panel.innerHTML = offline
-    ? `🚒 <b>${textoDistancia}</b> en línea recta<br><span class="aviso">Sin conexión al servicio de rutas</span>`
-    : `🚒 <b>${textoDistancia}</b> · ⏱ ${textoDuracion} <span style="color:#667">(estimado)</span>`;
-  panel.style.display = "block";
-
-  const limites = L.latLngBounds(latlngs);
-  if (!mapa.getBounds().contains(limites)) mapa.fitBounds(limites, { padding: [50, 50], maxZoom: 16 });
-}
-
-function configurar(opciones) {
-  editable = !!opciones.editable;
-  if (opciones.cuartel) marcadorCuartel.setLatLng(opciones.cuartel);
-  if (marcador && marcador.dragging) {
-    if (editable) marcador.dragging.enable(); else marcador.dragging.disable();
-  }
-}
-
-// ---------------------------------------------------------------------
-// API expuesta a Python (llamada vía page().runJavaScript)
-// ---------------------------------------------------------------------
-
-window.fireStationMapa = {
-  centrar: (lat, lng, zoom) => mapa.setView([lat, lng], zoom || ZOOM_OPERATIVO),
-  colocarMarcador: (lat, lng) => colocarMarcador(lat, lng, false),
-  quitarMarcador: quitarMarcador,
-  activarModoColocarMarcador: activarModoColocarMarcador,
-  iniciarDibujoPoligono: iniciarDibujoPoligono,
-  cancelarDibujoPoligono: cancelarDibujoPoligono,
-  limpiarPoligono: () => limpiarPoligono(true),
-  dibujarPoligonoDesdeGeoJSON: dibujarPoligonoDesdeGeoJSON,
-  habilitarEdicionPoligono: habilitarEdicionPoligono,
-  deshabilitarEdicionPoligono: deshabilitarEdicionPoligono,
-  cambiarCapa: cambiarCapa,
-  configurar: configurar,
-  dibujarRuta: dibujarRuta,
-  mostrarRutaCalculando: mostrarRutaCalculando,
-  limpiarRuta: limpiarRuta,
-  limpiarSoloLectura: () => capaSoloLectura.clearLayers(),
-  agregarMarcadorSoloLectura: (lat, lng, etiqueta) => {
-    L.marker([lat, lng], { icon: iconoIncidente })
-      .bindTooltip(etiqueta || "", { direction: "top" })
-      .addTo(capaSoloLectura);
   },
-  agregarPoligonoSoloLectura: (geojsonTexto) => {
-    const datos = JSON.parse(geojsonTexto);
-    L.geoJSON(datos, { style: { color: "#ff5722", weight: 2, fillColor: "#ff5722", fillOpacity: 0.15 } })
-      .eachLayer((l) => capaSoloLectura.addLayer(l));
+
+  // items: [{lat, lng, etiqueta, anillo: [[lat, lng], ...] | null}]
+  soloLectura(items) {
+    capaSoloLectura.clearLayers();
+    (items || []).forEach((it) => {
+      if (it.anillo && it.anillo.length >= 3) {
+        L.polygon(it.anillo, { color: COLOR_POLIGONO, weight: 2, fillOpacity: 0.15 })
+          .bindTooltip(it.etiqueta ? `Parte N° ${it.etiqueta}` : "Siniestro").addTo(capaSoloLectura);
+      }
+      L.marker([it.lat, it.lng], { icon: iconoSiniestro(0.8), keyboard: false })
+        .bindTooltip(it.etiqueta ? `Parte N° ${it.etiqueta}` : "Siniestro", { direction: "top", offset: [0, -28] })
+        .addTo(capaSoloLectura);
+    });
   },
-  ajustarVistaATodo: () => {
-    if (capaSoloLectura.getLayers().length) mapa.fitBounds(capaSoloLectura.getBounds(), { padding: [30, 30] });
+
+  centrar(lat, lng) {
+    if (encuadrePendiente) encuadrePendiente = [lat, lng, encuadrePendiente[2]];
+    mapa.setView([lat, lng], mapa.getZoom(), { animate: false });
   },
+
+  // Zoom de barrio: ~anchoKm de ancho en pantalla, centrado en el punto.
+  encuadrar(lat, lng, anchoKm) {
+    const anchoReal = mapa.getSize().x;
+    encuadrePendiente = anchoReal < ANCHO_MINIMO_ENCUADRE ? [lat, lng, anchoKm] : null;
+    const anchoPx = Math.max(anchoReal, 800);
+    const mPorPx = (anchoKm * 1000) / anchoPx;
+    const z = Math.log2((156543.03392 * Math.cos(lat * Math.PI / 180)) / mPorPx);
+    mapa.setView([lat, lng], Math.max(3, Math.min(18, Math.floor(z))), { animate: false });
+  },
+
+  // bounds: [[sur, oeste], [norte, este]]
+  ajustar(bounds) { mapa.fitBounds(bounds, { padding: [40, 40], maxZoom: 17, animate: false }); },
+
+  zoom(delta) { mapa.setZoom(mapa.getZoom() + delta); },
+
+  // Captura para el PDF: oculta controles, centra sin animar y avisa a
+  // Python cuando las teselas visibles terminaron de cargar.
+  prepararCaptura(lat, lng) {
+    document.body.classList.add("captura");
+    mapa.setView([lat, lng], mapa.getZoom(), { animate: false });
+    const capa = mapa.hasLayer(capaSatelital) ? capaSatelital : capaCalles;
+    let avisado = false;
+    const avisar = () => { if (!avisado) { avisado = true; if (puente) puente.captura_lista(); } };
+    capa.once("load", avisar);
+    // Si no quedó ninguna tesela pendiente, 'load' no se dispara.
+    setTimeout(() => { if (!capa._loading) avisar(); }, 120);
+  },
+
+  terminarCaptura() { document.body.classList.remove("captura"); },
 };
 
-// ---------------------------------------------------------------------
-// Puente QWebChannel con Python (si corre dentro de QWebEngineView)
-// ---------------------------------------------------------------------
-
-if (typeof qt !== "undefined" && qt.webChannelTransport) {
-  new QWebChannel(qt.webChannelTransport, (canal) => {
-    bridge = canal.objects.bridge;
-  });
-}
+new QWebChannel(qt.webChannelTransport, (canal) => {
+  puente = canal.objects.puente;
+  puente.listo();
+});
 </script>
 </body>
 </html>

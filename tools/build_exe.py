@@ -10,12 +10,10 @@ Qué se embebe en el bundle (read-only, ver app/paths.py -> get_resource_path):
   - data/config.example.json                 (esqueleto de config, SIN
                                                 credenciales reales)
   - resources/app_icon.ico y resources/logo.png (ícono del .exe y de las
-    ventanas, logo del encabezado) y resources/mapa_predeterminado.png (el
-    mapa de la zona con el que arranca la app). La imagen que cargue el
-    cuartel (`mapa_base.*`) es un dato escribible y le gana a la de fábrica.
-  - (el mapa táctico es nativo, QGraphicsView: no necesita archivos
-    embebidos. Su imagen base se carga desde Configuración y vive en
-    `resources/` AL LADO del .exe, ver app/services/cartografia.py)
+    ventanas, logo del encabezado)
+  - app/ui/map_assets/ (mapa táctico: Leaflet + OpenStreetMap en un
+    QWebEngineView; el caché de teselas se escribe en data/mapa_web/ AL
+    LADO del .exe)
   - el navegador Chromium de Playwright ya instalado en esta máquina
     (`ms-playwright/chromium-*` y `ms-playwright/chromium_headless_shell-*`,
     la versión más nueva de cada uno si hay varias) + el driver Node interno
@@ -156,6 +154,25 @@ def verificar_chromium_embebido(dist_app: Path) -> None:
     print(f"Chromium embebido OK en {base} ({', '.join(f'{p}{r}' for p, r in revisiones_requeridas().items())})")
 
 
+ARCHIVOS_MAPA = ("mapa.html", "leaflet.js", "leaflet.css", "qwebchannel.js")
+
+
+def verificar_mapa_embebido(dist_app: Path) -> None:
+    """Después de PyInstaller: la página Leaflet del mapa operativo y el
+    proceso de QtWebEngine que la dibuja. Sin ellos el .exe arranca pero el
+    mapa queda en blanco: mejor que el build falle acá."""
+    interna = dist_app / "_internal"
+    faltantes = [str(interna / "app" / "ui" / "map_assets" / a) for a in ARCHIVOS_MAPA
+                 if not (interna / "app" / "ui" / "map_assets" / a).is_file()]
+    if not any(interna.rglob("QtWebEngineProcess.exe")):
+        faltantes.append(f"{interna}/**/QtWebEngineProcess.exe")
+    if not any(interna.rglob("qtwebengine_resources.pak")):
+        faltantes.append(f"{interna}/**/qtwebengine_resources.pak")
+    if faltantes:
+        sys.exit("El bundle quedó SIN el mapa interactivo (Leaflet / QtWebEngine):\n  " + "\n  ".join(faltantes))
+    print(f"Mapa interactivo OK en {interna / 'app' / 'ui' / 'map_assets'} (+ QtWebEngineProcess)")
+
+
 def _preparar_config_example() -> Path:
     """Genera data/config.example.json (esqueleto SIN credenciales) a partir
     de la forma real de data/config.json, si existe, o con un esqueleto fijo
@@ -238,12 +255,10 @@ def main() -> None:
         "--icon", str(ICONO_APP),
         "--add-data", f"{ICONO_APP}{sep}resources",
         "--add-data", f"{LOGO_INSTITUCIONAL}{sep}resources",
-        # Mapa de la zona precargado (de Mapa.tiff, EPSG:3857): se ve aunque el
-        # cuartel nunca haya cargado una imagen propia.
-        "--add-data", f"{RESOURCES_DIR / 'mapa_predeterminado.png'}{sep}resources",
-        # Pillow convierte los .tif/.tiff que se cargan desde Configuración.
-        "--hidden-import", "PIL.Image",
-        "--hidden-import", "PIL.TiffImagePlugin",
+        # Mapa operativo: página Leaflet + qwebchannel.js que carga el
+        # QWebEngineView (app/ui/widgets/map_widget.py). QtWebEngine en sí
+        # (QtWebEngineProcess.exe, recursos, locales) lo junta el hook de PySide6.
+        "--add-data", f"{BASE_DIR / 'app' / 'ui' / 'map_assets'}{sep}app/ui/map_assets",
         "--add-data", f"{TEMPLATES_DIR}{sep}templates",
         "--add-data", f"{config_example}{sep}data",
         "--add-data", f"{BASE_DIR / 'config' / 'ruba_mapping.json'}{sep}config",
@@ -272,6 +287,7 @@ def main() -> None:
         print(f"  OK: {carpeta.name}")
 
     verificar_chromium_embebido(DIST_DIR / NOMBRE_APP)
+    verificar_mapa_embebido(DIST_DIR / NOMBRE_APP)
 
     print()
     print(f"Listo: {DIST_DIR / NOMBRE_APP / (NOMBRE_APP + '.exe')}")

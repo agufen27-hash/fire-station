@@ -15,7 +15,6 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
-import math
 import re
 import shutil
 import threading
@@ -35,9 +34,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QCompleter,
     QDialog,
-    QDialogButtonBox,
     QDoubleSpinBox,
-    QFileDialog,
     QFormLayout,
     QFrame,
     QGridLayout,
@@ -3403,73 +3400,25 @@ class MainWindow(QMainWindow):
         controlador.buscar_manual()
 
     def _crear_caja_config_mapa(self) -> QGroupBox:
-        """Mapa Operativo: imagen base (carta topográfica/satelital) y los
-        límites geográficos de sus bordes (calibración estilo Avenza)."""
+        """Mapa Operativo (Leaflet + OpenStreetMap): solo la ubicación del
+        cuartel, origen de la línea y la distancia al siniestro."""
         caja = QGroupBox("Mapa Operativo")
         form = QFormLayout(caja)
-
-        fila_imagen = QHBoxLayout()
-        self._label_imagen_mapa = QLabel(caja)
-        self._label_imagen_mapa.setWordWrap(True)
-        self._label_imagen_mapa.setProperty("muted", True)
-        boton_imagen = QPushButton("Cargar nueva imagen de mapa (.png, .jpg, .tiff)", caja)
-        boton_imagen.setObjectName("botonHerramienta")
-        boton_imagen.clicked.connect(self._cargar_imagen_mapa)
-        boton_restaurar = QPushButton("↺ Mapa de la zona (de fábrica)", caja)
-        boton_restaurar.setObjectName("botonHerramienta")
-        boton_restaurar.setToolTip("Vuelve al mapa que viene con la app y a sus límites "
-                                   "(borra la imagen propia cargada).")
-        boton_restaurar.clicked.connect(self._restaurar_mapa_predeterminado)
-        boton_satelital = QPushButton("🛰️ Descargar imagen satelital", caja)
-        boton_satelital.setObjectName("botonHerramienta")
-        boton_satelital.setToolTip("Baja de Google Earth Engine un compuesto Sentinel-2 sin nubes de la zona "
-                                   "y lo deja como imagen base, con los límites ya calibrados.")
-        boton_satelital.clicked.connect(self._descargar_imagen_satelital)
-        fila_imagen.addWidget(self._label_imagen_mapa, 1)
-        columna_botones = QVBoxLayout()
-        columna_botones.addWidget(boton_imagen)
-        columna_botones.addWidget(boton_satelital)
-        columna_botones.addWidget(boton_restaurar)
-        fila_imagen.addLayout(columna_botones)
-        form.addRow("Imagen base", fila_imagen)
-
-        fila_proyeccion = QHBoxLayout()
-        self._combo_proyeccion = QComboBox(caja)
-        self._combo_proyeccion.addItem("Web Mercator (EPSG:3857 · GeoTIFF de QGIS/Google)",
-                                       cartografia.PROYECCION_MERCATOR)
-        self._combo_proyeccion.addItem("Lat/Lon (EPSG:4326 · imagen satelital, cartas)",
-                                       cartografia.PROYECCION_EQUIRECTANGULAR)
-        boton_metros = QPushButton("Límites en metros (EPSG:3857)…", caja)
-        boton_metros.setObjectName("botonHerramienta")
-        boton_metros.setToolTip("Cargá los bordes Norte/Sur/Este/Oeste en metros Web Mercator "
-                                "(como los muestra QGIS); se convierten a latitud/longitud.")
-        boton_metros.clicked.connect(self._ingresar_limites_mercator)
-        fila_proyeccion.addWidget(self._combo_proyeccion, 1)
-        fila_proyeccion.addWidget(boton_metros)
-        form.addRow("Proyección de la imagen", fila_proyeccion)
 
         def spin(minimo: float, maximo: float) -> QDoubleSpinBox:
             s = QDoubleSpinBox(caja)
             s.setRange(minimo, maximo)
             s.setDecimals(6)
-            s.setSingleStep(0.01)
+            s.setSingleStep(0.0001)
             return s
 
-        self._spin_mapa_norte = spin(-90, 90)
-        self._spin_mapa_sur = spin(-90, 90)
-        self._spin_mapa_oeste = spin(-180, 180)
-        self._spin_mapa_este = spin(-180, 180)
         self._spin_cuartel_lat = spin(-90, 90)
         self._spin_cuartel_lon = spin(-180, 180)
-        form.addRow("Latitud borde norte (arriba)", self._spin_mapa_norte)
-        form.addRow("Latitud borde sur (abajo)", self._spin_mapa_sur)
-        form.addRow("Longitud borde oeste (izquierda)", self._spin_mapa_oeste)
-        form.addRow("Longitud borde este (derecha)", self._spin_mapa_este)
         form.addRow("Cuartel: latitud", self._spin_cuartel_lat)
         form.addRow("Cuartel: longitud", self._spin_cuartel_lon)
         ayuda = QLabel(
-            "La imagen tiene que estar orientada al norte y sin rotar. Los límites son las "
-            "coordenadas exactas de sus bordes (se leen en Google Earth / QGIS o en la carta).", caja,
+            "El mapa usa OpenStreetMap (calles) y Esri (satelital) en coordenadas WGS84: no hace falta "
+            "cargar ni calibrar imágenes. Necesita internet; las zonas ya vistas quedan en caché.", caja,
         )
         ayuda.setWordWrap(True)
         ayuda.setProperty("muted", True)
@@ -3478,155 +3427,16 @@ class MainWindow(QMainWindow):
 
     def _cargar_config_mapa(self) -> None:
         calibracion = cartografia.cargar_calibracion()
-        self._spin_mapa_norte.setValue(calibracion.lat_norte)
-        self._spin_mapa_sur.setValue(calibracion.lat_sur)
-        self._spin_mapa_oeste.setValue(calibracion.lon_oeste)
-        self._spin_mapa_este.setValue(calibracion.lon_este)
         self._spin_cuartel_lat.setValue(calibracion.cuartel_lat)
         self._spin_cuartel_lon.setValue(calibracion.cuartel_lon)
-        indice = self._combo_proyeccion.findData(calibracion.proyeccion)
-        self._combo_proyeccion.setCurrentIndex(max(0, indice))
-        ruta = cartografia.ruta_imagen_base()
-        if ruta is None:
-            texto = f"(sin imagen: se muestra la cuadrícula) -> {cartografia.carpeta_imagen()}"
-        elif cartografia.usa_imagen_predeterminada():
-            texto = "Mapa de la zona que viene con la app (Web Mercator)."
-        else:
-            texto = str(ruta)
-        from app.services import imagen_satelital
-
-        origen = imagen_satelital.origen_actual() if cartografia.ruta_imagen_propia() else None
-        if origen:
-            texto += f"\n🛰️ {origen.get('atribucion', '')} · período {' a '.join(origen.get('periodo', []))}"
-        self._label_imagen_mapa.setText(texto)
 
     def _calibracion_de_formulario(self) -> "cartografia.CalibracionMapa":
-        return cartografia.CalibracionMapa(
-            lat_norte=self._spin_mapa_norte.value(), lat_sur=self._spin_mapa_sur.value(),
-            lon_oeste=self._spin_mapa_oeste.value(), lon_este=self._spin_mapa_este.value(),
+        """La sección "mapa" de config.json con el cuartel del formulario
+        (el resto de los campos se conserva tal cual)."""
+        return dataclasses.replace(
+            cartografia.cargar_calibracion(),
             cuartel_lat=self._spin_cuartel_lat.value(), cuartel_lon=self._spin_cuartel_lon.value(),
-            proyeccion=self._combo_proyeccion.currentData() or cartografia.PROYECCION_EQUIRECTANGULAR,
         )
-
-    def _cargar_imagen_mapa(self) -> None:
-        ruta_texto, _ = QFileDialog.getOpenFileName(
-            self, "Cargar nueva imagen de mapa", "", "Imágenes (*.png *.jpg *.jpeg *.tif *.tiff)"
-        )
-        if not ruta_texto:
-            return
-        origen = Path(ruta_texto)
-        es_mercator = origen.suffix.lower() in cartografia.EXTENSIONES_TIFF and cartografia.es_geotiff_mercator(origen)
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            destino = cartografia.instalar_imagen_base(origen)
-        except (OSError, ValueError) as e:
-            QApplication.restoreOverrideCursor()
-            QMessageBox.critical(self, "No se pudo cargar la imagen", str(e))
-            return
-        QApplication.restoreOverrideCursor()
-        from app.services import imagen_satelital
-
-        # La imagen ya no es la satelital: su origen/atribución deja de aplicar.
-        (cartografia.carpeta_imagen() / imagen_satelital.ARCHIVO_ORIGEN).unlink(missing_ok=True)
-        # Conserva los límites que el usuario esté editando (no se guardaron todavía).
-        calibracion = self._calibracion_de_formulario()
-        self._recargar_mapas()
-        self._cargar_config_mapa()
-        self._poner_calibracion_en_formulario(calibracion)
-        if es_mercator:
-            self._combo_proyeccion.setCurrentIndex(self._combo_proyeccion.findData(cartografia.PROYECCION_MERCATOR))
-        aviso_proyeccion = ("\n\nEl TIFF está en Web Mercator (EPSG:3857): se eligió esa proyección. "
-                            "Si tenés los bordes en metros usá «Límites en metros (EPSG:3857)…»."
-                            if es_mercator else "")
-        QMessageBox.information(
-            self, "Imagen de mapa cargada",
-            f"Se copió a:\n{destino}\n\nRevisá que los límites norte/sur/oeste/este de abajo "
-            f"correspondan a los bordes de ESTA imagen y guardá la configuración.{aviso_proyeccion}",
-        )
-
-    def _poner_calibracion_en_formulario(self, calibracion: "cartografia.CalibracionMapa") -> None:
-        self._spin_mapa_norte.setValue(calibracion.lat_norte)
-        self._spin_mapa_sur.setValue(calibracion.lat_sur)
-        self._spin_mapa_oeste.setValue(calibracion.lon_oeste)
-        self._spin_mapa_este.setValue(calibracion.lon_este)
-        self._spin_cuartel_lat.setValue(calibracion.cuartel_lat)
-        self._spin_cuartel_lon.setValue(calibracion.cuartel_lon)
-        self._combo_proyeccion.setCurrentIndex(max(0, self._combo_proyeccion.findData(calibracion.proyeccion)))
-
-    def _ingresar_limites_mercator(self) -> None:
-        """Bordes en metros EPSG:3857 (acepta coma decimal: '-3944122,2065')."""
-        dialogo = QDialog(self)
-        dialogo.setWindowTitle("Límites en metros (Web Mercator EPSG:3857)")
-        form = QFormLayout(dialogo)
-        actual = self._calibracion_de_formulario()
-        valores_actuales = {
-            "norte": cartografia.lat_a_mercator(actual.lat_norte),
-            "sur": cartografia.lat_a_mercator(actual.lat_sur),
-            "este": math.radians(actual.lon_este) * cartografia.RADIO_MERCATOR_M,
-            "oeste": math.radians(actual.lon_oeste) * cartografia.RADIO_MERCATOR_M,
-        }
-        entradas: Dict[str, QLineEdit] = {}
-        for clave, etiqueta in (("norte", "Norte (Y arriba)"), ("sur", "Sur (Y abajo)"),
-                                ("este", "Este (X derecha)"), ("oeste", "Oeste (X izquierda)")):
-            entrada = QLineEdit(f"{valores_actuales[clave]:.4f}".replace(".", ","), dialogo)
-            form.addRow(etiqueta, entrada)
-            entradas[clave] = entrada
-        botones = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
-                                   dialogo)
-        botones.accepted.connect(dialogo.accept)
-        botones.rejected.connect(dialogo.reject)
-        form.addRow(botones)
-        if dialogo.exec() != QDialog.DialogCode.Accepted:
-            return
-        try:
-            metros = {k: float(e.text().strip().replace(" ", "").replace(",", ".")) for k, e in entradas.items()}
-        except ValueError:
-            QMessageBox.warning(self, "Límites inválidos", "Ingresá números (ej. -3944122,2065).")
-            return
-        calibracion = cartografia.CalibracionMapa.desde_mercator(
-            metros["norte"], metros["sur"], metros["este"], metros["oeste"],
-            actual.cuartel_lat, actual.cuartel_lon)
-        if not calibracion.es_valida():
-            QMessageBox.warning(self, "Límites inválidos",
-                                "El norte tiene que ser mayor que el sur y el este mayor que el oeste.")
-            return
-        self._poner_calibracion_en_formulario(calibracion)
-        self.statusBar().showMessage("Límites convertidos a lat/lon. Guardá la configuración para aplicarlos.", 8000)
-
-    def _restaurar_mapa_predeterminado(self) -> None:
-        if not self._permitido("configurar", "Restaurar el mapa de la zona"):
-            return
-        if cartografia.ruta_imagen_predeterminada() is None:
-            QMessageBox.warning(self, "Mapa de la zona", "Esta instalación no trae el mapa de la zona.")
-            return
-        if QMessageBox.question(
-                self, "Mapa de la zona",
-                "¿Volver al mapa de la zona que viene con la app? Se borra la imagen propia cargada "
-                "y se reemplazan los límites del mapa (se conserva la ubicación del cuartel).",
-        ) != QMessageBox.StandardButton.Yes:
-            return
-        from app.services import imagen_satelital
-
-        try:
-            cartografia.restaurar_mapa_predeterminado(self._spin_cuartel_lat.value(), self._spin_cuartel_lon.value())
-            (cartografia.carpeta_imagen() / imagen_satelital.ARCHIVO_ORIGEN).unlink(missing_ok=True)
-        except (OSError, ValueError) as e:
-            QMessageBox.critical(self, "No se pudo restaurar el mapa", str(e))
-            return
-        self._recargar_mapas()
-        self._cargar_config_mapa()
-        self.statusBar().showMessage("Mapa de la zona restaurado.", 6000)
-
-    def _descargar_imagen_satelital(self) -> None:
-        """Abre la descarga desde Earth Engine con los límites que están en el
-        formulario (aunque todavía no se hayan guardado)."""
-        from app.ui.satelital_dialog import DescargaSatelitalDialog
-
-        dialogo = DescargaSatelitalDialog(self._calibracion_de_formulario(), self)
-        dialogo.exec()
-        if dialogo.instalada:
-            self._recargar_mapas()
-            self._cargar_config_mapa()  # los spins toman los límites nuevos: "Guardar" no los pisa
 
     def _recargar_mapas(self) -> None:
         for mapa in (getattr(self, "mapa", None), getattr(getattr(self, "_pagina_mapa", None), "mapa", None)):
@@ -3674,13 +3484,6 @@ class MainWindow(QMainWindow):
         if not self._permitido("configurar", "Guardar la configuración"):
             return
         calibracion = self._calibracion_de_formulario()
-        if not calibracion.es_valida():
-            QMessageBox.warning(
-                self, "Límites del mapa inválidos",
-                "El borde norte tiene que tener mayor latitud que el sur (ej. -33.55 > -33.72) "
-                "y el este mayor longitud que el oeste (ej. -63.92 > -64.12).",
-            )
-            return
         try:
             datos = json.loads(self._ruta_config_json().read_text(encoding="utf-8-sig"))
             if not isinstance(datos, dict):

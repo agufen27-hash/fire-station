@@ -11,10 +11,12 @@ from datetime import time as time_
 from pathlib import Path
 from typing import List, Optional
 
-from PySide6.QtCore import QBuffer, QDate, QEvent, QIODevice, QPoint, Qt, QTime, QTimer, Signal
+from PySide6.QtCore import QBuffer, QDate, QEvent, QIODevice, QObject, QPoint, Qt, QTime, QTimer, Signal
 from PySide6.QtGui import QColor, QImage, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
+    QComboBox,
     QDateEdit,
     QDateTimeEdit,
     QFrame,
@@ -27,6 +29,42 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+
+TIPOS_SIN_RUEDA = (QDateTimeEdit, QComboBox)  # QDateEdit y QTimeEdit heredan de QDateTimeEdit
+
+
+class FiltroRuedaSinFoco(QObject):
+    """Filtro global: la rueda del mouse NO cambia fechas, horas ni combos
+    salvo que el campo tenga el foco (se hizo click o se llegó con Tab).
+    Sin foco el evento se ignora y Qt lo propaga al padre, así el
+    formulario (QScrollArea, tabla) se scrollea normalmente.
+
+    Además se baja la política de foco de WheelFocus a StrongFocus: si no,
+    Qt le da el foco al campo con la propia rueda y el primer giro ya
+    cambiaría el valor."""
+
+    def eventFilter(self, objeto, evento) -> bool:  # noqa: N802 - override de Qt
+        tipo = evento.type()
+        if tipo == QEvent.Type.Wheel:
+            if isinstance(objeto, TIPOS_SIN_RUEDA) and not objeto.hasFocus():
+                evento.ignore()
+                return True  # el campo no lo procesa; sigue al widget padre
+        elif tipo == QEvent.Type.Polish and isinstance(objeto, TIPOS_SIN_RUEDA):
+            if objeto.focusPolicy() == Qt.FocusPolicy.WheelFocus:
+                objeto.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        return False
+
+
+def instalar_filtro_rueda(app: QApplication) -> FiltroRuedaSinFoco:
+    """Instalar UNA vez, antes de crear las ventanas (el ajuste de foco se
+    aplica cuando cada widget se pule al mostrarse)."""
+    filtro = getattr(app, "_filtro_rueda_sin_foco", None)
+    if filtro is None:
+        filtro = FiltroRuedaSinFoco(app)
+        app.installEventFilter(filtro)
+        app._filtro_rueda_sin_foco = filtro  # que el GC de Python no lo destruya
+    return filtro
 
 
 class EditorHoraRapido(QTimeEdit):

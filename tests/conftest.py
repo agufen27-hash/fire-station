@@ -4,6 +4,11 @@ from pathlib import Path
 # Permite `import app...` corriendo pytest desde cualquier carpeta.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# QtWebEngine (mapa Leaflet, app/ui/widgets/map_widget.py) tiene que
+# importarse ANTES de crear cualquier QApplication; si no, Qt aborta al crear
+# el primer QWebEngineView. Varios tests crean la app en su propio fixture.
+import PySide6.QtWebEngineWidgets  # noqa: E402,F401
+
 
 import pytest  # noqa: E402
 

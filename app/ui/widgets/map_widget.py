@@ -1,25 +1,32 @@
 """
-Visor de mapa nativo estilo Avenza Maps: una imagen local georreferenciada
-(`resources/mapa_base.png|jpg`, calibrada por sus bordes en data/config.json,
-ver app/services/cartografia.py) dibujada con QGraphicsView/QGraphicsScene.
-Sin navegador embebido ni internet: funciona igual en una PC de guardia
-aislada.
+Visor de mapa interactivo: Leaflet + OpenStreetMap dentro de un
+QWebEngineView (app/ui/map_assets/mapa.html). Sin API keys: teselas de
+OpenStreetMap (calles) y Esri World Imagery (satelital), con zoom y paneo
+libres a cualquier escala.
 
-  - Rueda del mouse: zoom centrado en el cursor. Clic sostenido: paneo.
-  - Cuartel: marcador fijo en las coordenadas de la calibración.
-  - Clic en el mapa: coloca o mueve el Lugar del Siniestro (chincheta
-    roja), traza la línea cuartel -> siniestro con la distancia geodésica y
-    emite `coordenadas_cambiadas` para completar "Zona / Coordenadas".
+Todo se maneja en WGS84 (latitud/longitud): Leaflet proyecta a Web Mercator
+solo para dibujar, así que no hay calibración de imagen ni desfasaje.
+
+  - Rueda: zoom. Arrastrar: paneo. Doble clic: acercar.
+  - Cuartel: marcador fijo en las coordenadas de Configuración.
+  - Clic en el mapa: coloca o mueve el Lugar del Siniestro (chincheta roja),
+    traza la línea cuartel -> siniestro con la distancia geodésica y emite
+    `coordenadas_cambiadas` para completar "Zona / Coordenadas".
   - Polígono del área afectada (superficie y perímetro geodésicos) e
-    import/export KML/KMZ/GPX, como en la versión anterior con Leaflet.
+    import/export KML/KMZ/GPX.
+
+Python es el dueño del estado (punto, polígono, modos); la página solo
+dibuja lo que se le manda con `runJavaScript` (`fs.*`) y avisa clics, teclas
+y vértices movidos por QWebChannel (`_PuenteMapa`). Las llamadas hechas
+antes de que la página termine de cargar se encolan y se ejecutan en orden.
+
+Las teselas quedan en un caché de disco (data/mapa_web/): las zonas ya
+vistas vuelven a verse sin internet mientras el caché las conserve.
 
 Un mismo `MapWidget`, dos usos:
   - Incrustado en el formulario de carga (`main_window.py`): editable.
   - `OperationsMapWindow`: solo lectura, con todos los incidentes que
     tienen coordenadas guardadas.
-
-Todo el estado se guarda en coordenadas geográficas (no en píxeles): al
-cambiar la imagen o la calibración, `recargar_mapa()` reproyecta todo.
 """
 
 from __future__ import annotations
@@ -27,31 +34,16 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
-from PySide6.QtCore import QEvent, QPointF, QRectF, Qt, QThread, Signal
-from PySide6.QtGui import (
-    QBrush,
-    QColor,
-    QFont,
-    QImage,
-    QImageReader,
-    QPainter,
-    QPainterPath,
-    QPen,
-    QPixmap,
-    QPolygonF,
-)
+from PySide6.QtCore import QEventLoop, QObject, QPointF, QRectF, Qt, QThread, QTimer, QUrl, Signal, Slot
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QImage, QPainter, QPen
+from PySide6.QtWebChannel import QWebChannel
+from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile, QWebEngineSettings
+from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (
+    QApplication,
     QFileDialog,
-    QGraphicsEllipseItem,
-    QGraphicsItem,
-    QGraphicsLineItem,
-    QGraphicsPathItem,
-    QGraphicsPixmapItem,
-    QGraphicsPolygonItem,
-    QGraphicsScene,
-    QGraphicsView,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -63,322 +55,118 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app import __version__
+from app.paths import get_resource_path, get_writable_dir
 from app.services import cartografia, geografia
-from app.services.cartografia import CalibracionMapa, Georreferencia
+from app.services.cartografia import CalibracionMapa
 from app.services.geocodificacion import GeocodeWorker, lanzar_geocodificacion
 
-# Valores de fábrica (la calibración real se lee de data/config.json).
+# Valores de fábrica (la ubicación real del cuartel se lee de data/config.json).
 CUARTEL_LAT = CalibracionMapa.cuartel_lat
 CUARTEL_LON = CalibracionMapa.cuartel_lon
 
-ANCHO_FONDO_GENERADO = 2400  # px del fondo cuadriculado cuando no hay imagen
-ZOOM_MAXIMO = 40.0  # píxeles de pantalla por píxel de imagen
-FACTOR_ZOOM = 1.25
-TOLERANCIA_CLIC_PX = 5  # más movimiento que esto entre press y release = paneo
+RUTA_PAGINA_MAPA = "app/ui/map_assets/mapa.html"
+ANCHO_VISTA_INICIAL_KM = 6.0  # vista de arranque: el pueblo entero alrededor del cuartel
+TOLERANCIA_VERTICE_M = 0.5  # vértices más cercanos que esto son el mismo (doble clic)
+TIMEOUT_CAPTURA_MS = 8000  # espera máxima a que carguen las teselas antes de capturar
+CACHE_TESELAS_BYTES = 400 * 1024 * 1024
 
 COLOR_SINIESTRO = QColor("#d32f2f")
-COLOR_CUARTEL = QColor("#1565c0")
-COLOR_POLIGONO = QColor("#ff5722")
-COLOR_LINEA = QColor("#1565c0")
-
-
-# ---------------------------------------------------------------------------
-# Fondo generado por código (sin imagen cargada todavía)
-# ---------------------------------------------------------------------------
-
-def generar_fondo_cuadricula(calibracion: CalibracionMapa, ancho: int = ANCHO_FONDO_GENERADO) -> QPixmap:
-    """Fondo claro con retícula geográfica (cada 0.01°, rotulada cada 0.05°)
-    y el texto institucional. Tiene la misma calibración que tendrá la
-    imagen real, así que marcar puntos y medir ya funciona sobre él."""
-    alto = max(1, round(ancho / calibracion.relacion_aspecto()))
-    pixmap = QPixmap(ancho, alto)
-    pixmap.fill(QColor("#f8fafc"))
-    geo = Georreferencia(calibracion, ancho, alto)
-
-    pintor = QPainter(pixmap)
-    pintor.setRenderHint(QPainter.RenderHint.Antialiasing)
-    fuente_rotulo = QFont("Segoe UI", 1)
-    fuente_rotulo.setPixelSize(max(11, int(ancho * 0.011)))  # legible con el mapa entero a la vista
-    pintor.setFont(fuente_rotulo)
-
-    paso = 0.01
-    for k in range(math.ceil(calibracion.lon_oeste / paso), math.floor(calibracion.lon_este / paso) + 1):
-        x, _ = geo.coords_to_pixel(calibracion.lat_norte, k * paso)
-        mayor = k % 5 == 0
-        pintor.setPen(QPen(QColor("#cbd5e1" if mayor else "#e2e8f0"), 1.6 if mayor else 1))
-        pintor.drawLine(QPointF(x, 0), QPointF(x, alto))
-        if mayor:
-            pintor.setPen(QColor("#64748b"))
-            pintor.drawText(QPointF(x + 4, fuente_rotulo.pixelSize() + 4), f"{k * paso:.2f}°")
-    for k in range(math.ceil(calibracion.lat_sur / paso), math.floor(calibracion.lat_norte / paso) + 1):
-        _, y = geo.coords_to_pixel(k * paso, calibracion.lon_oeste)
-        mayor = k % 5 == 0
-        pintor.setPen(QPen(QColor("#cbd5e1" if mayor else "#e2e8f0"), 1.6 if mayor else 1))
-        pintor.drawLine(QPointF(0, y), QPointF(ancho, y))
-        if mayor:
-            pintor.setPen(QColor("#64748b"))
-            pintor.drawText(QPointF(6, y - 4), f"{k * paso:.2f}°")
-
-    pintor.setPen(QPen(QColor("#94a3b8"), 3))
-    pintor.drawRect(QRectF(1.5, 1.5, ancho - 3, alto - 3))
-
-    # Cartel arriba (no en el centro: ahí están el pueblo y el cuartel).
-    caja = QRectF(ancho * 0.14, alto * 0.05, ancho * 0.72, alto * 0.14)
-    pintor.setPen(QPen(QColor("#cbd5e1"), 2))
-    pintor.setBrush(QColor(255, 255, 255, 225))
-    pintor.drawRoundedRect(caja, 18, 18)
-    fuente_titulo = QFont("Segoe UI", 1)
-    fuente_titulo.setPixelSize(max(18, int(ancho * 0.026)))
-    fuente_titulo.setBold(True)
-    pintor.setFont(fuente_titulo)
-    pintor.setPen(QColor("#334155"))
-    pintor.drawText(caja.adjusted(0, 0, 0, -caja.height() * 0.35), Qt.AlignmentFlag.AlignCenter,
-                    "Mapa Operativo - Cargar imagen de zona")
-    fuente_sub = QFont("Segoe UI", 1)
-    fuente_sub.setPixelSize(max(12, int(ancho * 0.013)))
-    pintor.setFont(fuente_sub)
-    pintor.setPen(QColor("#64748b"))
-    pintor.drawText(caja.adjusted(0, caja.height() * 0.45, 0, 0), Qt.AlignmentFlag.AlignCenter,
-                    "Configuración → 🛰️ Descargar imagen satelital  ·  o  Cargar nueva imagen de mapa (.png, .jpg, .tiff)")
-    pintor.end()
-    return pixmap
-
-
-def cargar_pixmap_base(calibracion: CalibracionMapa) -> Tuple[QPixmap, bool]:
-    """(pixmap, es_imagen_real). Cae al fondo generado si no hay imagen o
-    no se puede leer (archivo dañado, formato no soportado)."""
-    ruta = cartografia.ruta_imagen_base()
-    if ruta is not None:
-        # Las cartas satelitales pesan: el límite por defecto de Qt (256 MB
-        # decodificados) rechaza imágenes de ~8000 x 8000 px.
-        QImageReader.setAllocationLimit(1024)
-        pixmap = QPixmap(str(ruta))
-        if not pixmap.isNull():
-            return pixmap, True
-        print(f"[Mapa] No se pudo leer '{ruta}'; se usa el fondo cuadriculado.")
-    return generar_fondo_cuadricula(calibracion), False
-
-
-# ---------------------------------------------------------------------------
-# Ítems gráficos (tamaño fijo en pantalla: ignoran el zoom)
-# ---------------------------------------------------------------------------
-
-class _MarcadorCuartel(QGraphicsItem):
-    LADO = 30
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
-        self.setZValue(30)
-        self.setToolTip("Cuartel de Bomberos")
-
-    def boundingRect(self) -> QRectF:  # noqa: N802 - override de Qt
-        m = self.LADO / 2 + 2
-        return QRectF(-m, -m, 2 * m, 2 * m)
-
-    def paint(self, pintor: QPainter, _opcion, _widget=None) -> None:
-        pintor.setRenderHint(QPainter.RenderHint.Antialiasing)
-        lado = self.LADO
-        rect = QRectF(-lado / 2, -lado / 2, lado, lado)
-        pintor.setPen(QPen(QColor("#ffffff"), 2))
-        pintor.setBrush(COLOR_CUARTEL)
-        pintor.drawRoundedRect(rect, 6, 6)
-        fuente = QFont("Segoe UI Emoji")
-        fuente.setPixelSize(17)
-        pintor.setFont(fuente)
-        pintor.drawText(rect, Qt.AlignmentFlag.AlignCenter, "🚒")
-
-
-class _MarcadorSiniestro(QGraphicsItem):
-    """Chincheta roja: la punta (0, 0) es el punto exacto marcado."""
-
-    def __init__(self, tooltip: str = "Lugar del Siniestro", escala: float = 1.0) -> None:
-        super().__init__()
-        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
-        self.setZValue(40)
-        self.setToolTip(tooltip)
-        self._escala = escala
-        radio, alto = 11 * escala, 34 * escala
-        cuerpo = QPainterPath()
-        cuerpo.addEllipse(QPointF(0, -alto + radio), radio, radio)
-        punta = QPainterPath()
-        punta.addPolygon(QPolygonF([QPointF(-radio * 0.72, -alto + radio * 1.7), QPointF(radio * 0.72, -alto + radio * 1.7),
-                                    QPointF(0, 0), QPointF(-radio * 0.72, -alto + radio * 1.7)]))
-        self._forma = cuerpo.united(punta)
-        self._centro = QPointF(0, -alto + radio)
-        self._radio = radio
-
-    def boundingRect(self) -> QRectF:  # noqa: N802 - override de Qt
-        return self._forma.boundingRect().adjusted(-2, -2, 2, 2)
-
-    def shape(self) -> QPainterPath:
-        return self._forma
-
-    def paint(self, pintor: QPainter, _opcion, _widget=None) -> None:
-        pintor.setRenderHint(QPainter.RenderHint.Antialiasing)
-        pintor.setPen(QPen(QColor("#ffffff"), 2))
-        pintor.setBrush(COLOR_SINIESTRO)
-        pintor.drawPath(self._forma)
-        pintor.setPen(Qt.PenStyle.NoPen)
-        pintor.setBrush(QColor("#ffffff"))
-        pintor.drawEllipse(self._centro, self._radio * 0.38, self._radio * 0.38)
-
-
-class _Vertice(QGraphicsEllipseItem):
-    """Vértice arrastrable del polígono en modo edición."""
-
-    def __init__(self, indice: int, al_mover: Callable[[int, QPointF], None]) -> None:
-        super().__init__(-6, -6, 12, 12)
-        self.indice = indice
-        self._al_mover = al_mover
-        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
-        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable)
-        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
-        self.setBrush(QColor("#ffffff"))
-        self.setPen(QPen(COLOR_POLIGONO, 2))
-        self.setZValue(50)
-        self.setCursor(Qt.CursorShape.SizeAllCursor)
-
-    def itemChange(self, cambio, valor):  # noqa: N802 - override de Qt
-        if cambio == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
-            self._al_mover(self.indice, self.pos())
-        return super().itemChange(cambio, valor)
-
-
-def _lapiz_cosmetico(color: QColor, ancho: float, estilo=Qt.PenStyle.SolidLine) -> QPen:
-    """Grosor constante en pantalla, sin importar el zoom."""
-    lapiz = QPen(color, ancho, estilo)
-    lapiz.setCosmetic(True)
-    lapiz.setCapStyle(Qt.PenCapStyle.RoundCap)
-    lapiz.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-    return lapiz
-
-
-# ---------------------------------------------------------------------------
-# Vista: zoom con rueda, paneo con arrastre, clic sin arrastre = marcar
-# ---------------------------------------------------------------------------
-
-class _VistaMapa(QGraphicsView):
-    clic = Signal(QPointF)  # posición en la escena
-    doble_clic = Signal(QPointF)
-    cursor_movido = Signal(QPointF)
-    tecla_enter = Signal()
-    tecla_escape = Signal()
-
-    def __init__(self, escena: QGraphicsScene, parent: Optional[QWidget] = None) -> None:
-        super().__init__(escena, parent)
-        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
-        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
-        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
-        self.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform)
-        self.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.SmartViewportUpdate)
-        self.setBackgroundBrush(QColor("#e5e9f0"))
-        # Sin barras, como Avenza: se navega arrastrando (siguen funcionando ocultas).
-        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.setMouseTracking(True)
-        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.rect_contenido = QRectF()
-        self._ajuste_pendiente = True
-        self._press_pos = None
-        self._ignorar_release = False
-
-    # -- Zoom -------------------------------------------------------------------
-
-    def _escala_actual(self) -> float:
-        return self.transform().m11()
-
-    def _escala_ajuste(self) -> float:
-        if self.rect_contenido.isEmpty():
-            return 1.0
-        vp = self.viewport().rect()
-        return min(vp.width() / self.rect_contenido.width(), vp.height() / self.rect_contenido.height())
-
-    def zoom(self, factor: float) -> None:
-        minimo = self._escala_ajuste() * 0.5
-        nueva = min(max(self._escala_actual() * factor, minimo), ZOOM_MAXIMO)
-        factor = nueva / self._escala_actual()
-        if abs(factor - 1.0) > 1e-6:
-            self.scale(factor, factor)
-
-    def wheelEvent(self, evento) -> None:  # noqa: N802 - override de Qt
-        pasos = evento.angleDelta().y() / 120.0
-        if pasos:
-            self.zoom(FACTOR_ZOOM ** pasos)
-        evento.accept()
-
-    def ver_todo(self) -> None:
-        if not self.rect_contenido.isEmpty():
-            self.fitInView(self.rect_contenido, Qt.AspectRatioMode.KeepAspectRatio)
-
-    def pedir_ajuste_inicial(self) -> None:
-        self._ajuste_pendiente = True
-        self._intentar_ajuste_inicial()
-
-    def _intentar_ajuste_inicial(self) -> None:
-        # Mientras el widget está oculto (página no activa) el viewport mide
-        # ~0 px y fitInView daría un zoom absurdo: se espera al primer
-        # tamaño real.
-        if self._ajuste_pendiente and self.viewport().width() > 50 and self.viewport().height() > 50:
-            self._ajuste_pendiente = False
-            self.ver_todo()
-
-    def resizeEvent(self, evento) -> None:  # noqa: N802 - override de Qt
-        super().resizeEvent(evento)
-        self._intentar_ajuste_inicial()
-
-    # -- Clic vs. paneo -------------------------------------------------------------
-
-    def mousePressEvent(self, evento) -> None:  # noqa: N802 - override de Qt
-        self._press_pos = evento.position() if evento.button() == Qt.MouseButton.LeftButton else None
-        super().mousePressEvent(evento)
-
-    def mouseReleaseEvent(self, evento) -> None:  # noqa: N802 - override de Qt
-        super().mouseReleaseEvent(evento)
-        if evento.button() != Qt.MouseButton.LeftButton or self._press_pos is None:
-            return
-        movimiento = (evento.position() - self._press_pos).manhattanLength()
-        self._press_pos = None
-        if self._ignorar_release:
-            self._ignorar_release = False
-            return
-        if movimiento > TOLERANCIA_CLIC_PX:
-            return  # fue un paneo, no un clic
-        if isinstance(self.itemAt(evento.position().toPoint()), _Vertice):
-            return  # clic sobre un vértice: lo maneja el vértice
-        self.clic.emit(self.mapToScene(evento.position().toPoint()))
-
-    def mouseDoubleClickEvent(self, evento) -> None:  # noqa: N802 - override de Qt
-        if evento.button() == Qt.MouseButton.LeftButton:
-            # El release que sigue al doble clic no cuenta como otro clic.
-            self._ignorar_release = True
-            self._press_pos = evento.position()
-            self.doble_clic.emit(self.mapToScene(evento.position().toPoint()))
-        super().mouseDoubleClickEvent(evento)
-
-    def mouseMoveEvent(self, evento) -> None:  # noqa: N802 - override de Qt
-        super().mouseMoveEvent(evento)
-        self.cursor_movido.emit(self.mapToScene(evento.position().toPoint()))
-
-    def keyPressEvent(self, evento) -> None:  # noqa: N802 - override de Qt
-        if evento.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-            self.tecla_enter.emit()
-        elif evento.key() == Qt.Key.Key_Escape:
-            self.tecla_escape.emit()
-        elif evento.key() in (Qt.Key.Key_Plus, Qt.Key.Key_Equal):
-            self.zoom(FACTOR_ZOOM)
-        elif evento.key() == Qt.Key.Key_Minus:
-            self.zoom(1 / FACTOR_ZOOM)
-        else:
-            super().keyPressEvent(evento)
-
-
-# ---------------------------------------------------------------------------
-# Widget principal
-# ---------------------------------------------------------------------------
 
 MODO_NORMAL, MODO_DIBUJO, MODO_EDICION = "normal", "dibujo", "edicion"
 
+
+# ---------------------------------------------------------------------------
+# Perfil web compartido (caché de teselas persistente)
+# ---------------------------------------------------------------------------
+
+_PERFIL: Optional[QWebEngineProfile] = None
+
+
+def perfil_mapa() -> QWebEngineProfile:
+    """Perfil con nombre (no el off-the-record por defecto): caché HTTP en
+    disco para que las teselas ya vistas se carguen al instante y, mientras
+    el caché las conserve, también sin internet. User-Agent propio: la
+    política de uso de tile.openstreetmap.org pide identificar la app."""
+    global _PERFIL
+    if _PERFIL is None:
+        carpeta = get_writable_dir("data") / "mapa_web"
+        perfil = QWebEngineProfile("fire_station_mapa", QApplication.instance())
+        perfil.setPersistentStoragePath(str(carpeta))
+        perfil.setCachePath(str(carpeta / "cache"))
+        perfil.setHttpCacheType(QWebEngineProfile.HttpCacheType.DiskHttpCache)
+        perfil.setHttpCacheMaximumSize(CACHE_TESELAS_BYTES)
+        perfil.setHttpUserAgent(f"FireStation/{__version__} (Bomberos Voluntarios; mapa de guardia)")
+        _PERFIL = perfil
+    return _PERFIL
+
+
+class _PaginaMapa(QWebEnginePage):
+    """La vista nunca navega fuera de mapa.html: un link (atribución,
+    tooltip) se abre en el navegador del sistema."""
+
+    def acceptNavigationRequest(self, url: QUrl, tipo, es_principal: bool) -> bool:  # noqa: N802 - override de Qt
+        if url.isLocalFile() or url.scheme() in ("data", "about", "qrc"):
+            return True
+        if es_principal:
+            QDesktopServices.openUrl(url)
+        return False
+
+    def createWindow(self, _tipo):  # noqa: N802 - override de Qt (target="_blank")
+        return None
+
+
+class _PuenteMapa(QObject):
+    """Objeto `puente` de la página: JS -> Python."""
+
+    clic_en_mapa = Signal(float, float)
+    doble_clic_en_mapa = Signal()
+    tecla_pulsada = Signal(str)
+    vertice_soltado = Signal(int, float, float)
+    pagina_lista = Signal()
+    captura_preparada = Signal()
+
+    @Slot(float, float)
+    def clic(self, lat: float, lng: float) -> None:
+        self.clic_en_mapa.emit(lat, lng)
+
+    @Slot()
+    def doble_clic(self) -> None:
+        self.doble_clic_en_mapa.emit()
+
+    @Slot(str)
+    def tecla(self, nombre: str) -> None:
+        self.tecla_pulsada.emit(nombre)
+
+    @Slot(int, float, float)
+    def vertice_movido(self, indice: int, lat: float, lng: float) -> None:
+        self.vertice_soltado.emit(indice, lat, lng)
+
+    @Slot()
+    def listo(self) -> None:
+        self.pagina_lista.emit()
+
+    @Slot()
+    def captura_lista(self) -> None:
+        self.captura_preparada.emit()
+
+
+def _esperar(milisegundos: int, senal=None) -> None:
+    """Bucle de eventos local: vuelve al llegar `senal` o al vencer el tiempo."""
+    bucle = QEventLoop()
+    if senal is not None:
+        senal.connect(bucle.quit)
+    QTimer.singleShot(milisegundos, bucle.quit)
+    try:
+        bucle.exec()
+    finally:
+        if senal is not None:
+            senal.disconnect(bucle.quit)
+
+
+# ---------------------------------------------------------------------------
+# Widget
+# ---------------------------------------------------------------------------
 
 class MapWidget(QWidget):
     """Visor táctico. `modo_operativo=True` lo pone en solo lectura (sin
@@ -399,7 +187,6 @@ class MapWidget(QWidget):
         self._fuente_direccion = fuente_direccion
         self.entry_direccion_mapa: Optional[QLineEdit] = None
 
-        # Estado en coordenadas geográficas (sobrevive a un cambio de imagen).
         self._latitud: Optional[float] = None
         self._longitud: Optional[float] = None
         self._anillo: List[Tuple[float, float]] = []  # (lon, lat), sin repetir el primero
@@ -408,27 +195,66 @@ class MapWidget(QWidget):
         self._numero_parte_actual = ""
         self._modo = MODO_NORMAL
         self._solo_lectura: List[Tuple[float, float, str, Optional[str]]] = []
+        self._solo_lectura_programado = False
 
         self._hilo_geocode: Optional[Tuple[QThread, GeocodeWorker]] = None
+        self.calibracion = cartografia.cargar_calibracion()
 
-        # Ítems de la escena (se recrean en _redibujar_superposiciones).
-        self._item_fondo: Optional[QGraphicsPixmapItem] = None
-        self._item_cuartel: Optional[_MarcadorCuartel] = None
-        self._item_siniestro: Optional[_MarcadorSiniestro] = None
-        self._items_linea: List[QGraphicsLineItem] = []
-        self._item_poligono: Optional[QGraphicsPolygonItem] = None
-        self._item_trazo: Optional[QGraphicsPathItem] = None
-        self._vertices: List[_Vertice] = []
-        self._items_solo_lectura: List[QGraphicsItem] = []
-
-        self.escena = QGraphicsScene(self)
-        self.vista = _VistaMapa(self.escena, self)
-        self.calibracion = CalibracionMapa()
-        self.georreferencia = Georreferencia(self.calibracion, 1, 1)
-        self.hay_imagen_real = False
+        # Página Leaflet + puente JS <-> Python.
+        self._pagina_cargada = False
+        self._pendientes: List[str] = []
+        self.vista = QWebEngineView(self)
+        self.vista.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+        self._pagina = _PaginaMapa(perfil_mapa(), self.vista)
+        ajustes = self._pagina.settings()
+        ajustes.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
+        self.vista.setPage(self._pagina)
+        self._puente = _PuenteMapa(self)
+        self._canal = QWebChannel(self._pagina)
+        self._canal.registerObject("puente", self._puente)
+        self._pagina.setWebChannel(self._canal)
+        self._puente.pagina_lista.connect(self._on_pagina_lista)
+        self._puente.clic_en_mapa.connect(self._on_clic_mapa)
+        self._puente.doble_clic_en_mapa.connect(self._on_doble_clic_mapa)
+        self._puente.tecla_pulsada.connect(self._on_tecla)
+        self._puente.vertice_soltado.connect(self._on_vertice_movido)
 
         self._construir_ui()
-        self.recargar_mapa()
+        self._js("configurar", not self.modo_operativo)
+        self._js("cuartel", self.calibracion.cuartel_lat, self.calibracion.cuartel_lon)
+        self._js("encuadrar", self.calibracion.cuartel_lat, self.calibracion.cuartel_lon, ANCHO_VISTA_INICIAL_KM)
+        self.vista.setUrl(QUrl.fromLocalFile(str(get_resource_path(RUTA_PAGINA_MAPA))))
+
+    # -- Puente con la página ----------------------------------------------------
+
+    def _js(self, funcion: str, *args: Any) -> None:
+        """Llama `fs.<funcion>(args)` en la página (o lo encola si todavía no cargó)."""
+        script = f"fs.{funcion}({', '.join(json.dumps(a) for a in args)});"
+        if self._pagina_cargada:
+            self._pagina.runJavaScript(script)
+        else:
+            self._pendientes.append(script)
+
+    def _on_pagina_lista(self) -> None:
+        if self._pagina_cargada:
+            # Recarga de la página (no debería pasar): se redibuja todo el estado.
+            self._sincronizar_todo()
+            return
+        self._pagina_cargada = True
+        for script in self._pendientes:
+            self._pagina.runJavaScript(script)
+        self._pendientes = []
+
+    def _sincronizar_todo(self) -> None:
+        self._js("configurar", not self.modo_operativo)
+        self._js("cuartel", self.calibracion.cuartel_lat, self.calibracion.cuartel_lon)
+        self._redibujar_siniestro()
+        self._redibujar_poligono()
+        self._enviar_solo_lectura()
+
+    @property
+    def pagina_cargada(self) -> bool:
+        return self._pagina_cargada
 
     # -- Construcción de la UI ------------------------------------------------
 
@@ -441,13 +267,6 @@ class MapWidget(QWidget):
 
         self.vista.setMinimumHeight(320)
         layout.addWidget(self.vista, 1)
-        self._crear_superposiciones_vista()
-
-        self.vista.clic.connect(self._on_clic_mapa)
-        self.vista.doble_clic.connect(self._on_doble_clic_mapa)
-        self.vista.cursor_movido.connect(self._on_cursor_movido)
-        self.vista.tecla_enter.connect(self._terminar_dibujo)
-        self.vista.tecla_escape.connect(self._on_escape)
 
         layout.addLayout(self._crear_barra_herramientas())
         if not self.modo_operativo:
@@ -490,32 +309,6 @@ class MapWidget(QWidget):
             boton.setObjectName("botonHerramienta")
         return fila
 
-    def _crear_superposiciones_vista(self) -> None:
-        """Rótulos flotantes sobre el mapa: distancia (arriba) y coordenadas
-        bajo el cursor (abajo), como en Avenza."""
-        estilo = ("background: rgba(255,255,255,0.93); color: #1a1d21; border: 1px solid #cfd6e2;"
-                  " border-radius: 6px; padding: 4px 9px; font: 12px 'Segoe UI';")
-        self.label_distancia_mapa = QLabel(self.vista.viewport())
-        self.label_distancia_mapa.setStyleSheet(estilo)
-        self.label_distancia_mapa.move(10, 10)
-        self.label_distancia_mapa.hide()
-        self.label_cursor = QLabel(self.vista.viewport())
-        self.label_cursor.setStyleSheet(estilo.replace("12px", "11px"))
-        self.label_cursor.hide()
-        self.vista.viewport().installEventFilter(self)
-
-    def eventFilter(self, objeto, evento) -> bool:  # noqa: N802 - override de Qt
-        if objeto is self.vista.viewport():
-            if evento.type() == QEvent.Type.Resize:
-                self._ubicar_label_cursor()
-            elif evento.type() == QEvent.Type.Leave:
-                self.label_cursor.hide()
-        return super().eventFilter(objeto, evento)
-
-    def _ubicar_label_cursor(self) -> None:
-        self.label_cursor.adjustSize()
-        self.label_cursor.move(10, self.vista.viewport().height() - self.label_cursor.height() - 10)
-
     def _crear_barra_herramientas(self) -> QHBoxLayout:
         fila = QHBoxLayout()
         botones: List[QPushButton] = []
@@ -537,9 +330,9 @@ class MapWidget(QWidget):
                   "Arrastrá los vértices; un clic fuera de ellos termina la edición.")
             boton("🗑 Borrar Polígono", self._borrar_poligono)
         fila.addStretch(1)
-        boton("＋", lambda: self.vista.zoom(FACTOR_ZOOM), "Acercar (rueda del mouse)")
-        boton("－", lambda: self.vista.zoom(1 / FACTOR_ZOOM), "Alejar (rueda del mouse)")
-        boton("⤢ Ver todo", self.vista.ver_todo, "Ver la imagen completa")
+        boton("＋", lambda: self._js("zoom", 1), "Acercar (rueda del mouse)")
+        boton("－", lambda: self._js("zoom", -1), "Alejar (rueda del mouse)")
+        boton("⤢ Ver todo", self.ver_todo, "Encuadrar el cuartel, el siniestro y las zonas dibujadas")
         boton("🚒 Cuartel", self._centrar_en_cuartel, "Centrar en el cuartel")
         for b in botones:
             b.setObjectName("botonHerramienta")
@@ -566,61 +359,42 @@ class MapWidget(QWidget):
         grid.addWidget(self.label_distancia, 1, 1, 1, 5)
         return caja
 
-    # -- Calibración y conversión píxel <-> GPS ---------------------------------------
-
-    def pixel_to_coords(self, x: float, y: float) -> Tuple[float, float]:
-        """Píxel de la imagen base -> (lat, lon)."""
-        return self.georreferencia.pixel_to_coords(x, y)
-
-    def coords_to_pixel(self, lat: float, lon: float) -> Tuple[float, float]:
-        """(lat, lon) -> píxel de la imagen base (puede caer fuera si el punto
-        está fuera del recuadro calibrado)."""
-        return self.georreferencia.coords_to_pixel(lat, lon)
-
-    def _punto_escena(self, lat: float, lon: float) -> QPointF:
-        x, y = self.coords_to_pixel(lat, lon)
-        return QPointF(x, y)
+    # -- Vista -------------------------------------------------------------------
 
     def recargar_mapa(self) -> None:
-        """Vuelve a leer imagen y calibración (tras cambiarlas en
-        Configuración) y reproyecta todo lo marcado."""
+        """Vuelve a leer la ubicación del cuartel (tras cambiarla en
+        Configuración) y redibuja marcador, línea y distancia."""
         self.calibracion = cartografia.cargar_calibracion()
-        pixmap, self.hay_imagen_real = cargar_pixmap_base(self.calibracion)
-        self.georreferencia = Georreferencia(self.calibracion, pixmap.width(), pixmap.height())
-
-        self._salir_de_modos()
-        self.escena.clear()
-        self._item_siniestro = self._item_poligono = self._item_trazo = None
-        self._items_linea, self._vertices, self._items_solo_lectura = [], [], []
-
-        self._item_fondo = self.escena.addPixmap(pixmap)
-        self._item_fondo.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
-        self._item_fondo.setZValue(0)
-        rect = QRectF(pixmap.rect())
-        self.vista.rect_contenido = rect
-        # Margen alrededor para poder panear un poco más allá del borde.
-        margen = max(rect.width(), rect.height()) * 0.15
-        self.escena.setSceneRect(rect.adjusted(-margen, -margen, margen, margen))
-
-        self._item_cuartel = _MarcadorCuartel()
-        self._item_cuartel.setPos(self._punto_escena(self.calibracion.cuartel_lat, self.calibracion.cuartel_lon))
-        self.escena.addItem(self._item_cuartel)
-
-        self._redibujar_superposiciones()
-        for lat, lon, etiqueta, geojson in self._solo_lectura:
-            self._dibujar_solo_lectura(lat, lon, etiqueta, geojson)
-        self.vista.pedir_ajuste_inicial()
+        self._js("cuartel", self.calibracion.cuartel_lat, self.calibracion.cuartel_lon)
+        self._redibujar_siniestro()
 
     def _centrar_en_cuartel(self) -> None:
-        if self._item_cuartel is not None:
-            self.vista.centerOn(self._item_cuartel.pos())
+        self.centrar_en(self.calibracion.cuartel_lat, self.calibracion.cuartel_lon)
 
-    # -- Clics sobre el mapa ------------------------------------------------------------
+    def ver_todo(self) -> None:
+        """Encuadra el cuartel, el siniestro, el polígono y la capa de solo lectura."""
+        puntos = [(self.calibracion.cuartel_lat, self.calibracion.cuartel_lon)]
+        if self._latitud is not None and self._longitud is not None:
+            puntos.append((self._latitud, self._longitud))
+        puntos += [(lat, lon) for lon, lat in self._anillo]
+        for lat, lon, _etiqueta, geojson in self._solo_lectura:
+            puntos.append((lat, lon))
+            puntos += [(la, lo) for lo, la in self._anillo_seguro(geojson)]
+        if len(puntos) == 1:
+            self.encuadrar(*puntos[0], ancho_km=ANCHO_VISTA_INICIAL_KM)
+            return
+        self._ajustar_a(puntos)
 
-    def _on_clic_mapa(self, punto: QPointF) -> None:
+    def _ajustar_a(self, puntos: List[Tuple[float, float]]) -> None:
+        lats = [p[0] for p in puntos]
+        lons = [p[1] for p in puntos]
+        self._js("ajustar", [[min(lats), min(lons)], [max(lats), max(lons)]])
+
+    # -- Clics y teclas sobre el mapa ------------------------------------------------
+
+    def _on_clic_mapa(self, lat: float, lon: float) -> None:
         if self.modo_operativo:
             return
-        lat, lon = self.pixel_to_coords(punto.x(), punto.y())
         if self._modo == MODO_DIBUJO:
             self._anillo.append((lon, lat))
             self._redibujar_poligono()
@@ -630,15 +404,15 @@ class MapWidget(QWidget):
             return
         self._on_marcador_cambiado(lat, lon)
 
-    def _on_doble_clic_mapa(self, _punto: QPointF) -> None:
+    def _on_doble_clic_mapa(self) -> None:
         if self._modo == MODO_DIBUJO:
             self._terminar_dibujo()
 
-    def _on_cursor_movido(self, punto: QPointF) -> None:
-        lat, lon = self.pixel_to_coords(punto.x(), punto.y())
-        self.label_cursor.setText(f"{lat:.5f}, {lon:.5f}")
-        self._ubicar_label_cursor()
-        self.label_cursor.show()
+    def _on_tecla(self, nombre: str) -> None:
+        if nombre == "enter":
+            self._terminar_dibujo()
+        elif nombre == "escape":
+            self._on_escape()
 
     def _on_escape(self) -> None:
         if self._modo == MODO_DIBUJO:
@@ -660,44 +434,20 @@ class MapWidget(QWidget):
         self._redibujar_siniestro()
 
     def _redibujar_siniestro(self) -> None:
-        for item in [self._item_siniestro, *self._items_linea]:
-            if item is not None:
-                self.escena.removeItem(item)
-        self._item_siniestro, self._items_linea = None, []
-
         if self._latitud is None or self._longitud is None:
-            self.label_distancia_mapa.hide()
+            self._js("siniestro", None, None, None)
             self._set_texto_panel("label_coordenadas", "(sin marcar)")
             self._set_texto_panel("label_distancia", "(marcá el lugar del siniestro)")
             return
 
-        destino = self._punto_escena(self._latitud, self._longitud)
-        origen = self._item_cuartel.pos()
-        # Contorno blanco debajo: la línea se lee sobre cualquier carta.
-        for lapiz, z in ((_lapiz_cosmetico(QColor("#ffffff"), 6), 20),
-                         (_lapiz_cosmetico(COLOR_LINEA, 3, Qt.PenStyle.DashLine), 21)):
-            linea = self.escena.addLine(origen.x(), origen.y(), destino.x(), destino.y(), lapiz)
-            linea.setZValue(z)
-            self._items_linea.append(linea)
-
-        self._item_siniestro = _MarcadorSiniestro()
-        self._item_siniestro.setPos(destino)
-        self.escena.addItem(self._item_siniestro)
-
         km = cartografia.distancia_geodesica_km(
             self.calibracion.cuartel_lat, self.calibracion.cuartel_lon, self._latitud, self._longitud
         )
-        texto = f"Distancia: {cartografia.formatear_distancia(km)}"
-        fuera = not self.georreferencia.contiene(self._latitud, self._longitud)
-        self.label_distancia_mapa.setText(
-            f"🚒 → 📍 <b>{texto}</b> <span style='color:#667'>(línea recta)</span>"
-            + ("<br><span style='color:#e65100'>⚠ Fuera del área de la imagen</span>" if fuera else "")
-        )
-        self.label_distancia_mapa.adjustSize()
-        self.label_distancia_mapa.show()
+        distancia = cartografia.formatear_distancia(km)
+        rotulo = f"🚒 → 📍 <b>Distancia: {distancia}</b> <span style='color:#667'>(línea recta)</span>"
+        self._js("siniestro", self._latitud, self._longitud, rotulo)
         self._set_texto_panel("label_coordenadas", f"{self._latitud:.6f}, {self._longitud:.6f}")
-        self._set_texto_panel("label_distancia", f"{cartografia.formatear_distancia(km)} en línea recta"
-                              + (" (fuera del área de la imagen)" if fuera else ""))
+        self._set_texto_panel("label_distancia", f"{distancia} en línea recta")
 
     def _set_texto_panel(self, nombre: str, texto: str) -> None:
         label = getattr(self, nombre, None)
@@ -713,16 +463,14 @@ class MapWidget(QWidget):
         self._salir_de_modos()
         self._anillo = []
         self._modo = MODO_DIBUJO
-        self.vista.setDragMode(QGraphicsView.DragMode.NoDrag)
-        self.vista.viewport().setCursor(Qt.CursorShape.CrossCursor)
-        self.vista.setFocus()
+        self.vista.setFocus()  # Enter / Esc llegan a la página
         self.boton_dibujar.setText("✔ Terminar Polígono")
         self._on_poligono_cambiado()
 
     def _terminar_dibujo(self) -> None:
         if self._modo != MODO_DIBUJO:
             return
-        # El doble clic suele dejar dos vértices casi en el mismo lugar.
+        # El doble clic puede dejar dos vértices en el mismo lugar.
         while len(self._anillo) >= 2 and self._vertices_iguales(self._anillo[-1], self._anillo[-2]):
             self._anillo.pop()
         if len(self._anillo) < 3:
@@ -730,40 +478,31 @@ class MapWidget(QWidget):
         self._salir_de_modos()
         self._on_poligono_cambiado()
 
-    def _vertices_iguales(self, a: Tuple[float, float], b: Tuple[float, float]) -> bool:
-        pa, pb = self._punto_escena(a[1], a[0]), self._punto_escena(b[1], b[0])
-        escala = self.vista.transform().m11() or 1.0
-        return (pa - pb).manhattanLength() * escala <= TOLERANCIA_CLIC_PX
+    @staticmethod
+    def _vertices_iguales(a: Tuple[float, float], b: Tuple[float, float]) -> bool:
+        return cartografia.distancia_geodesica_km(a[1], a[0], b[1], b[0]) * 1000 <= TOLERANCIA_VERTICE_M
 
     def _habilitar_edicion_poligono(self) -> None:
         if len(self._anillo) < 3:
             return
         self._salir_de_modos()
         self._modo = MODO_EDICION
-        for i, (lon, lat) in enumerate(self._anillo):
-            vertice = _Vertice(i, self._on_vertice_movido)
-            vertice.setPos(self._punto_escena(lat, lon))
-            self.escena.addItem(vertice)
-            self._vertices.append(vertice)
+        self._redibujar_poligono()
+        self._js("vertices", [[lat, lon] for lon, lat in self._anillo])
 
-    def _on_vertice_movido(self, indice: int, pos: QPointF) -> None:
-        if self._modo != MODO_EDICION or indice >= len(self._anillo):
+    def _on_vertice_movido(self, indice: int, lat: float, lon: float) -> None:
+        if self._modo != MODO_EDICION or not 0 <= indice < len(self._anillo):
             return
-        lat, lon = self.pixel_to_coords(pos.x(), pos.y())
         self._anillo[indice] = (lon, lat)
         self._on_poligono_cambiado()
 
     def _salir_de_modos(self) -> None:
-        for vertice in self._vertices:
-            if vertice.scene() is not None:
-                self.escena.removeItem(vertice)
-        self._vertices = []
+        if self._modo == MODO_EDICION:
+            self._js("vertices", None)
         self._modo = MODO_NORMAL
-        # En este orden: setDragMode pone la mano de paneo en el viewport.
-        self.vista.viewport().unsetCursor()
-        self.vista.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
         if hasattr(self, "boton_dibujar"):
             self.boton_dibujar.setText("▱ Dibujar Polígono")
+        self._redibujar_poligono()
 
     def _borrar_poligono(self) -> None:
         self._salir_de_modos()
@@ -781,29 +520,7 @@ class MapWidget(QWidget):
         self._actualizar_labels_poligono()
 
     def _redibujar_poligono(self) -> None:
-        for item in (self._item_poligono, self._item_trazo):
-            if item is not None:
-                self.escena.removeItem(item)
-        self._item_poligono = self._item_trazo = None
-        if not self._anillo:
-            return
-        puntos = QPolygonF([self._punto_escena(lat, lon) for lon, lat in self._anillo])
-        if self._modo == MODO_DIBUJO:
-            camino = QPainterPath()
-            camino.addPolygon(puntos)
-            self._item_trazo = self.escena.addPath(camino, _lapiz_cosmetico(COLOR_POLIGONO, 2, Qt.PenStyle.DashLine))
-            self._item_trazo.setZValue(10)
-            for p in puntos:  # vértices ya marcados, como referencia
-                punto = self.escena.addEllipse(-4, -4, 8, 8, QPen(COLOR_POLIGONO, 2), QBrush(QColor("#ffffff")))
-                punto.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
-                punto.setPos(p)
-                punto.setZValue(11)
-                punto.setParentItem(self._item_trazo)
-            return
-        relleno = QColor(COLOR_POLIGONO)
-        relleno.setAlpha(64)
-        self._item_poligono = self.escena.addPolygon(puntos, _lapiz_cosmetico(COLOR_POLIGONO, 3), QBrush(relleno))
-        self._item_poligono.setZValue(10)
+        self._js("poligono", [[lat, lon] for lon, lat in self._anillo], self._modo)
 
     def _actualizar_labels_poligono(self) -> None:
         area_m2 = self._superficie_ha * 10_000
@@ -853,8 +570,7 @@ class MapWidget(QWidget):
             QMessageBox.warning(self, "No se encontró la dirección", mensaje_error or "Intentá con otro texto.")
             return
         self._on_marcador_cambiado(lat, lng)
-        if self._item_siniestro is not None:
-            self.vista.centerOn(self._item_siniestro.pos())
+        self.encuadrar(lat, lng)
 
     # -- Importar / exportar KML, KMZ, GPX ------------------------------------
 
@@ -870,9 +586,8 @@ class MapWidget(QWidget):
         except Exception as e:  # noqa: BLE001 - cualquier archivo mal formado se reporta, no crashea
             QMessageBox.warning(self, "No se pudo importar", str(e))
             return
-        if self._item_poligono is not None:
-            self.vista.fitInView(self._item_poligono.boundingRect().adjusted(-80, -80, 80, 80),
-                                 Qt.AspectRatioMode.KeepAspectRatio)
+        if self._anillo:
+            self._ajustar_a([(lat, lon) for lon, lat in self._anillo])
 
     def _cargar_anillo_geojson(self, geojson_texto: Optional[str]) -> None:
         self._salir_de_modos()
@@ -916,42 +631,39 @@ class MapWidget(QWidget):
     # -- Capa de solo lectura (vista de operaciones) ------------------------------
 
     def limpiar_solo_lectura(self) -> None:
-        for item in self._items_solo_lectura:
-            if item.scene() is not None:
-                self.escena.removeItem(item)
-        self._items_solo_lectura = []
         self._solo_lectura = []
+        self._programar_solo_lectura()
 
     def agregar_incidente_solo_lectura(self, lat: float, lon: float, etiqueta: str,
                                        geojson: Optional[str] = None) -> None:
         self._solo_lectura.append((lat, lon, etiqueta, geojson))
-        self._dibujar_solo_lectura(lat, lon, etiqueta, geojson)
+        self._programar_solo_lectura()
 
-    def _dibujar_solo_lectura(self, lat: float, lon: float, etiqueta: str, geojson: Optional[str]) -> None:
-        if geojson:
-            try:
-                anillo = _anillo_de_geojson(geojson)
-            except (ValueError, KeyError, TypeError, IndexError):
-                anillo = []
-            if len(anillo) >= 3:
-                relleno = QColor(COLOR_POLIGONO)
-                relleno.setAlpha(38)
-                poligono = self.escena.addPolygon(
-                    QPolygonF([self._punto_escena(la, lo) for lo, la in anillo]),
-                    _lapiz_cosmetico(COLOR_POLIGONO, 2), QBrush(relleno),
-                )
-                poligono.setZValue(9)
-                self._items_solo_lectura.append(poligono)
-        marcador = _MarcadorSiniestro(tooltip=f"Parte N° {etiqueta}" if etiqueta else "Siniestro", escala=0.8)
-        marcador.setPos(self._punto_escena(lat, lon))
-        self.escena.addItem(marcador)
-        self._items_solo_lectura.append(marcador)
+    def _programar_solo_lectura(self) -> None:
+        """Agregar N incidentes seguidos = UN solo redibujo en la página."""
+        if not self._solo_lectura_programado:
+            self._solo_lectura_programado = True
+            QTimer.singleShot(0, self._enviar_solo_lectura)
+
+    def _enviar_solo_lectura(self) -> None:
+        self._solo_lectura_programado = False
+        items = [
+            {"lat": lat, "lng": lon, "etiqueta": etiqueta,
+             "anillo": [[la, lo] for lo, la in self._anillo_seguro(geojson)] or None}
+            for lat, lon, etiqueta, geojson in self._solo_lectura
+        ]
+        self._js("soloLectura", items)
+
+    @staticmethod
+    def _anillo_seguro(geojson: Optional[str]) -> List[Tuple[float, float]]:
+        if not geojson:
+            return []
+        try:
+            return _anillo_de_geojson(geojson)
+        except (ValueError, KeyError, TypeError, IndexError):
+            return []
 
     # -- API pública para main_window.py ---------------------------------------
-
-    def _redibujar_superposiciones(self) -> None:
-        self._redibujar_siniestro()
-        self._redibujar_poligono()
 
     def cargar_incidente(
         self, numero_parte: str, lat: Optional[float], lng: Optional[float],
@@ -971,8 +683,8 @@ class MapWidget(QWidget):
             # Superficie cargada sin polígono (estimada a ojo): se respeta.
             self._superficie_ha = superficie_ha or 0.0
             self._actualizar_labels_poligono()
-        if self._item_siniestro is not None:
-            self.vista.centerOn(self._item_siniestro.pos())
+        if lat is not None and lng is not None:
+            self.centrar_en(lat, lng)
 
     def limpiar(self) -> None:
         """Resetea el mapa para cargar un incidente nuevo (llamado desde
@@ -997,46 +709,44 @@ class MapWidget(QWidget):
             self.coordenadas_cambiadas.emit(lat, lon)
 
     def centrar_en(self, lat: float, lon: float) -> None:
-        self.vista.centerOn(self._punto_escena(lat, lon))
+        """Centra la vista en el punto (mismo zoom). Llamable desde Python
+        en cualquier momento: si la página no cargó, queda encolado."""
+        self._js("centrar", lat, lon)
 
     def encuadrar(self, lat: float, lon: float, ancho_km: float = 3.0) -> None:
-        """Zoom de barrio (~`ancho_km` de ancho en pantalla) centrado en el
-        punto: la vista inicial del selector y la escala de la captura. Con
-        la imagen entera en pantalla no se podría ni centrar ni leer el lugar."""
-        grados_lon = ancho_km / (111.32 * max(math.cos(math.radians(lat)), 0.01))
-        x0, _ = self.coords_to_pixel(lat, lon - grados_lon / 2)
-        x1, _ = self.coords_to_pixel(lat, lon + grados_lon / 2)
-        ancho_px = abs(x1 - x0)
-        if ancho_px > 0:
-            escala = self.vista.viewport().width() / ancho_px
-            escala = min(max(escala, self.vista._escala_ajuste() * 0.5), ZOOM_MAXIMO)
-            self.vista.resetTransform()
-            self.vista.scale(escala, escala)
-        self.centrar_en(lat, lon)
+        """Zoom de barrio (~`ancho_km` de ancho en pantalla) centrado en el punto."""
+        self._js("encuadrar", lat, lon, ancho_km)
 
     def dentro_del_mapa(self, lat: float, lon: float) -> bool:
-        """True si el punto cae dentro de la imagen calibrada."""
-        return self.georreferencia.contiene(lat, lon)
+        """El mapa cubre todo el mundo: solo se validan los rangos WGS84."""
+        return -90 <= lat <= 90 and -180 <= lon <= 180
 
     def exportar_imagen(self, ruta: Path, ancho: int = 1600, alto: int = 1000, leyenda: str = "") -> Path:
-        """PNG/JPG del área del mapa CENTRADA en la chincheta, con la misma
-        escala que tiene la vista en pantalla (lo que el operador está viendo)
-        y una franja inferior con la leyenda y las coordenadas.
-
-        Se dibuja la ESCENA (no una captura de la ventana): no salen el
-        cursor, los carteles flotantes ni las barras, y la chincheta y el
-        cuartel mantienen su tamaño (ignoran el zoom)."""
-        if self._item_siniestro is None:
+        """PNG/JPG del mapa CENTRADO en la chincheta, con el zoom que tiene la
+        vista en pantalla y una franja inferior con la leyenda y las
+        coordenadas. Se centra, se espera a que carguen las teselas (máx.
+        `TIMEOUT_CAPTURA_MS`) y se captura la vista sin los controles."""
+        if self._latitud is None or self._longitud is None:
             raise ValueError("No hay un punto marcado en el mapa.")
-        centro = self._item_siniestro.pos()
-        visible = self.vista.mapToScene(self.vista.viewport().rect()).boundingRect()
-        # Mismo zoom que en pantalla, recortado a la proporción de la imagen de salida.
-        alto_fuente = max(visible.height(), 1.0)
-        ancho_fuente = alto_fuente * ancho / alto
-        if ancho_fuente < visible.width():
-            ancho_fuente = visible.width()
-            alto_fuente = ancho_fuente * alto / ancho
-        fuente = QRectF(centro.x() - ancho_fuente / 2, centro.y() - alto_fuente / 2, ancho_fuente, alto_fuente)
+        lat, lon = self._latitud, self._longitud
+
+        self._js("prepararCaptura", lat, lon)
+        _esperar(TIMEOUT_CAPTURA_MS, self._puente.captura_preparada)
+        _esperar(200)  # que el compositor pinte el último cuadro
+        captura = self.vista.grab().toImage()
+        self._js("terminarCaptura")
+        if captura.isNull() or captura.width() < 2 or captura.height() < 2:
+            raise OSError("No se pudo capturar el mapa (¿la ventana está minimizada?).")
+        captura.setDevicePixelRatio(1.0)
+
+        # Recorte centrado con la proporción de salida (el punto queda en el centro).
+        proporcion = ancho / alto
+        rw, rh = captura.width(), captura.height()
+        if rw / rh > proporcion:
+            rw = round(rh * proporcion)
+        else:
+            rh = round(rw / proporcion)
+        fuente = QRectF((captura.width() - rw) / 2, (captura.height() - rh) / 2, rw, rh)
 
         banda = 56
         imagen = QImage(ancho, alto + banda, QImage.Format.Format_ARGB32)
@@ -1045,28 +755,29 @@ class MapWidget(QWidget):
         try:
             pintor.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform
                                   | QPainter.RenderHint.TextAntialiasing)
-            self.escena.render(pintor, QRectF(0, 0, ancho, alto), fuente, Qt.AspectRatioMode.IgnoreAspectRatio)
+            pintor.drawImage(QRectF(0, 0, ancho, alto), captura, fuente)
             # Retícula fina sobre el punto: se ubica aunque la chincheta tape el lugar.
-            pintor.setPen(QPen(QColor(255, 255, 255, 200), 3))
-            for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-                pintor.drawLine(QPointF(ancho / 2 + dx * 14, alto / 2 + dy * 14),
-                                QPointF(ancho / 2 + dx * 40, alto / 2 + dy * 40))
-            pintor.setPen(QPen(COLOR_SINIESTRO, 1.5))
-            for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-                pintor.drawLine(QPointF(ancho / 2 + dx * 14, alto / 2 + dy * 14),
-                                QPointF(ancho / 2 + dx * 40, alto / 2 + dy * 40))
-            # Franja con leyenda y coordenadas.
+            for lapiz in (QPen(QColor(255, 255, 255, 200), 3), QPen(COLOR_SINIESTRO, 1.5)):
+                pintor.setPen(lapiz)
+                for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    pintor.drawLine(QPointF(ancho / 2 + dx * 14, alto / 2 + dy * 14),
+                                    QPointF(ancho / 2 + dx * 40, alto / 2 + dy * 40))
             pintor.fillRect(QRectF(0, alto, ancho, banda), QColor("#1f2937"))
             pintor.setPen(QColor("#ffffff"))
             fuente_texto = QFont("Segoe UI")
             fuente_texto.setPixelSize(22)
             pintor.setFont(fuente_texto)
-            lat, lon = self._latitud, self._longitud
             texto = f"📍 {lat:.6f}, {lon:.6f}   ({formatear_dms(lat, lon)})"
             if leyenda:
                 texto = f"{leyenda}   ·   {texto}"
             pintor.drawText(QRectF(18, alto, ancho - 36, banda),
                             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, texto)
+            pintor.setPen(QColor("#9ca3af"))
+            fuente_texto.setPixelSize(13)
+            pintor.setFont(fuente_texto)
+            pintor.drawText(QRectF(18, alto, ancho - 36, banda - 6),
+                            Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignRight,
+                            "© colaboradores de OpenStreetMap / Esri")
         finally:
             pintor.end()
 
@@ -1084,7 +795,6 @@ class MapWidget(QWidget):
             "superficie_ha": self._superficie_ha if self._superficie_ha else None,
             "geometria_geojson": self._geometria_geojson(),
         }
-
 
 # ---------------------------------------------------------------------------
 # Geometría

@@ -1,13 +1,12 @@
 """
 "📍 Marcar en Mapa": selector de punto estilo Avenza Maps para el formulario
-de salida. Reutiliza el `MapWidget` de la Cartografía Táctica (imagen local
-georreferenciada, sin internet -- funciona en la PC de guardia aislada):
+de salida. Reutiliza el `MapWidget` de la Cartografía Táctica (Leaflet +
+OpenStreetMap, coordenadas WGS84):
 
   - Clic en el mapa: coloca / mueve el marcador de intervención.
   - Latitud / Longitud a mano (acepta "-33.6315, -64.0152" pegado en un solo
     campo y coma decimal): "Ir al punto" mueve el marcador y centra la vista.
-  - Coordenadas del punto en decimal y en grados/minutos/segundos, con aviso
-    si cae fuera del área de la imagen.
+  - Coordenadas del punto en decimal y en grados/minutos/segundos.
   - "✅ Confirmar y Guardar Imagen": PNG del área centrada en el marcador en
     data/mapas/parte_<NUMERO>_<AÑO>.png; el formulario recibe punto, ruta y
     lo que se haya dibujado (polígono del área afectada).
@@ -166,8 +165,8 @@ class DialogoMarcarMapa(QDialog):
 
     def showEvent(self, evento) -> None:  # noqa: N802 - override de Qt
         super().showEvent(evento)
-        # Después del ajuste inicial de la vista (que muestra la imagen entera):
-        # zoom de barrio centrado en el punto de la salida o en Adelia María.
+        # Zoom de barrio centrado en el punto de la salida o en Adelia María
+        # (diferido: el mapa ya tiene su tamaño final para calcular la escala).
         QTimer.singleShot(120, lambda: self.mapa.encuadrar(*self._centro_inicial))
 
     # -- Coordenadas a mano -------------------------------------------------------------
@@ -208,11 +207,7 @@ class DialogoMarcarMapa(QDialog):
             return
         lat, lon = punto
         texto = f"📍 Punto: <b>{lat:.6f}, {lon:.6f}</b> &nbsp; ({formatear_dms(lat, lon)})"
-        if not self.mapa.dentro_del_mapa(lat, lon):
-            texto += " &nbsp; ⚠ Fuera del área de la imagen del mapa: la captura saldrá sin fondo."
-            theme.set_tono(self.label_punto, "alerta")
-        else:
-            theme.set_tono(self.label_punto, "ok")
+        theme.set_tono(self.label_punto, "ok")
         self.label_punto.setText(texto)
 
     # -- Confirmar ----------------------------------------------------------------------

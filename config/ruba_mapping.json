@@ -259,7 +259,8 @@
           "tipo_lugar": "#bomberos_estructurabundle_incidenteRescateType_tipoLugar"
         },
         "climatico": {
-          "evacuacion": "#bomberos_estructurabundle_incidenteClimaticoType_evacuacion"
+          "evacuacion": "#bomberos_estructurabundle_incidenteClimaticoType_evacuacion",
+          "superficie_evacuada": "#bomberos_estructurabundle_incidenteClimaticoType_superficieEvacuada"
         },
         "matpel": {
           "evacuacion": "#bomberos_estructurabundle_incidenteMatPelType_evacuacion"

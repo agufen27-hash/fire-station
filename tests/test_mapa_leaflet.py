@@ -117,6 +117,32 @@ def test_dentro_del_mapa_valida_rangos_wgs84(mapa):
     assert not mapa.dentro_del_mapa(-91, 0) and not mapa.dentro_del_mapa(0, 181)
 
 
+def _evaluar(mapa, expresion: str):
+    resultado = {}
+    mapa._pagina.runJavaScript(expresion, 0, lambda r: resultado.setdefault("r", r))
+    for _ in range(20):
+        if "r" in resultado:
+            break
+        _esperar(100)
+    return resultado.get("r")
+
+
+def test_encuadre_antes_de_tener_tamano_se_aplica_al_mostrarse(mapa):
+    """Qt crea el widget en ~100 px: encuadrar ahí daría zoom 11 (el bug del
+    .exe). El encuadre queda pendiente hasta que el mapa tiene su ancho real."""
+    _esperar(20000, mapa._puente.pagina_lista)  # carga sin mostrarse: tamaño chico
+    if not mapa.pagina_cargada:
+        pytest.skip("QtWebEngine no levantó en este entorno")
+    mapa.encuadrar(-33.6315, -64.0152, 3.0)
+    mapa.resize(1000, 700)
+    mapa.show()
+    _esperar(1500)
+    ancho = _evaluar(mapa, "mapa.getSize().x")
+    zoom = _evaluar(mapa, "mapa.getZoom()")
+    assert ancho >= 300
+    assert zoom >= 14, f"zoom {zoom} con ancho {ancho}"
+
+
 def test_la_pagina_carga_y_responde_al_puente(mapa):
     """Integración real con QtWebEngine: la página avisa `listo` y ejecuta lo encolado."""
     mapa.resize(800, 600)
