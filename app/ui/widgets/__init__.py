@@ -130,7 +130,7 @@ class TimeField(QWidget):
 
         self.boton_ahora = QPushButton("Ahora", self)
         self.boton_ahora.setObjectName("botonAhora")
-        self.boton_ahora.setFixedWidth(64)
+        self.boton_ahora.setFixedWidth(72)
         self.boton_ahora.clicked.connect(self.set_ahora)
 
         layout.addWidget(self.time_edit, 1)
@@ -214,7 +214,7 @@ class DateField(QWidget):
 
         self.boton_hoy = QPushButton("Hoy", self)
         self.boton_hoy.setObjectName("botonAhora")
-        self.boton_hoy.setFixedWidth(64)
+        self.boton_hoy.setFixedWidth(72)
         self.boton_hoy.clicked.connect(self.set_hoy)
 
         layout.addWidget(self.date_edit, 1)

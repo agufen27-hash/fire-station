@@ -1,9 +1,11 @@
 """
-Ventana principal de Fire Station: dashboard con sidebar lateral (10 módulos),
+Ventana principal de Fire Station: dashboard con sidebar lateral (11 módulos),
 barra institucional superior con el nombre de la sección activa, y un
-QStackedWidget de páginas -- Inicio, Nueva Salida (formulario operativo de
-guardia, con dotaciones dinámicas y firma electrónica), Historial de
-Salidas, Cartografía Táctica, Personal y Unidades (CRUD), Libro de Guardia
+QStackedWidget de páginas -- Inicio, Planillas (panel central de partes y
+carga a RUBA; desde ahí, y solo desde ahí, se abre el formulario operativo
+de guardia para una planilla nueva, con dotaciones dinámicas y firma
+electrónica), Estadísticas (KPIs y gráficos, según
+permisos), Cartografía Táctica, Personal y Unidades (CRUD), Libro de Guardia
 (bitácora de viajes y asistencias en Supabase), Inventario (ABM de activos,
 edición solo para ADMIN), Mantenimiento (checklists preventivos por cadencia),
 Documentación
@@ -113,12 +115,13 @@ from app.ui.widgets.map_widget import MapWidget, OperationsMapWindow
 from app.ui.damnificados_widgets import PanelDamnificados
 from app.services.personal_info import mandos_del_padron, padron_activo
 from app.core.roles import NOMBRES_ROL, Permisos, permisos_de
-from app.services.personal_service import rol_de, verificar_pin_personal
+from app.services.personal_service import hay_administrador, rol_de, verificar_pin_personal
 from app.ui.pin_dialogs import DialogoResetPinMaestra
 from app.ui.dotaciones_widgets import PanelDotaciones, PanelPersonalBase, personas_repetidas
 from app.ui.participacion_widgets import HorarioServicio, SelectorBombero
 from app.ui.bomberos_view import importar_bomberos_desde_excel
 from app.ui.libro_guardia_view import PaginaLibroGuardia
+from app.ui.estadisticas_view import PaginaEstadisticas
 from app.ui.inventario_view import PaginaInventario
 from app.ui.mantenimiento_view import PaginaMantenimiento
 from app.ui.personnel_window import BotonSyncCloud, LegajoPrivadoWidget
@@ -149,14 +152,16 @@ ROL_CODIGO_RUBA = Qt.ItemDataRole.UserRole + 1
 # Índices de página del QStackedWidget, en el mismo orden que la sidebar.
 IDX_DASHBOARD = 0
 IDX_FORMULARIO = 1
-IDX_HISTORIAL = 2
-IDX_MAPA = 3
-IDX_DOTACIONES = 4
-IDX_LIBRO_GUARDIA = 5
-IDX_INVENTARIO = 6
-IDX_MANTENIMIENTO = 7
-IDX_DOCUMENTACION = 8
-IDX_CONFIGURACION = 9
+IDX_HISTORIAL = 2        # "Planillas": lista de partes + carga a RUBA
+IDX_PLANILLAS = IDX_HISTORIAL
+IDX_ESTADISTICAS = 3
+IDX_MAPA = 4
+IDX_DOTACIONES = 5
+IDX_LIBRO_GUARDIA = 6
+IDX_INVENTARIO = 7
+IDX_MANTENIMIENTO = 8
+IDX_DOCUMENTACION = 9
+IDX_CONFIGURACION = 10
 
 # Estado reactivo: chequeo de internet cada 4 min (en un QThread) y retardo
 # para agrupar los avisos del QFileSystemWatcher del padrón.
@@ -184,8 +189,8 @@ class ChipClickable(QLabel):
 
 ITEMS_NAV = [
     (IDX_DASHBOARD, "📊  Inicio"),
-    (IDX_FORMULARIO, "📝  Nueva Planilla"),
-    (IDX_HISTORIAL, "📈  Estadísticas"),
+    (IDX_HISTORIAL, "📋  Planillas"),
+    (IDX_ESTADISTICAS, "📈  Estadísticas"),
     (IDX_MAPA, "🗺️  Cartografía Táctica"),
     (IDX_DOTACIONES, "🚒  Personal y Unidades"),
     (IDX_LIBRO_GUARDIA, "📒  Libro de Guardia"),
@@ -220,8 +225,9 @@ def filtrar_tabla(tabla: QTableWidget, texto: str, col_excluida: int = -1) -> No
 
 NOMBRES_SECCION = {
     IDX_DASHBOARD: "INICIO",
-    IDX_FORMULARIO: "NUEVA PLANILLA",
-    IDX_HISTORIAL: "ESTADÍSTICAS",
+    IDX_FORMULARIO: "PLANILLA",
+    IDX_HISTORIAL: "PLANILLAS",
+    IDX_ESTADISTICAS: "ESTADÍSTICAS",
     IDX_MAPA: "CARTOGRAFÍA TÁCTICA",
     IDX_DOTACIONES: "PERSONAL Y UNIDADES",
     IDX_LIBRO_GUARDIA: "LIBRO DE GUARDIA",
@@ -386,6 +392,9 @@ class MainWindow(QMainWindow):
         self._pagina_historial.eliminar_solicitado.connect(self.eliminar_servicio)
         self._pagina_historial.estados_cambiados.connect(self._actualizar_dashboard)
         self._pagina_historial.estados_cambiados.connect(self._refrescar_estado_ruba)
+        self._pagina_historial.nueva_planilla_solicitada.connect(self._nueva_planilla)
+        self._pagina_estadisticas = PaginaEstadisticas(self)
+        self._pagina_estadisticas.identificarse_solicitado.connect(self._on_chip_operador)
         self._pagina_mapa = OperationsMapWindow(self)
         self._pagina_dotaciones = self._crear_pagina_dotaciones()
         self._pagina_libro_guardia = PaginaLibroGuardia(self)
@@ -398,6 +407,7 @@ class MainWindow(QMainWindow):
             self._pagina_dashboard,
             self._pagina_formulario,
             self._pagina_historial,
+            self._pagina_estadisticas,
             self._pagina_mapa,
             self._pagina_dotaciones,
             self._pagina_libro_guardia,
@@ -712,7 +722,9 @@ class MainWindow(QMainWindow):
 
         self._grupo_nav = QButtonGroup(sidebar)
         self._grupo_nav.setExclusive(True)
-        self._botones_nav: List[QPushButton] = []
+        # Página -> botón. El formulario (IDX_FORMULARIO) no tiene botón propio:
+        # es una subpágina de Planillas (Nueva Planilla / Editar / Continuar).
+        self._botones_nav: Dict[int, QPushButton] = {}
 
         for indice, etiqueta in ITEMS_NAV:
             boton = QPushButton(etiqueta, sidebar)
@@ -721,7 +733,7 @@ class MainWindow(QMainWindow):
             boton.setCursor(Qt.CursorShape.PointingHandCursor)
             boton.clicked.connect(lambda _=False, i=indice: self._ir_a_pagina(i))
             self._grupo_nav.addButton(boton)
-            self._botones_nav.append(boton)
+            self._botones_nav[indice] = boton
             layout_nav.addWidget(boton)
 
         self._botones_nav[IDX_DASHBOARD].setChecked(True)
@@ -731,7 +743,9 @@ class MainWindow(QMainWindow):
         return sidebar
 
     def _ir_a_pagina(self, indice: int) -> None:
-        self._botones_nav[indice].setChecked(True)
+        boton = self._botones_nav.get(IDX_PLANILLAS if indice == IDX_FORMULARIO else indice)
+        if boton is not None:
+            boton.setChecked(True)
         self._stack.setCurrentIndex(indice)
 
     def _on_pagina_cambiada(self, indice: int) -> None:
@@ -741,6 +755,9 @@ class MainWindow(QMainWindow):
             self._actualizar_dashboard()
         elif indice == IDX_HISTORIAL:
             self._pagina_historial.refrescar()
+        elif indice == IDX_ESTADISTICAS:
+            self._pagina_estadisticas.recargar_catalogos()
+            self._pagina_estadisticas.refrescar()
         elif indice == IDX_MAPA:
             self._pagina_mapa.refrescar()
         elif indice == IDX_DOTACIONES:
@@ -1380,6 +1397,14 @@ class MainWindow(QMainWindow):
         self.boton_limpiar.setObjectName("botonLimpiar")
         self.boton_limpiar.clicked.connect(self._limpiar_formulario)
 
+        # Salir del formulario sin tocar lo guardado: al editar un parte (o
+        # retomar uno en curso / borrador) descarta los cambios y vuelve a
+        # Planillas; en un parte nuevo, descarta lo cargado.
+        self.boton_cancelar = QPushButton("✖ Cancelar / Descartar cambios", self)
+        self.boton_cancelar.setObjectName("botonLimpiar")
+        self.boton_cancelar.setToolTip("Sale del formulario sin guardar: lo que ya estaba guardado no se modifica.")
+        self.boton_cancelar.clicked.connect(self._cancelar_edicion)
+
         self.boton_borrador = QPushButton("⏱️ Salida en Curso (Guardar Borrador)", self)
         self.boton_borrador.setObjectName("botonBorradorCurso")
         self.boton_borrador.setToolTip(
@@ -1392,15 +1417,16 @@ class MainWindow(QMainWindow):
         self.boton_guardar_local.setObjectName("botonPrimarioAzul")
         self.boton_guardar_local.setToolTip(
             "Guarda en la base local (queda PENDIENTE de RUBA) y abre las planillas PCS/PCD2. "
-            "La carga en RUBA se hace desde Estadísticas (🚀 Cargar Seleccionados a RUBA)."
+            "La carga en RUBA se hace desde Planillas (🚀 Cargar Seleccionados a RUBA)."
         )
         self.boton_guardar_local.clicked.connect(self._guardar_y_generar_planillas)
 
-        for boton in (self.boton_limpiar, self.boton_borrador, self.boton_guardar_local):
+        for boton in (self.boton_cancelar, self.boton_limpiar, self.boton_borrador, self.boton_guardar_local):
             boton.setCursor(Qt.CursorShape.PointingHandCursor)
 
         layout.setSpacing(12)
         layout.setContentsMargins(0, 4, 0, 0)
+        layout.addWidget(self.boton_cancelar, 1)
         layout.addWidget(self.boton_limpiar, 1)
         layout.addWidget(self.boton_borrador, 2)
         layout.addWidget(self.boton_guardar_local, 2)
@@ -1899,7 +1925,7 @@ class MainWindow(QMainWindow):
         if problemas:
             resumen += "\n\nProblemas al generar planillas:\n" + "\n".join(problemas)
 
-        resumen += ("\n\nQuedó PENDIENTE de carga en RUBA: cargalo desde Estadísticas "
+        resumen += ("\n\nQuedó PENDIENTE de carga en RUBA: cargalo desde Planillas "
                     "(🚀 Cargar Seleccionados a RUBA).")
         self._refrescar_estado_ruba()  # antes del mensaje modal: el chip ya muestra el nuevo pendiente
         (QMessageBox.warning if problemas else QMessageBox.information)(self, "Siniestro guardado", resumen)
@@ -2042,6 +2068,48 @@ class MainWindow(QMainWindow):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No,
         )
         return respuesta == QMessageBox.StandardButton.Yes
+
+    def _formulario_modificado(self) -> bool:
+        """True si el formulario tiene algo que se perdería al salir: un parte
+        guardado abierto (edición / en curso) o uno nuevo a medio cargar."""
+        return self._incidente_en_edicion is not None or self._formulario_con_datos_sin_guardar()
+
+    def _cancelar_edicion(self) -> None:
+        """✖ Cancelar / Descartar cambios: sale del formulario SIN guardar.
+        La base no se toca (el parte editado, el borrador o el servicio en
+        curso quedan exactamente como estaban) y se vuelve a Planillas."""
+        editando = self._incidente_en_edicion is not None
+        if self._formulario_modificado():
+            numero = self.label_numero_parte.text()
+            texto = (f"¿Salir del Parte N° {numero} sin guardar?\n\nSe descartan los cambios hechos en el "
+                     "formulario; lo que ya estaba guardado queda como estaba." if editando else
+                     "¿Descartar el parte nuevo que estás cargando? No se guarda nada.")
+            respuesta = QMessageBox.question(
+                self, "Cancelar y descartar cambios", texto,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No,
+            )
+            if respuesta != QMessageBox.StandardButton.Yes:
+                return
+        self._limpiar_formulario()
+        self._ir_a_pagina(IDX_HISTORIAL)
+        theme.set_tono(self.statusBar(), "neutro")
+        self.statusBar().showMessage("Edición cancelada: no se guardó ningún cambio." if editando
+                                     else "Formulario descartado.", 8000)
+
+    def _nueva_planilla(self) -> None:
+        """"📝 Nueva Planilla" de Planillas: abre el formulario en blanco. Si
+        hay un parte guardado abierto en edición, pregunta antes de soltarlo;
+        un parte nuevo a medio cargar se conserva (se sigue donde quedó)."""
+        if self._incidente_en_edicion is not None:
+            respuesta = QMessageBox.question(
+                self, "Nueva planilla",
+                f"El formulario tiene abierto el Parte N° {self.label_numero_parte.text()} sin guardar.\n\n"
+                "¿Descartar esos cambios y empezar una planilla nueva? (No = seguir editándolo)",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No,
+            )
+            if respuesta == QMessageBox.StandardButton.Yes:
+                self._limpiar_formulario()
+        self._ir_a_pagina(IDX_FORMULARIO)
 
     def editar_servicio(self, incidente_id: int) -> None:
         """Carga un servicio del Historial en el formulario en MODO EDICIÓN:
@@ -2366,12 +2434,18 @@ class MainWindow(QMainWindow):
     # -- Sincronización con RUBA en segundo plano (Fase 3) ----------------------
 
     def _cargar_lote_ruba(self, incidente_ids: List[int]) -> None:
-        """Encola partes para RUBA (Historial -> 🚀, ↻ RUBA de una fila, o el
+        """Encola partes para RUBA (Planillas -> 🚀, ↻ RUBA de una fila, o el
         aviso de pendientes). La carga corre en la cola de segundo plano: el
         operador sigue trabajando. Antes, el Semáforo Pre-RUBA revisa cada
         parte SIN abrir Chromium: los que tienen datos faltantes no se
-        encolan (se avisa cuáles y qué les falta)."""
+        encolan (se avisa cuáles y qué les falta). Requiere el permiso RUBA
+        (Jefatura / Administración / Estadística)."""
         if not incidente_ids:
+            return
+        if not self._permisos.cargar_ruba:
+            QMessageBox.warning(self, "Sin permiso RUBA",
+                                "La carga y sincronización con RUBA está habilitada solo para Jefatura, "
+                                "Administración y Estadística. Identificate con tu PIN (chip 👤).")
             return
         listos: List[int] = []
         incompletos: List[Tuple[str, SemaforoRuba]] = []
@@ -2401,7 +2475,7 @@ class MainWindow(QMainWindow):
             caja.setWindowTitle("Semáforo Pre-RUBA: faltan datos")
             caja.setText(f"{len(incompletos)} parte(s) no están listos para RUBA: abrir el navegador con "
                          "ellos solo haría perder tiempo (RUBA rechazaría el guardado).")
-            caja.setInformativeText("Completalos desde el Historial (✏️ Editar) y volvé a cargarlos.")
+            caja.setInformativeText("Completalos desde Planillas (✏️ Editar) y volvé a cargarlos.")
             caja.setDetailedText(detalle)
             boton_listos = None
             if listos:
@@ -2548,6 +2622,9 @@ class MainWindow(QMainWindow):
             "Elegí el 'Reporte de vehiculos' exportado de RUBA (.xlsx) desde cualquier carpeta")
         boton_importar_unidades.clicked.connect(self._importar_unidades)
         self._botones_abm = [boton_nuevo_bombero, boton_nueva_unidad, boton_importar_padron, boton_importar_unidades]
+        # Instalación limpia (sin ningún Administrador): las importaciones quedan
+        # habilitadas sin operador para poder cargar el padrón desde cero.
+        self._botones_importar = [boton_importar_padron, boton_importar_unidades]
         fila_botones.addWidget(boton_nuevo_bombero)
         fila_botones.addWidget(boton_nueva_unidad)
         fila_botones.addWidget(self._crear_boton_refrescar(pagina))
@@ -2682,17 +2759,31 @@ class MainWindow(QMainWindow):
             and self._panel_unidades.eliminar(mid),
         )
 
+    def _instalacion_inicial(self) -> bool:
+        """Base sin ningún Administrador activo (primer arranque)."""
+        try:
+            return not hay_administrador()
+        except Exception:  # noqa: BLE001 - ante la duda, sin excepción de permisos
+            return False
+
+    def _permitido_importar(self, accion: str) -> bool:
+        """Importar padrón / unidades: rol Administrador, o instalación inicial."""
+        if self._permisos.editar_padron or self._instalacion_inicial():
+            return True
+        return self._permitido("editar_padron", accion)
+
     def _importar_unidades(self) -> None:
-        if self._permitido("editar_padron", "Importar unidades"):
+        if self._permitido_importar("Importar unidades"):
             self._panel_unidades.importar_desde_excel()
 
     def _importar_padron_bomberos(self) -> None:
         """Diálogo + importación en app/ui/bomberos_view.py; acá solo se
         refrescan la tabla de personal y el chip del padrón."""
-        if not self._permitido("editar_padron", "Importar el padrón"):
+        if not self._permitido_importar("Importar el padrón"):
             return
         if not importar_bomberos_desde_excel(self):
             return
+        self._aplicar_permisos()  # con personal cargado puede dejar de ser "instalación inicial"
         # _cargar_pagina_dotaciones -> _refrescar_padron_despacho reparte el
         # padrón nuevo (ya filtrado) a los selectores de la planilla.
         self._cargar_pagina_dotaciones()
@@ -2785,6 +2876,7 @@ class MainWindow(QMainWindow):
                 datos_previos = {
                     "legajo": p.legajo or "", "nombre": p.nombre, "apellido": p.apellido, "dni": p.dni,
                     "telefono": p.telefono or "", "jerarquia": p.jerarquia or "Bombero",
+                    "contacto_emergencia": p.contacto_emergencia or "",
                     "grupo_sanguineo": p.grupo_sanguineo or "", "antiguedad_fecha": p.antiguedad_fecha,
                     "estado": p.estado, "id_ruba": p.id_ruba,
                 }
@@ -2800,6 +2892,9 @@ class MainWindow(QMainWindow):
         entry_apellido = QLineEdit(datos_previos["apellido"] if datos_previos else "", dialogo)
         entry_dni = QLineEdit(datos_previos["dni"] if datos_previos else "", dialogo)
         entry_telefono = QLineEdit(datos_previos["telefono"] if datos_previos else "", dialogo)
+        entry_contacto = QLineEdit(datos_previos["contacto_emergencia"] if datos_previos else "", dialogo)
+        entry_contacto.setPlaceholderText("Nombre, vínculo y teléfono")
+        entry_contacto.setMaxLength(200)
         entry_jerarquia = QLineEdit(datos_previos["jerarquia"] if datos_previos else "Bombero", dialogo)
         entry_grupo_sanguineo = QLineEdit(datos_previos["grupo_sanguineo"] if datos_previos else "", dialogo)
         entry_grupo_sanguineo.setPlaceholderText("Ej: 0+, A-, AB+…")
@@ -2818,6 +2913,7 @@ class MainWindow(QMainWindow):
         form.addRow("Apellido", entry_apellido)
         form.addRow("DNI", entry_dni)
         form.addRow("Teléfono", entry_telefono)
+        form.addRow("Contacto de emergencia", entry_contacto)
         form.addRow("Jerarquía", entry_jerarquia)
         form.addRow("Grupo Sanguíneo", entry_grupo_sanguineo)
         form.addRow("Antigüedad (ingreso)", campo_antiguedad)
@@ -2861,6 +2957,7 @@ class MainWindow(QMainWindow):
             persona.apellido = apellido
             persona.dni = dni
             persona.telefono = entry_telefono.text().strip() or None
+            persona.contacto_emergencia = entry_contacto.text().strip() or None
             persona.jerarquia = entry_jerarquia.text().strip() or None
             persona.grupo_sanguineo = entry_grupo_sanguineo.text().strip() or None
             persona.antiguedad_fecha = campo_antiguedad.value()
@@ -3184,6 +3281,12 @@ class MainWindow(QMainWindow):
             theme.set_tono(self._chip_operador, "ok" if self._permisos.configurar else "info")
 
         self._boton_sync_cloud.set_rol(rol)
+        # Permiso RUBA: botones de carga / sincronización en Planillas.
+        self._pagina_historial.set_permiso_ruba(self._permisos.cargar_ruba)
+        # Estadísticas: KPIs generales + la propia, o toda la base.
+        self._pagina_estadisticas.set_operador(self._operador_id, rol)
+        if hasattr(self, "_boton_sync_pendientes"):
+            self._refrescar_estado_ruba()
         # Inventario: alta / edición / baja solo con un operador ADMIN identificado.
         self._pagina_inventario.set_operador(self._operador_id, rol)
         # Mantenimiento: cualquier operador identificado firma revisiones; plantillas solo ADMIN.
@@ -3193,6 +3296,12 @@ class MainWindow(QMainWindow):
         for boton in self._botones_abm:
             boton.setEnabled(puede_abm)
             boton.setToolTip("" if puede_abm else "Solo Administrador")
+        if not puede_abm and self._instalacion_inicial():
+            for boton in self._botones_importar:
+                boton.setEnabled(True)
+                boton.setToolTip("Instalación inicial (todavía no hay ningún Administrador): importá el padrón y "
+                                 "las unidades de RUBA. Después asigná el rol Administrador en Configuración → "
+                                 "Usuarios y Roles.")
         for tabla, columna in ((self._tabla_personal_dotacion, COL_PERSONAL_ACCIONES),
                                (self._panel_unidades.tabla, COL_UNIDAD_ACCIONES)):
             for fila in range(tabla.rowCount()):
@@ -3579,7 +3688,7 @@ class MainWindow(QMainWindow):
             self._set_chip_ruba(f"Al día{sufijo}", "ok", tooltip)
 
         # El botón ofrece solo lo que todavía no está en manos de la cola.
-        mostrar_boton = bool(sin_encolar) and bool(self._hay_internet)
+        mostrar_boton = bool(sin_encolar) and bool(self._hay_internet) and self._permisos.cargar_ruba
         if mostrar_boton:
             self._boton_sync_pendientes.setText(f"⇪ Sincronizar {sin_encolar} pendiente(s) con RUBA")
         self._boton_sync_pendientes.setVisible(mostrar_boton)

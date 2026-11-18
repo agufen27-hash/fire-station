@@ -15,9 +15,10 @@ esta forma:
       }
     }
 
-Sin el archivo: el personal de fábrica es genérico (de ejemplo, para que una
-instalación nueva arranque) y NO hay denunciante por defecto -- a RUBA
-(registro oficial) nunca se le mandan datos inventados.
+Sin el archivo (instalación limpia): la base arranca SIN personal -- nada
+de fichas de ejemplo -- y el padrón se importa del 'Reporte de bomberos' de
+RUBA. Tampoco hay denunciante por defecto: a RUBA (registro oficial) nunca
+se le mandan datos inventados.
 """
 
 from __future__ import annotations
@@ -34,11 +35,6 @@ log = logging.getLogger(__name__)
 NOMBRE_ARCHIVO = "seed_bomberos.json"
 CAMPOS_PERSONA = ("nombre", "apellido", "dni", "telefono")
 
-PERSONAL_GENERICO: List[Dict[str, str]] = [
-    {"nombre": "Bombero", "apellido": "Ejemplo Uno", "dni": "00000001", "telefono": ""},
-    {"nombre": "Bombero", "apellido": "Ejemplo Dos", "dni": "00000002", "telefono": ""},
-    {"nombre": "Bombero", "apellido": "Ejemplo Tres", "dni": "00000003", "telefono": ""},
-]
 
 
 def ruta_semilla() -> Path:
@@ -64,9 +60,9 @@ def _persona(valor: Any) -> Optional[Dict[str, str]]:
 
 
 def personal_inicial() -> List[Dict[str, str]]:
-    """Personal de fábrica para una base nueva: el de la semilla o el genérico."""
-    personas = [p for p in map(_persona, _leer().get("personal") or []) if p]
-    return personas or [dict(p) for p in PERSONAL_GENERICO]
+    """Personal para una base nueva: solo el de la semilla local del cuartel
+    (data/seed_bomberos.json). Sin semilla, lista vacía: instalación limpia."""
+    return [p for p in map(_persona, _leer().get("personal") or []) if p]
 
 
 def denunciante_por_defecto() -> Optional[Dict[str, str]]:

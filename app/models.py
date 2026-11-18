@@ -150,6 +150,10 @@ class Personal(Base):
     apellido: Mapped[str] = mapped_column(String(80), nullable=False)
     dni: Mapped[str] = mapped_column(String(15), unique=True, nullable=False)
     telefono: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+    # Contacto de emergencia (nombre / vínculo / teléfono, texto libre). La
+    # importación de RUBA lo completa con la columna "Familiares" si no hay
+    # una columna de contacto de emergencia (ver ruba_importer.CAMPOS_PADRON).
+    contacto_emergencia: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
     jerarquia: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
     activo: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
@@ -188,7 +192,7 @@ class Personal(Base):
     situacion_revista: Mapped[Optional[str]] = mapped_column(String(60), nullable=True)
     fecha_ultimo_ascenso: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
 
-    # RBAC local (app/core/roles.py): BOMBERO / JEFATURA / ADMIN. Lo asigna
+    # RBAC local (app/core/roles.py): BOMBERO / JEFATURA / ADMIN / ESTADISTICA. Lo asigna
     # Configuración → "Usuarios y Roles"; el importador del padrón no lo toca.
     rol: Mapped[str] = mapped_column(String(12), default=ROL_DEFAULT, server_default=ROL_DEFAULT, nullable=False)
 

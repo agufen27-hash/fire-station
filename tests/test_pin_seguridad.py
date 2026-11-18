@@ -233,7 +233,7 @@ def test_migracion_agrega_rol_a_base_existente(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_matriz_de_permisos():
-    b, j, a = (roles.permisos_de(r) for r in roles.ROLES)
+    b, j, a = (roles.permisos_de(r) for r in (roles.ROL_BOMBERO, roles.ROL_JEFATURA, roles.ROL_ADMIN))
     assert not (b.editar_padron or b.ver_legajos_ajenos or b.configurar or b.resetear_pin_ajeno)
     assert j.ver_legajos_ajenos and not (j.editar_padron or j.configurar or j.resetear_pin_ajeno)
     assert a.editar_padron and a.ver_legajos_ajenos and a.configurar and a.resetear_pin_ajeno
@@ -350,7 +350,8 @@ def ventana(qapp, personas, monkeypatch):
 def test_sin_operador_rige_bombero(ventana):
     v, avisos, _mw = ventana
     assert v._permisos == roles.permisos_de(roles.ROL_BOMBERO)
-    assert all(not b.isEnabled() for b in v._botones_abm)
+    # Sin ningún ADMIN en la base (instalación inicial) solo las importaciones quedan libres.
+    assert all(b.isEnabled() == (b in v._botones_importar) for b in v._botones_abm)
     assert all(not w.isEnabled() for w in v._widgets_config_criticos)
     assert not v._label_config_bloqueada.isHidden()
     assert v._panel_roles.isEnabled()  # roles: autorizado por RUBA / clave maestra, no por rol
@@ -389,7 +390,8 @@ def test_jefatura_abre_legajo_ajeno_en_solo_lectura(ventana, personas):
     v._intentar_ingresar_legajo()
     assert v._stack_documentacion.currentIndex() == 1
     assert v._legajo_privado.solo_lectura and v._legajo_privado.boton_reset_pin.isHidden()
-    assert all(not b.isEnabled() for b in v._botones_abm)
+    # Sin ADMIN en la base (instalación inicial): solo las importaciones quedan libres.
+    assert all(b.isEnabled() == (b in v._botones_importar) for b in v._botones_abm)
 
     v._cerrar_sesion_operador()  # el legajo ajeno no queda a la vista
     assert v._stack_documentacion.currentIndex() == 0
@@ -406,3 +408,19 @@ def test_bombero_con_su_pin_ve_su_legajo_editable_sin_editar_padron(ventana, per
     assert not v._legajo_privado.solo_lectura
     assert not v._legajo_privado.boton_reset_pin.isHidden()
     assert v._legajo_privado.boton_editar.isHidden()
+
+
+def test_instalacion_inicial_libera_importar_hasta_que_haya_admin(ventana, personas):
+    v, avisos, mw = ventana
+    ana, _beto, _ceci = personas
+    llamadas = []
+    mw.importar_bomberos_desde_excel = lambda parent: llamadas.append("padron") or False
+    assert v._instalacion_inicial() and all(b.isEnabled() for b in v._botones_importar)
+    v._importar_padron_bomberos()
+    assert llamadas == ["padron"] and not avisos  # sin operador y sin "Permiso insuficiente"
+
+    asignar_roles({ana: "ADMIN"})
+    v._aplicar_permisos()
+    assert not v._instalacion_inicial() and not any(b.isEnabled() for b in v._botones_importar)
+    v._importar_padron_bomberos()
+    assert llamadas == ["padron"] and avisos  # ya hay Administrador: se exige el rol

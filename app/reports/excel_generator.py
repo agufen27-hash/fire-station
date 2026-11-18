@@ -438,7 +438,9 @@ def _completar_pcs(incidente: Incidente) -> ResultadoPlanilla:
 
     # Fila 51: apresto (quedaron en cuartel) + en servicio (salieron en las
     # dotaciones) = total general; y quién confeccionó la planilla con su PIN.
-    en_apresto = len(reserva)
+    # Los operadores de radio / comunicaciones (Operador 1 y 2) también quedan
+    # en el cuartel: suman al apresto junto con la reserva.
+    en_apresto = personal_en_apresto(incidente)
     en_servicio = total_efectivos(_agrupar_dotaciones(incidente))
     e.escribir(m["total_apresto"], en_apresto, "Total en cuartel (apresto)", negrita=True)
     e.escribir(m["total_servicio"], en_servicio, "Total en servicio", negrita=True)
@@ -450,6 +452,12 @@ def _completar_pcs(incidente: Incidente) -> ResultadoPlanilla:
     _una_hoja_por_pagina(wb)
     wb.save(ruta)
     return ResultadoPlanilla(ruta, _sin_repetir(e.advertencias))
+
+
+def personal_en_apresto(incidente: Incidente) -> int:
+    """Personas distintas en base (fila 51 "Total en cuartel"): Operador 1,
+    Operador 2 (radio / comunicaciones) y la reserva en apresto."""
+    return len({b.personal_id for b in incidente.personal_base if b.personal_id is not None})
 
 
 # ---------------------------------------------------------------------------

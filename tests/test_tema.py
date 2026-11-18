@@ -107,6 +107,9 @@ def test_reintento_desde_historial_usa_la_cola(qapp, base_temporal, monkeypatch)
     from app.ui import main_window as mw
 
     ventana = mw.MainWindow()
+    # La carga a RUBA requiere el permiso RUBA (Jefatura / Admin / Estadística).
+    ventana._permisos = mw.permisos_de("ESTADISTICA")
+    ventana._pagina_historial.set_permiso_ruba(True)
     encolados = []
     # Sin hilo real ni Chromium: solo el cableado Historial -> MainWindow -> cola.
     monkeypatch.setattr(mw, "validar_incidente_para_ruba", lambda i: SemaforoRuba())

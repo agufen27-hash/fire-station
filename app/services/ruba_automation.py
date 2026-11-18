@@ -34,12 +34,12 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 from playwright.sync_api import BrowserContext, Error as PlaywrightError, Page, sync_playwright
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
-from app.core.catalogos import leer_mapping
+from app.core.catalogos import cargar_tipos_incidente, leer_mapping
 from app.services.ruba_payload import GENERO_DEFAULT, TIPO_VEHICULO_DEFAULT, genero_ruba
 from app.paths import configurar_entorno_playwright, get_writable_dir, is_frozen
 from app.services.ruba_helpers import (
@@ -334,6 +334,20 @@ _JS_LIBERAR_OPCIONALES = r"""([nombres, inactivos]) => {
 }"""
 
 _JS_OPCIONES = "(el) => Array.from(el.options || []).map(o => ({value: o.value, text: o.textContent.trim()}))"
+# Opción elegida de un <select>: {value, text} (o null si no existe el combo).
+_JS_SELECCION = """(s) => { const el = document.querySelector(s);
+    if (!el) return null;
+    const o = el.options[el.selectedIndex];
+    return {value: el.value, text: o ? o.textContent.trim() : ''}; }"""
+# Pantalla de edición: Tipo y Categoría ya no son combos, se muestran como texto.
+_JS_TIPO_CATEGORIA_EDICION = """() => {
+    const leer = (id) => { const el = document.querySelector('#' + id + ' .value');
+        return el ? el.textContent.trim() : null; };
+    return {tipo: leer('group_view_tipo'), categoria: leer('group_view_categoria')}; }"""
+# Tipo / Categoría: reintentos de la selección (la Categoría se repuebla por
+# AJAX al cambiar el Tipo y una respuesta tardía la devolvía a la 1ª opción).
+INTENTOS_TIPO_CATEGORIA = 3
+ESPERA_REPOBLADO_CATEGORIA_MS = 600
 # Un <select> oculto por select2/chosen sigue aplicando si su contenedor se ve.
 _JS_CONTENEDOR_VISIBLE = """(el) => {
     const caja = el.closest('.control-group, .form-group, .controls');
@@ -690,16 +704,12 @@ class RubaServiceAutomation:
         page.locator(sel["numero_parte"]).first.wait_for(state="visible")
 
         self._llenar(sel["numero_parte"], datos["numero_parte"])
-        self._seleccionar(sel["tipo_incidente"], datos["tipo_incidente"])
-        # Categoría se repuebla por AJAX al cambiar el Tipo.
-        page.wait_for_function(
-            "([s, v]) => { const el = document.querySelector(s); "
-            "return !!el && Array.from(el.options).some(o => o.value === v); }",
-            arg=[sel["categoria_incidente"], datos["categoria_incidente"]],
-        )
-        self._seleccionar(sel["categoria_incidente"], datos["categoria_incidente"])
+        self._seleccionar_tipo_y_categoria(sel, datos)
         self._tildar(sel["hay_participaciones"], bool(datos.get("hay_participaciones")))
         limpiar_required_ocultos(page)
+        # Último control antes de crear el servicio: después de guardar, RUBA ya
+        # no deja cambiar Tipo / Categoría (la edición los muestra como texto).
+        self._verificar_tipo_y_categoria(sel, datos, lanzar=True)
 
         url_antes = page.url
         page.locator(sel["btn_guardar"]).first.click()
@@ -707,6 +717,109 @@ class RubaServiceAutomation:
         self.ruba_id_remoto = _extraer_id(page.url)
         if self.ruba_id_remoto and self.on_id_remoto:
             self.on_id_remoto(self.ruba_id_remoto)
+
+    # -- Tipo y Categoría ---------------------------------------------------------
+
+    def _nombres_tipo_categoria(self, tipo: Any, categoria: Any) -> Tuple[str, str]:
+        """Nombres del catálogo (ruba_mapping.json) para los códigos del parte."""
+        try:
+            tipos = {t.id_ruba: t for t in cargar_tipos_incidente(self.mapping)}
+        except (KeyError, TypeError, ValueError):
+            tipos = {}
+        try:
+            entrada = tipos.get(int(tipo))
+            nombre_tipo = entrada.nombre if entrada else ""
+            nombre_cat = entrada.subtipos.get(int(categoria), "") if entrada else ""
+        except (TypeError, ValueError):
+            nombre_tipo = nombre_cat = ""
+        return nombre_tipo, nombre_cat
+
+    def _desfasaje_tipo_categoria(self, sel: Dict[str, Any], datos: Dict[str, Any]) -> Optional[str]:
+        """None si los combos muestran exactamente el Tipo y la Categoría del
+        parte (valor Y texto); si no, la descripción del desfasaje."""
+        esperado_tipo, esperado_cat = str(datos["tipo_incidente"]), str(datos["categoria_incidente"])
+        nombre_tipo, nombre_cat = self._nombres_tipo_categoria(esperado_tipo, esperado_cat)
+        tipo = self.page.evaluate(_JS_SELECCION, sel["tipo_incidente"]) or {}
+        cat = self.page.evaluate(_JS_SELECCION, sel["categoria_incidente"]) or {}
+        problemas = []
+        if tipo.get("value") != esperado_tipo or (nombre_tipo and _normalizar(tipo.get("text", "")) != _normalizar(nombre_tipo)):
+            problemas.append(f"Tipo '{tipo.get('text') or tipo.get('value') or '(vacío)'}' "
+                             f"en vez de '{nombre_tipo or esperado_tipo}'")
+        if cat.get("value") != esperado_cat or (nombre_cat and _normalizar(cat.get("text", "")) != _normalizar(nombre_cat)):
+            problemas.append(f"Categoría '{cat.get('text') or cat.get('value') or '(vacía)'}' "
+                             f"en vez de '{nombre_cat or esperado_cat}'")
+        return "; ".join(problemas) or None
+
+    def _seleccionar_tipo_y_categoria(self, sel: Dict[str, Any], datos: Dict[str, Any]) -> None:
+        """Elige Tipo y Categoría y comprueba que queden puestos. La Categoría
+        se repuebla por AJAX al cambiar el Tipo: si esa respuesta llega
+        DESPUÉS de elegirla, el combo vuelve a su primera opción (Incendios
+        -> 'Aeronaves'). Por eso se espera a que la red quede quieta, se
+        vuelve a leer lo elegido y, si no coincide, se reintenta."""
+        page = self.page
+        for intento in range(1, INTENTOS_TIPO_CATEGORIA + 1):
+            self._seleccionar(sel["tipo_incidente"], datos["tipo_incidente"])
+            self._esperar_red()
+            page.wait_for_function(
+                "([s, v]) => { const el = document.querySelector(s); "
+                "return !!el && Array.from(el.options).some(o => o.value === v); }",
+                arg=[sel["categoria_incidente"], datos["categoria_incidente"]],
+            )
+            page.wait_for_timeout(ESPERA_REPOBLADO_CATEGORIA_MS)
+            self._esperar_red()
+            self._seleccionar(sel["categoria_incidente"], datos["categoria_incidente"])
+            page.wait_for_timeout(ESPERA_REPOBLADO_CATEGORIA_MS)
+            self._esperar_red()
+            desfasaje = self._desfasaje_tipo_categoria(sel, datos)
+            if desfasaje is None:
+                if intento > 1:
+                    log.info("Paso 1: Tipo / Categoría fijados al intento %s.", intento)
+                return
+            log.warning("Paso 1: la selección no quedó (intento %s/%s): %s.", intento, INTENTOS_TIPO_CATEGORIA,
+                        desfasaje)
+        # El control final (_verificar_tipo_y_categoria) corta antes de guardar.
+
+    def _verificar_tipo_y_categoria(self, sel: Dict[str, Any], datos: Dict[str, Any], lanzar: bool) -> bool:
+        desfasaje = self._desfasaje_tipo_categoria(sel, datos)
+        if desfasaje is None:
+            return True
+        mensaje = (f"El formulario de RUBA quedó con {desfasaje}. No se guardó nada en RUBA para no crear "
+                   "el servicio con una categoría equivocada; reintentá la carga.")
+        log.error("Paso 1: %s", mensaje)
+        if lanzar:
+            raise RubaAutomationError(PasoRuba.INICIALIZACION, mensaje)
+        return False
+
+    def _verificar_tipo_categoria_existente(self) -> None:
+        """Pantalla de edición de un servicio YA creado: Tipo y Categoría se
+        muestran como texto y RUBA no permite cambiarlos. Si no coinciden con
+        el parte (p. ej. se creó como 'Aeronaves' siendo 'Forestal'), RUBA
+        pide datos de otra categoría y rechaza el guardado sin marcar ningún
+        campo: se corta con un mensaje que explica cómo resolverlo."""
+        datos = self.payload.get("inicializacion") or {}
+        if not datos.get("tipo_incidente") or not datos.get("categoria_incidente"):
+            return
+        try:
+            visto = self.page.evaluate(_JS_TIPO_CATEGORIA_EDICION) or {}
+        except PlaywrightError:
+            return
+        if not visto.get("tipo") and not visto.get("categoria"):
+            return  # esta versión del portal no los muestra: no hay con qué comparar
+        nombre_tipo, nombre_cat = self._nombres_tipo_categoria(datos["tipo_incidente"], datos["categoria_incidente"])
+        if not nombre_tipo or not nombre_cat:
+            return
+        if (_normalizar(visto.get("tipo") or "") == _normalizar(nombre_tipo)
+                and _normalizar(visto.get("categoria") or "") == _normalizar(nombre_cat)):
+            return
+        id_remoto = self.ruba_id_remoto or "?"
+        raise RubaAutomationError(
+            PasoRuba.GENERAL,
+            f"El servicio {id_remoto} en RUBA quedó como '{visto.get('tipo')} / {visto.get('categoria')}', pero el "
+            f"parte es '{nombre_tipo} / {nombre_cat}'. RUBA no permite cambiar Tipo ni Categoría al editar, por eso "
+            "rechaza el guardado. Eliminá el servicio "
+            f"{id_remoto} en RUBA (Servicios) y volvé a cargar el parte: Fire Station creará uno nuevo con la "
+            "categoría correcta.",
+        )
 
     def _abrir_edicion_existente(self, ruba_id: str) -> Optional[str]:
         """Abre /editar/{id} y verifica que muestre el formulario de Datos
@@ -768,6 +881,7 @@ class RubaServiceAutomation:
         datos = self.payload["editar_general"]
         sel = self.sel["editar_general"]
         self._esperar_formulario_general(sel["calle"])
+        self._verificar_tipo_categoria_existente()
         self._campos_inactivos.clear()  # reintento: se recalcula con el formulario nuevo
 
         if datos.get("localidad_autocomplete"):

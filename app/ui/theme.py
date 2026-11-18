@@ -147,6 +147,17 @@ def _rgba(hex_color: str, alfa: float) -> str:
     return f"rgba({c.red()}, {c.green()}, {c.blue()}, {alfa})"
 
 
+def _tono(hex_color: str, factor: float) -> str:
+    """El mismo color más claro (factor > 1) o más oscuro (< 1), para el
+    relieve de los botones (degradé y canto inferior)."""
+    c = QColor(hex_color)
+    if factor >= 1:
+        c = c.lighter(int(factor * 100))
+    else:
+        c = c.darker(int(100 / factor))
+    return c.name()
+
+
 # ---------------------------------------------------------------------------
 # Íconos SVG en el color del tema (QSS solo acepta imágenes para flechas y tildes)
 # ---------------------------------------------------------------------------
@@ -502,7 +513,6 @@ QTableView QTimeEdit, QTableView QDateEdit {{
     border-radius: 5px; padding: 3px 8px; min-height: 18px;
 }}
 QTableView QComboBox, QTableView QTimeEdit, QTableView QDateEdit {{ padding-right: 24px; }}
-QTableView QPushButton {{ padding: 4px 10px; font-size: 12px; min-height: 0; border-radius: 5px; }}
 
 /* ===== Barras de desplazamiento ======================================== */
 QScrollBar:vertical {{ background: transparent; width: 10px; margin: 2px; }}
@@ -513,97 +523,127 @@ QScrollBar::handle:hover {{ background: {p.borde_fuerte}; }}
 QScrollBar::add-line, QScrollBar::sub-line {{ width: 0; height: 0; border: none; background: none; }}
 QScrollBar::add-page, QScrollBar::sub-page {{ background: none; }}
 
-/* ===== Botones ========================================================== */
+/* ===== Botones ==========================================================
+   Sistema único: mismo alto (36 px), radio (7 px), tipografía y relieve 3D
+   leve en todas las variantes -- degradé vertical sutil (arriba un tono más
+   claro), borde inferior 1 px más oscuro que hace de "canto" y, al
+   presionar, el degradé se invierte y el texto baja 1 px. Las variantes solo
+   cambian el color: neutro (por defecto), acento azul suave (botonAhora),
+   primario azul / rojo, confirmación verde, borrador ámbar y secundario
+   transparente (botonLimpiar). */
 QPushButton {{
-    background-color: {p.panel};
+    background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {_tono(p.panel, 1.10)}, stop:1 {p.panel});
     border: 1px solid {p.borde};
-    border-radius: 6px;
-    padding: 7px 14px;
+    border-bottom: 1px solid {_tono(p.borde, 0.72)};
+    border-radius: 7px;
+    padding: 7px 16px;
+    min-height: 20px;
     color: {p.texto};
-    font-weight: 500;
+    font-size: 13px;
+    font-weight: 600;
 }}
-QPushButton:hover {{ border-color: {p.borde_fuerte}; background-color: {p.campo_hover}; }}
-QPushButton:pressed {{ background-color: {p.fondo_hundido}; }}
-QPushButton:disabled {{ color: {p.texto_tenue}; border-color: {p.borde_suave}; background-color: {p.superficie}; }}
+QPushButton:hover {{
+    background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {_tono(p.campo_hover, 1.16)}, stop:1 {p.campo_hover});
+    border-color: {p.borde_fuerte};
+}}
+QPushButton:pressed {{
+    background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {p.fondo_hundido}, stop:1 {p.panel});
+    border-bottom-color: {p.borde};
+    padding-top: 8px; padding-bottom: 6px;
+}}
+QPushButton:disabled {{
+    color: {p.texto_tenue}; border-color: {p.borde_suave}; background-color: {p.superficie};
+}}
 QPushButton:focus {{ outline: none; }}
 
-/* Secundario de acento (Hoy / Ahora / + Agregar / Generar filas) */
+/* Acento azul suave (Hoy / Ahora / + Agregar / Identificarme) */
 QPushButton#botonAhora {{
-    background-color: {_rgba(p.azul, 0.14)};
+    background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {_rgba(p.azul, 0.20)}, stop:1 {_rgba(p.azul, 0.11)});
     border: 1px solid {_rgba(p.azul, 0.45)};
+    border-bottom: 1px solid {_rgba(p.azul, 0.75)};
     color: {p.azul_texto};
-    font-weight: 600;
-    padding: 6px 12px;
+    padding: 7px 12px;
 }}
-QPushButton#botonAhora:hover {{ background-color: {_rgba(p.azul, 0.24)}; border-color: {p.azul_hover}; }}
-QPushButton#botonAhora:pressed {{ background-color: {_rgba(p.azul, 0.34)}; }}
+QPushButton#botonAhora:hover {{
+    background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {_rgba(p.azul, 0.30)}, stop:1 {_rgba(p.azul, 0.20)});
+    border-color: {p.azul_hover};
+}}
+QPushButton#botonAhora:pressed {{ background-color: {_rgba(p.azul, 0.34)}; padding-top: 8px; padding-bottom: 6px; }}
 
 /* Confirmación (diálogos, Guardar Configuración): verde operativo */
 QPushButton#botonGuardar {{
-    background-color: {p.verde};
+    background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {p.verde_hover}, stop:1 {p.verde});
     border: 1px solid {p.verde};
+    border-bottom: 1px solid {_tono(p.verde, 0.70)};
     color: {p.texto_sobre_acento};
-    font-weight: 700;
-    padding: 9px 18px;
 }}
-QPushButton#botonGuardar:hover {{ background-color: {p.verde_hover}; border-color: {p.verde_hover}; }}
-QPushButton#botonGuardar:pressed {{ background-color: {p.verde}; padding-top: 10px; padding-bottom: 8px; }}
+QPushButton#botonGuardar:hover {{
+    background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {_tono(p.verde_hover, 1.12)}, stop:1 {p.verde_hover});
+}}
+QPushButton#botonGuardar:pressed {{ background-color: {_tono(p.verde, 0.88)}; padding-top: 8px; padding-bottom: 6px; }}
 
-/* Barra de herramientas del mapa: compacta */
-QPushButton#botonHerramienta {{ padding: 5px 10px; font-size: 12px; }}
+/* Primario azul (Guardar e Imprimir, Nueva Planilla) */
+QPushButton#botonPrimarioAzul {{
+    background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {p.azul_hover}, stop:1 {p.azul});
+    border: 1px solid {p.azul};
+    border-bottom: 1px solid {_tono(p.azul_pressed, 0.75)};
+    color: {p.texto_sobre_acento};
+}}
+QPushButton#botonPrimarioAzul:hover {{
+    background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {_tono(p.azul_hover, 1.12)}, stop:1 {p.azul_hover});
+}}
+QPushButton#botonPrimarioAzul:pressed {{
+    background-color: {p.azul_pressed}; border-color: {p.azul_pressed}; padding-top: 8px; padding-bottom: 6px;
+}}
 
-/* Quitar fila (✖): discreto, rojo al pasar */
+/* Primario rojo (Cargar a RUBA) */
+QPushButton#botonPrimarioRojo {{
+    background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {p.rojo_hover}, stop:1 {p.rojo});
+    border: 1px solid {p.rojo};
+    border-bottom: 1px solid {_tono(p.rojo_pressed, 0.75)};
+    color: {p.texto_sobre_acento};
+}}
+QPushButton#botonPrimarioRojo:hover {{
+    background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {_tono(p.rojo_hover, 1.10)}, stop:1 {p.rojo_hover});
+}}
+QPushButton#botonPrimarioRojo:pressed {{
+    background-color: {p.rojo_pressed}; padding-top: 8px; padding-bottom: 6px;
+}}
+
+/* Borrador / salida en curso: ámbar suave */
+QPushButton#botonBorradorCurso {{
+    background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {_rgba(p.ambar, 0.22)}, stop:1 {_rgba(p.ambar, 0.12)});
+    border: 1px solid {_rgba(p.ambar, 0.6)};
+    border-bottom: 1px solid {_rgba(p.ambar, 0.9)};
+    color: {p.ambar};
+}}
+QPushButton#botonBorradorCurso:hover {{ background-color: {_rgba(p.ambar, 0.26)}; border-color: {p.ambar}; }}
+QPushButton#botonBorradorCurso:pressed {{ background-color: {_rgba(p.ambar, 0.34)}; padding-top: 8px; padding-bottom: 6px; }}
+
+/* Secundario (Limpiar / Cancelar): mismo relieve, sin relleno de color */
+QPushButton#botonLimpiar {{
+    color: {p.texto_secundario};
+}}
+QPushButton#botonLimpiar:hover {{ color: {p.texto}; }}
+
+/* Barra de herramientas del mapa: mismo sistema, texto apenas menor */
+QPushButton#botonHerramienta {{ font-size: 12px; padding: 7px 12px; }}
+
+/* Quitar fila (✖): discreto, sin relieve; rojo al pasar */
 QPushButton#botonQuitarFila {{
     background: transparent; border: 1px solid transparent; color: {p.texto_tenue};
-    padding: 2px; font-size: 12px;
+    padding: 2px; font-size: 12px; min-height: 0;
 }}
 QPushButton#botonQuitarFila:hover {{
     color: {p.rojo_hover}; background-color: {_rgba(p.rojo, 0.12)}; border-color: {_rgba(p.rojo, 0.4)};
 }}
 
-/* Barra de acciones del formulario */
-QPushButton#botonLimpiar, QPushButton#botonBorradorCurso, QPushButton#botonPrimarioAzul,
-QPushButton#botonPrimarioRojo {{
-    min-height: 46px;
-    font-size: 14px;
-    font-weight: 700;
-    border-radius: 8px;
-    padding: 10px 18px;
+/* Dentro de tablas: el mismo estilo, en versión compacta para entrar en la fila */
+QTableView QPushButton, QTableView QPushButton#botonAhora, QTableView QPushButton#botonPrimarioAzul,
+QTableView QPushButton#botonPrimarioRojo, QTableView QPushButton#botonGuardar {{
+    padding: 4px 10px; font-size: 12px; min-height: 0; border-radius: 6px;
 }}
-QPushButton#botonLimpiar {{
-    background-color: transparent;
-    border: 1px solid {p.borde};
-    color: {p.texto_secundario};
-}}
-QPushButton#botonLimpiar:hover {{ background-color: {p.panel}; color: {p.texto}; border-color: {p.borde_fuerte}; }}
-QPushButton#botonLimpiar:pressed {{ background-color: {p.fondo_hundido}; }}
-QPushButton#botonBorradorCurso {{
-    background-color: {_rgba(p.ambar, 0.14)};
-    border: 1px solid {_rgba(p.ambar, 0.6)};
-    color: {p.ambar};
-}}
-QPushButton#botonBorradorCurso:hover {{ background-color: {_rgba(p.ambar, 0.24)}; border-color: {p.ambar}; }}
-QPushButton#botonBorradorCurso:pressed {{ background-color: {_rgba(p.ambar, 0.34)}; padding-top: 11px; padding-bottom: 9px; }}
-QPushButton#botonPrimarioAzul {{
-    background-color: {p.azul};
-    border: 1px solid {p.azul};
-    color: {p.texto_sobre_acento};
-}}
-QPushButton#botonPrimarioAzul:hover {{ background-color: {p.azul_hover}; border-color: {p.azul_hover}; }}
-QPushButton#botonPrimarioAzul:pressed {{
-    background-color: {p.azul_pressed}; border-color: {p.azul_pressed}; padding-top: 11px; padding-bottom: 9px;
-}}
-QPushButton#botonPrimarioRojo {{
-    background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {p.rojo_hover}, stop:1 {p.rojo});
-    border: 1px solid {p.rojo_pressed};
-    color: {p.texto_sobre_acento};
-}}
-QPushButton#botonPrimarioRojo:hover {{
-    background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #F26A67, stop:1 {p.rojo_hover});
-}}
-QPushButton#botonPrimarioRojo:pressed {{
-    background-color: {p.rojo_pressed}; padding-top: 11px; padding-bottom: 9px;
-}}
+QTableView QPushButton:pressed, QTableView QPushButton#botonAhora:pressed {{ padding-top: 5px; padding-bottom: 3px; }}
 
 /* ===== Damnificados: tarjetas con conmutador No / Sí ==================== */
 QFrame#tarjetaConmutable {{

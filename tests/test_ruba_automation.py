@@ -169,6 +169,38 @@ def test_categoria_inexistente_falla_en_inicializacion(payload, fake, tmp_path):
     assert error.value.paso == ra.PasoRuba.INICIALIZACION
 
 
+def test_categoria_pisada_por_ajax_tardio_se_reintenta(payload, fake, tmp_path):
+    """La Categoría se repuebla tarde y queda en la primera opción: el script
+    lo detecta, vuelve a elegir y crea el servicio con la categoría correcta."""
+    fake.categoria_pisada = 1
+    _automatizacion(payload, fake, tmp_path).ejecutar()
+    envio = fake.envios["/estructura/incidente/agregar"]
+    assert (envio["tipo"], envio["categoria"]) == (["3"], ["19"])
+    assert (fake.vista_tipo, fake.vista_categoria) == ("Incendios", "Forestal")
+
+
+def test_categoria_que_no_queda_no_crea_el_servicio(payload, fake, tmp_path, monkeypatch):
+    """Si tras los reintentos la Categoría sigue mal, se corta ANTES de guardar."""
+    fake.categoria_pisada = 99
+    with pytest.raises(ra.RubaAutomationError) as error:
+        _automatizacion(payload, fake, tmp_path).ejecutar()
+    assert error.value.paso == ra.PasoRuba.INICIALIZACION
+    assert "Forestal" in error.value.detalle and "No se guardó nada" in error.value.detalle
+    assert fake.inicializaciones == 0
+
+
+def test_servicio_existente_con_otra_categoria_da_error_claro(payload, fake, tmp_path):
+    """El servicio ya creado en RUBA quedó como Aeronaves: en edición no se
+    puede cambiar, así que se explica qué hacer en vez del rechazo mudo."""
+    fake.vista_categoria = "Aeronaves"
+    with pytest.raises(ra.RubaAutomationError) as error:
+        _automatizacion(payload, fake, tmp_path, ruba_id_existente="555").ejecutar()
+    assert error.value.paso == ra.PasoRuba.GENERAL
+    assert "Incendios / Aeronaves" in error.value.detalle and "Incendios / Forestal" in error.value.detalle
+    assert "Eliminá el servicio 555" in error.value.detalle
+    assert "/estructura/incidente/editar/555" not in fake.envios  # no se intentó guardar
+
+
 def test_login_rechazado(payload, fake, tmp_path):
     automatizacion = _automatizacion(payload, fake, tmp_path)
     automatizacion.credenciales = {"url_login": fake.url_login, "url_incidentes": fake.url_incidentes}

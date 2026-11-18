@@ -91,6 +91,16 @@ def rol_de(personal_id: Optional[int]) -> str:
         return normalizar_rol(persona.rol if persona is not None else None)
 
 
+def hay_administrador() -> bool:
+    """True si algún bombero ACTIVO tiene rol ADMIN. Mientras no haya ninguno
+    (instalación limpia) la app permite importar el padrón y las unidades sin
+    operador: si no, nadie podría cargar al primer Administrador."""
+    from app.core.roles import ROL_ADMIN
+
+    with get_session() as session:
+        return session.query(Personal).filter(Personal.rol == ROL_ADMIN, Personal.activo.is_(True)).first() is not None
+
+
 def personal_con_roles() -> List[Tuple[int, str, str, str]]:
     """(id, nombre completo, legajo, rol) del personal activo, por apellido."""
     with get_session() as session:

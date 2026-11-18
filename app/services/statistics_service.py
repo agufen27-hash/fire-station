@@ -28,6 +28,14 @@ Vehículos: salidas, horas operativas (suma de la duración de sus salidas) y
 kilómetros. La base todavía NO registra odómetro de salida / regreso: los
 km quedan en None ("sin dato") hasta que se carguen.
 
+Filtros opcionales (página Estadísticas): tipo de salida, vehículo (partes
+en los que salió ese móvil) y bombero (partes en los que participó, embarcado
+o en base). Con filtros, TODAS las métricas se calculan sobre ese subconjunto.
+
+`estadistica_personal` es la ficha de un solo bombero (asistencia, horas en
+apresto, horas como interviniente y total) y su peso sobre el cuartel: es lo
+que ve un Bombero sin permiso de estadística completa.
+
 Todo sale de una sola consulta con carga anticipada (selectinload) de las
 relaciones: sin consultas por fila.
 """
@@ -96,8 +104,17 @@ class ReporteEstadisticas:
     horas_servicio: float = 0.0               # suma de la duración de cada parte
     salidas_moviles: int = 0
     por_tipo: List[Tuple[str, int]] = field(default_factory=list)
+    por_mes: List[Tuple[str, int]] = field(default_factory=list)      # ("MM/AAAA", servicios), en orden
+    horas_por_mes: List[Tuple[str, float]] = field(default_factory=list)
     bomberos: List[EstadisticaBombero] = field(default_factory=list)
     moviles: List[EstadisticaMovil] = field(default_factory=list)
+
+    @property
+    def promedio_horas_servicio(self) -> float:
+        return self.horas_servicio / self.servicios if self.servicios else 0.0
+
+    def ficha_de(self, personal_id: Optional[int]) -> Optional[EstadisticaBombero]:
+        return next((b for b in self.bomberos if b.personal_id == personal_id), None)
 
     @property
     def bomberos_participantes(self) -> int:
@@ -186,25 +203,65 @@ def _personas_embarcadas(su: SalidaUnidad) -> Iterable[Personal]:
             yield fila.personal
 
 
+def _salio_movil(inc: Incidente, movil_id: int) -> bool:
+    return (any(su.movil_id == movil_id for su in inc.salidas_unidad)
+            or any(d.movil_id == movil_id for d in inc.dotacion))
+
+
+def _participo(inc: Incidente, personal_id: int) -> bool:
+    if any(b.personal_id == personal_id for b in inc.personal_base):
+        return True
+    if any(d.personal_id == personal_id for d in inc.dotacion):
+        return True
+    return any(su.chofer_personal_id == personal_id or any(d.personal_id == personal_id for d in su.dotacion)
+               for su in inc.salidas_unidad)
+
+
+def _meses(fecha_desde: date, fecha_hasta: date) -> List[Tuple[int, int]]:
+    """(año, mes) de cada mes del rango, en orden: los meses sin servicios
+    aparecen con 0 en el gráfico."""
+    meses = []
+    anio, mes = fecha_desde.year, fecha_desde.month
+    while (anio, mes) <= (fecha_hasta.year, fecha_hasta.month):
+        meses.append((anio, mes))
+        anio, mes = (anio + 1, 1) if mes == 12 else (anio, mes + 1)
+    return meses
+
+
 def calcular_estadisticas(fecha_desde: date, fecha_hasta: date,
-                          incluir_moviles_inactivos: bool = True) -> ReporteEstadisticas:
+                          incluir_moviles_inactivos: bool = True,
+                          tipo_id: Optional[int] = None,
+                          movil_id: Optional[int] = None,
+                          personal_id: Optional[int] = None) -> ReporteEstadisticas:
     """Métricas de personal y vehículos de los partes del período. Todos los
     móviles del parque aparecen (también con 0 salidas, para ver la flota
     ociosa); sin `incluir_moviles_inactivos` se omiten los dados de baja que
-    no salieron en el período."""
+    no salieron en el período. `tipo_id`, `movil_id` y `personal_id` acotan
+    los partes considerados (ver el docstring del módulo)."""
     if fecha_hasta < fecha_desde:
         raise ValueError("La fecha 'hasta' es anterior a la fecha 'desde'.")
     reporte = ReporteEstadisticas(fecha_desde, fecha_hasta, datetime.now())
     fichas: Dict[int, EstadisticaBombero] = {}
     moviles: Dict[int, EstadisticaMovil] = {}
     por_tipo: Counter = Counter()
+    meses = _meses(fecha_desde, fecha_hasta)
+    por_mes: Counter = Counter()
+    horas_mes: Dict[Tuple[int, int], float] = {}
 
     with get_session() as session:
         for movil in session.query(Movil).order_by(Movil.nombre_identificador):
+            if movil_id is not None and movil.id != movil_id:
+                continue
             if movil.activo or incluir_moviles_inactivos:
                 moviles[movil.id] = EstadisticaMovil(movil.id, movil.nombre_identificador, movil.tipo or "—")
 
         for inc in _consultar_partes(session, fecha_desde, fecha_hasta):
+            if tipo_id is not None and inc.tipo_incidente_id != tipo_id:
+                continue
+            if movil_id is not None and not _salio_movil(inc, movil_id):
+                continue
+            if personal_id is not None and not _participo(inc, personal_id):
+                continue
             if inc.estado_operativo != EstadoOperativo.CERRADO.value:
                 reporte.servicios_en_curso += 1
                 continue
@@ -212,10 +269,16 @@ def calcular_estadisticas(fecha_desde: date, fecha_hasta: date,
             por_tipo[inc.tipo.nombre if inc.tipo else "Sin tipo"] += 1
             duracion_parte = horas_servicio(inc)
             reporte.horas_servicio += duracion_parte
+            if inc.fecha is not None:
+                clave_mes = (inc.fecha.year, inc.fecha.month)
+                por_mes[clave_mes] += 1
+                horas_mes[clave_mes] = horas_mes.get(clave_mes, 0.0) + duracion_parte
 
             embarcados_en_parte: Set[int] = set()
             for su in inc.salidas_unidad:
                 horas = horas_salida(su, inc)
+                if movil_id is not None and su.movil_id != movil_id:
+                    continue
                 reporte.salidas_moviles += 1
                 if su.movil is not None:
                     estadistica = moviles.get(su.movil_id) or moviles.setdefault(
@@ -257,6 +320,57 @@ def calcular_estadisticas(fecha_desde: date, fecha_hasta: date,
                 ficha._partes.add(inc.id)
 
     reporte.por_tipo = sorted(por_tipo.items(), key=lambda par: (-par[1], par[0]))
+    reporte.por_mes = [(f"{m:02d}/{a}", por_mes.get((a, m), 0)) for a, m in meses]
+    reporte.horas_por_mes = [(f"{m:02d}/{a}", horas_mes.get((a, m), 0.0)) for a, m in meses]
     reporte.bomberos = sorted(fichas.values(), key=lambda b: (-b.horas_totales, b.nombre))
     reporte.moviles = sorted(moviles.values(), key=lambda m: (-m.salidas, -m.horas, m.nombre))
     return reporte
+
+
+# ---------------------------------------------------------------------------
+# Estadística personal (lo que ve cada bombero de sí mismo)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class EstadisticaPersonal:
+    personal_id: int
+    nombre: str
+    servicios_cuartel_total: int        # partes cerrados del cuartel en el período
+    asistencias: int = 0                # partes distintos en los que participó
+    servicios_interviniente: int = 0    # salió embarcado (chofer / Jefe / embarcado)
+    servicios_apresto: int = 0          # quedó en base (operador de radio / reserva)
+    horas_apresto: float = 0.0
+    horas_interviniente: float = 0.0
+
+    @property
+    def horas_totales(self) -> float:
+        return self.horas_apresto + self.horas_interviniente
+
+    @property
+    def porcentaje_asistencia(self) -> float:
+        """% de los servicios del cuartel en los que participó."""
+        if not self.servicios_cuartel_total:
+            return 0.0
+        return 100.0 * self.asistencias / self.servicios_cuartel_total
+
+
+def estadistica_personal(personal_id: int, fecha_desde: date, fecha_hasta: date,
+                         reporte: Optional[ReporteEstadisticas] = None) -> EstadisticaPersonal:
+    """Ficha de un bombero en el período. `reporte` (calculado SIN filtro de
+    bombero ni de vehículo) evita recalcular si la página ya lo tiene."""
+    if reporte is None:
+        reporte = calcular_estadisticas(fecha_desde, fecha_hasta)
+    ficha = reporte.ficha_de(personal_id)
+    nombre = ficha.nombre if ficha is not None else ""
+    if not nombre:
+        with get_session() as session:
+            persona = session.get(Personal, personal_id)
+            nombre = persona.nombre_completo() if persona is not None else ""
+    personal = EstadisticaPersonal(personal_id, nombre, reporte.servicios)
+    if ficha is not None:
+        personal.asistencias = ficha.total_servicios
+        personal.servicios_interviniente = ficha.servicios_escena
+        personal.servicios_apresto = ficha.servicios_cuartel
+        personal.horas_apresto = ficha.horas_cuartel
+        personal.horas_interviniente = ficha.horas_escena
+    return personal

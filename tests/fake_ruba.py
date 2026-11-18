@@ -5,8 +5,14 @@ comportamiento relevados del RUBA real (logs/screenshots de la corrida del
 23/09/2026):
 
 - Login con cookie de sesión.
-- /agregar: Categoría que se repuebla "por AJAX" al elegir el Tipo; al
-  guardar, 302 a /editar/{id}.
+- /agregar: Categoría que se repuebla "por AJAX" al elegir el Tipo (con los
+  nombres reales del catálogo: "Forestal", "Aeronaves"...); al guardar, 302 a
+  /editar/{id}. `repoblado_tardio` simula una segunda respuesta AJAX tardía
+  que vuelve a llenar el combo y lo deja en la PRIMERA categoría (así quedó
+  un parte Forestal como "Aeronaves" en el RUBA real el 18/11/2026).
+- /editar/{id}: muestra Tipo y Categoría como texto (#group_view_tipo /
+  #group_view_categoria .value), igual que el real; por defecto, lo que se
+  eligió al crear el servicio (o `vista_tipo` / `vista_categoria`).
 - /editar/{id}: el form hace POST a la MISMA URL (novalidate). Localidad es
   un par Symfony: <input type="hidden" id="..._localidad"> + un input visible
   "autocomplete_..._localidad" (jQuery UI) que depende de la Provincia.
@@ -74,6 +80,15 @@ class FakeRuba:
         self.localidades = [{"id": i, "texto": t} for i, t in (localidades or [
             (1001, "ADELIA MARIA"), (1002, "ADELIA (San Luis)")])]
         self.categorias = categorias or {"1": ["3"], "3": ["15", "19", "21", "23"]}
+        from app.core.catalogos import cargar_tipos_incidente
+
+        tipos = cargar_tipos_incidente()
+        self.nombres_tipo = {str(t.id_ruba): t.nombre for t in tipos}
+        self.nombres_categoria = {str(k): v for t in tipos for k, v in t.subtipos.items()}
+        self.repoblado_tardio = 0          # respuestas AJAX tardías que pisan la Categoría elegida
+        self.categoria_pisada = 0          # las primeras N elecciones de Categoría vuelven a la 1ª opción
+        self.vista_tipo = "Incendios"      # lo que muestra /editar (lo pisa el POST a /agregar)
+        self.vista_categoria = "Forestal"
         self.envios: Dict[str, Dict[str, List[str]]] = {}
         self.logins = 0
         # False = "Buscar Puntos" sin resultados (zona rural): como el real, no fija el punto.
@@ -158,8 +173,12 @@ class FakeRuba:
         if path == "/estructura/incidente/agregar":
             if metodo == "POST":
                 self.inicializaciones += 1
+                tipo, categoria = (datos.get("tipo") or [""])[0], (datos.get("categoria") or [""])[0]
+                self.vista_tipo = self.nombres_tipo.get(tipo, tipo)
+                self.vista_categoria = self.nombres_categoria.get(categoria, categoria)
                 return redirigir(f"/estructura/incidente/editar/{self.ID_INCIDENTE}")
-            return 200, {}, self._agregar()
+            tardios, self.repoblado_tardio = self.repoblado_tardio, 0
+            return 200, {}, self._agregar(tardios, self.categoria_pisada)
         if path.startswith("/estructura/incidente/editar/"):
             if metodo == "POST":
                 errores = self._validar_general(datos)
@@ -218,7 +237,7 @@ class FakeRuba:
   <button type="submit">Ingresar</button>
 </form>""")
 
-    def _agregar(self) -> str:
+    def _agregar(self, tardios: int = 0, pisadas: int = 0) -> str:
         return _pagina(f"""
 <form method="post" action="/estructura/incidente/agregar" novalidate>
   <input id="{P_INI}_numeroParte" name="numeroParte" required>
@@ -231,12 +250,26 @@ class FakeRuba:
   <button type="submit" class="js-submit">Guardar</button>
 </form>""", f"""<script>
 const CATEGORIAS = {json.dumps(self.categorias)};
+const NOMBRES = {json.dumps(self.nombres_categoria, ensure_ascii=False)};
+let TARDIOS = {tardios};
+let PISADAS = {pisadas};
+const opciones = (tipo) => (CATEGORIAS[tipo] || [])
+  .map(c => `<option value="${{c}}">${{NOMBRES[c] || c}}</option>`).join('');
 document.getElementById('{P_INI}_tipoIncidente').addEventListener('change', (e) => {{
   const combo = document.getElementById('{P_INI}_categoriaIncidente');
-  setTimeout(() => {{
-    combo.innerHTML = '<option value=""></option>' +
-      (CATEGORIAS[e.target.value] || []).map(c => `<option value="${{c}}">${{c}}</option>`).join('');
-  }}, 250);
+  setTimeout(() => {{ combo.innerHTML = '<option value=""></option>' + opciones(e.target.value); }}, 250);
+  if (TARDIOS > 0) {{
+    TARDIOS -= 1;
+    // Respuesta tardía: rearma el combo SIN opción vacía -> queda la primera categoría.
+    setTimeout(() => {{ combo.innerHTML = opciones(e.target.value); }}, 1000);
+  }}
+}});
+// Respuesta tardía determinista: la elección de Categoría se pisa con la primera opción.
+document.getElementById('{P_INI}_categoriaIncidente').addEventListener('change', (e) => {{
+  if (PISADAS > 0 && e.target.selectedIndex !== 1) {{
+    PISADAS -= 1;
+    setTimeout(() => {{ e.target.selectedIndex = 1; }}, 100);
+  }}
 }});
 </script>""")
 
@@ -245,6 +278,10 @@ document.getElementById('{P_INI}_tipoIncidente').addEventListener('change', (e) 
         return _pagina(f"""
 <form method="post" action="/estructura/incidente/editar/{self.ID_INCIDENTE}" novalidate>
   {alerta}
+  <div class="control-group" id="group_view_tipo"><label>Tipo</label>
+    <div class="controls"><span class="value"> {self.vista_tipo} </span></div></div>
+  <div class="control-group" id="group_view_categoria"><label>Categoría</label>
+    <div class="controls"><span class="value"> {self.vista_categoria} </span></div></div>
   <select id="{P_GEN}_provincia" name="provincia" required>
     <option value="">Seleccionar</option><option value="6" selected>Córdoba</option><option value="19">San Luis</option>
   </select>

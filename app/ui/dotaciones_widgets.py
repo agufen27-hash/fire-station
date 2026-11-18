@@ -972,8 +972,30 @@ class PanelPersonalBase(QFrame):
         self.boton_agregar = QPushButton("+ Agregar en apresto", self)
         self.boton_agregar.setObjectName("botonAhora")
         self.boton_agregar.clicked.connect(self.agregar_apresto)
-        layout.addWidget(self.boton_agregar, 0, Qt.AlignmentFlag.AlignLeft)
+        fila_pie = QHBoxLayout()
+        fila_pie.addWidget(self.boton_agregar, 0, Qt.AlignmentFlag.AlignLeft)
+        fila_pie.addStretch(1)
+        # Total en apresto como en la fila 51 de la PCS: operadores de radio + reserva.
+        self.label_total_apresto = QLabel("", self)
+        self.label_total_apresto.setObjectName("subtituloBloque")
+        self.label_total_apresto.setToolTip("Personal en el cuartel (fila 51 de la PCS): Operador 1 y 2 "
+                                            "de radio / comunicaciones + reserva en apresto")
+        fila_pie.addWidget(self.label_total_apresto)
+        layout.addLayout(fila_pie)
+        for selector in (self.selector_operador_1, self.selector_operador_2):
+            selector.cambiado.connect(self._actualizar_total_apresto)
         _ajustar_alto(self.tabla)
+        self._actualizar_total_apresto()
+
+    def total_apresto(self) -> int:
+        """Personas distintas en base: operadores de radio + reserva (fila 51 PCS)."""
+        datos = self.datos()
+        ids = {datos["operador_1"], datos["operador_2"], *datos["apresto"]}
+        ids.discard(None)
+        return len(ids)
+
+    def _actualizar_total_apresto(self) -> None:
+        self.label_total_apresto.setText(f"Total en apresto (operadores + reserva): {self.total_apresto()}")
 
     def set_padron(self, padron: Sequence[Bombero]) -> None:
         self._padron = list(padron)
@@ -989,7 +1011,9 @@ class PanelPersonalBase(QFrame):
         self.tabla.setCellWidget(fila, 0, selector)
         self.tabla.setCellWidget(fila, 1, quitar)
         self._apresto.append(selector)
+        selector.cambiado.connect(self._actualizar_total_apresto)
         _ajustar_alto(self.tabla)
+        self._actualizar_total_apresto()
         return selector
 
     def _quitar(self, selector: SelectorBombero) -> None:
@@ -997,6 +1021,7 @@ class PanelPersonalBase(QFrame):
             self.tabla.removeRow(self._apresto.index(selector))
             self._apresto.remove(selector)
             _ajustar_alto(self.tabla)
+            self._actualizar_total_apresto()
 
     def datos(self) -> Dict[str, Any]:
         return {

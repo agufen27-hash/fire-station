@@ -1,11 +1,22 @@
 """
-Estadísticas (antes "Historial de Salidas"): lista todos los incidentes
-guardados, con filtros rápidos (texto, estado RUBA, tipo, año), KPIs del
-conjunto filtrado (salidas, horas trabajadas y horas por móvil) y acciones
-por fila (editar, eliminar, reimprimir planillas, reintentar la carga en
-RUBA, ver el log de error), también desde el menú contextual (clic
-derecho). Se embebe como página del dashboard en `main_window.py`
-("📊 Estadísticas" en la sidebar).
+Planillas (antes "Estadísticas" / "Historial de Salidas"): panel de control
+central de los partes del cuartel. Se embebe como página del dashboard en
+`main_window.py` ("📋 Planillas" en la sidebar).
+
+  Arriba   acciones rápidas: "📝 Nueva Planilla" y, solo para quien tiene el
+           permiso RUBA (Jefatura / Administración / Estadística, ver
+           app/core/roles.py), la carga en lote a RUBA y el marcado manual.
+  Abajo    lista limpia de partes con su estado (📝 Borrador / ⏱️ En curso /
+           ✅ Finalizado), su estado en RUBA, filtros rápidos (texto, estado
+           del parte, estado RUBA, tipo, año) y acciones por fila (editar,
+           eliminar, reimprimir planillas, reintentar la carga en RUBA, ver
+           el log de error), también desde el menú contextual (clic derecho).
+
+Los KPIs y gráficos viven en su propia sección (app/ui/estadisticas_view.py).
+
+Estado del parte (`estado_parte`): Finalizado = CERRADO; un EN_CURSO es
+"En curso" si ya salió al menos una unidad (hora de salida cargada) y
+"Borrador" si todavía no (guardado a medias).
 
 Marcado manual: uno o varios partes (tildados o seleccionados) se pueden
 marcar "✔ Ya cargado en RUBA manualmente" -- quedan SINCRONIZADOS sin pasar
@@ -45,6 +56,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -55,7 +67,9 @@ from sqlalchemy.orm import joinedload
 
 from app.core.horarios import duracion as duracion_servicio
 from app.db import get_session
-from app.models import ESTADOS_RUBA_EN_PROCESO, DotacionSalida, EstadoRuba, Incidente, SalidaUnidad, TipoIncidente
+from app.models import (
+    ESTADOS_RUBA_EN_PROCESO, DotacionSalida, EstadoOperativo, EstadoRuba, Incidente, SalidaUnidad, TipoIncidente,
+)
 from app.reports.excel_generator import generar_e_imprimir_pcd2, generar_e_imprimir_pcs, resumen_advertencias
 from app.reports.pdf_generator import generar_e_imprimir_informe_pdf
 from app.services.ruba_service import desmarcar_sincronizado_manual, marcar_sincronizado_manual
@@ -69,11 +83,32 @@ ESTADO_FILTRO_PENDIENTES = "Pendientes / Error"
 TIPO_FILTRO_TODOS = "Todos"
 ANIO_FILTRO_TODOS = "Todos"
 
+# Estado del parte (ciclo de vida en el cuartel, independiente de RUBA).
+ESTADO_PARTE_BORRADOR = "Borrador"
+ESTADO_PARTE_EN_CURSO = "En curso"
+ESTADO_PARTE_FINALIZADO = "Finalizado"
+ESTADOS_PARTE = (ESTADO_PARTE_BORRADOR, ESTADO_PARTE_EN_CURSO, ESTADO_PARTE_FINALIZADO)
+ESTADO_PARTE_TODOS = "Todos"
+TEXTO_ESTADO_PARTE = {
+    ESTADO_PARTE_BORRADOR: "📝 Borrador",
+    ESTADO_PARTE_EN_CURSO: "⏱️ En curso",
+    ESTADO_PARTE_FINALIZADO: "✅ Finalizado",
+}
+TOOLTIP_ESTADO_PARTE = {
+    ESTADO_PARTE_BORRADOR: "Guardado a medias, todavía sin unidades en la calle. Continualo para completarlo.",
+    ESTADO_PARTE_EN_CURSO: "La dotación sigue en el lugar: continualo para registrar el regreso y cerrarlo.",
+    ESTADO_PARTE_FINALIZADO: "Parte cerrado con sus horarios: listo para planillas y RUBA.",
+}
+SIN_PERMISO_RUBA = ("Requiere el permiso RUBA (Jefatura, Administración o Estadística). "
+                    "Identificate con tu PIN en el chip 👤.")
+
 # Una duración mayor es un dato mal cargado (fecha de regreso errónea): no suma.
 MAX_HORAS_SERVICIO = 72
 
-COL_SELECCION, COL_NUMERO_PARTE, COL_FECHA, COL_TIPO, COL_MOVIL, COL_DIRECCION, COL_ESTADO, COL_ACCIONES = range(8)
-ENCABEZADOS = ["", "N° Parte", "Fecha", "Tipo y Categoría", "Móvil Principal", "Dirección", "Estado RUBA", "Acciones"]
+(COL_SELECCION, COL_NUMERO_PARTE, COL_FECHA, COL_TIPO, COL_MOVIL, COL_DIRECCION, COL_ESTADO_PARTE,
+ COL_ESTADO, COL_ACCIONES) = range(9)
+ENCABEZADOS = ["", "N° Parte", "Fecha", "Tipo y Categoría", "Móvil Principal", "Dirección", "Estado",
+               "Estado RUBA", "Acciones"]
 
 TEXTO_BOTON_LOTE = "🚀 Cargar Seleccionados a RUBA ({})"
 TEXTO_MARCAR_MANUAL = "✔ Marcar como sincronizado manualmente"
@@ -107,6 +142,14 @@ def formatear_horas(horas: float) -> str:
     return f"{total_min // 60} h {total_min % 60:02d} min"
 
 
+def estado_parte(inc: Incidente) -> str:
+    """Borrador / En curso / Finalizado (ver docstring del módulo)."""
+    if inc.estado_operativo != EstadoOperativo.EN_CURSO.value:
+        return ESTADO_PARTE_FINALIZADO
+    salio = bool(inc.hora_salida) or any(su.hora_salida for su in inc.salidas_unidad)
+    return ESTADO_PARTE_EN_CURSO if salio else ESTADO_PARTE_BORRADOR
+
+
 def permisos_servicio(estado_ruba: str) -> tuple:
     """(puede_editar, puede_eliminar, motivo del bloqueo o "")."""
     if estado_ruba == EstadoRuba.SINCRONIZADO.value:
@@ -125,11 +168,13 @@ class HistoryWindow(QWidget):
     editar_solicitado = Signal(int)          # incidente_id (cualquier estado)
     eliminar_solicitado = Signal(int)        # incidente_id (MainWindow confirma y borra)
     estados_cambiados = Signal()             # marcado/desmarcado manual de RUBA (refrescar Inicio)
+    nueva_planilla_solicitada = Signal()     # "📝 Nueva Planilla" (MainWindow abre el formulario)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._seleccionados: Set[int] = set()   # sobrevive a refrescar() y a los filtros
         self._carga_en_curso = False
+        self._permiso_ruba = False               # lo fija MainWindow según el operador (set_permiso_ruba)
 
         self._construir_ui()
         self._cargar_tipos_filtro()
@@ -142,8 +187,13 @@ class HistoryWindow(QWidget):
         layout.setContentsMargins(28, 20, 28, 16)
         layout.setSpacing(12)
 
-        layout.addLayout(self._crear_filtros())
-        layout.addLayout(self._crear_barra_lote())
+        barra = self._crear_barra_lote()
+        filtros = self._crear_filtros()
+        # El buscador va en la fila de acciones rápidas (al lado de Nueva Planilla):
+        # así la fila de filtros entra completa en pantallas de 1366 px.
+        barra.insertWidget(2, self.entry_busqueda, 3)
+        layout.addLayout(barra)
+        layout.addLayout(filtros)
 
         self.tabla = QTableWidget(self)
         self.tabla.setColumnCount(len(ENCABEZADOS))
@@ -154,9 +204,10 @@ class HistoryWindow(QWidget):
         self.tabla.verticalHeader().setVisible(False)
         header = self.tabla.horizontalHeader()
         header.setSectionResizeMode(COL_TIPO, QHeaderView.ResizeMode.Stretch)
+        header.setMinimumSectionSize(60)
         header.setSectionResizeMode(COL_DIRECCION, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(COL_ACCIONES, QHeaderView.ResizeMode.ResizeToContents)
-        for columna in (COL_SELECCION, COL_NUMERO_PARTE, COL_FECHA, COL_MOVIL, COL_ESTADO):
+        for columna in (COL_SELECCION, COL_NUMERO_PARTE, COL_FECHA, COL_MOVIL, COL_ESTADO_PARTE, COL_ESTADO):
             header.setSectionResizeMode(columna, QHeaderView.ResizeMode.ResizeToContents)
         theme.estilizar_tabla(self.tabla, alto_fila=44)
         self.tabla.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -168,16 +219,25 @@ class HistoryWindow(QWidget):
         self.label_estado = QLabel("")
         self.label_estado.setProperty("muted", True)
         layout.addWidget(self.label_estado)
+        self._aplicar_permiso_ruba()
 
     def _crear_filtros(self) -> QHBoxLayout:
         fila = QHBoxLayout()
         fila.setSpacing(10)
 
-        fila.addWidget(QLabel("Buscar:"))
         self.entry_busqueda = QLineEdit(self)
-        self.entry_busqueda.setPlaceholderText("N° parte, calle o apellido (bombero/denunciante)…")
+        self.entry_busqueda.setPlaceholderText("🔎 Buscar por N° parte, calle o apellido (bombero / denunciante)…")
+        self.entry_busqueda.setClearButtonEnabled(True)
+        self.entry_busqueda.setMinimumWidth(200)
         self.entry_busqueda.textChanged.connect(self.refrescar)
-        fila.addWidget(self.entry_busqueda, 1)
+
+        fila.addWidget(QLabel("Estado:"))
+        self.combo_estado_parte = QComboBox(self)
+        self.combo_estado_parte.addItem(ESTADO_PARTE_TODOS, None)
+        for estado in ESTADOS_PARTE:
+            self.combo_estado_parte.addItem(TEXTO_ESTADO_PARTE[estado], estado)
+        self.combo_estado_parte.currentIndexChanged.connect(self.refrescar)
+        fila.addWidget(self.combo_estado_parte)
 
         fila.addWidget(QLabel("Estado RUBA:"))
         self.combo_estado = QComboBox(self)
@@ -193,44 +253,44 @@ class HistoryWindow(QWidget):
         fila.addWidget(QLabel("Año:"))
         self.combo_anio = QComboBox(self)
         self.combo_anio.addItem(ANIO_FILTRO_TODOS, None)
-        self.combo_anio.setToolTip("Filtra la tabla y los indicadores por año del servicio")
+        self.combo_anio.setToolTip("Filtra la lista por año del servicio")
         self.combo_anio.currentIndexChanged.connect(self.refrescar)
         fila.addWidget(self.combo_anio)
 
         boton_actualizar = QPushButton("Actualizar", self)
         boton_actualizar.clicked.connect(self.refrescar)
         fila.addWidget(boton_actualizar)
-
-        boton_reporte = QPushButton("📑 Reporte gerencial", self)
-        boton_reporte.setObjectName("botonAhora")
-        boton_reporte.setToolTip("Exporta a Excel asistencias y horas por bombero y salidas y horas por móvil "
-                                 "entre dos fechas")
-        boton_reporte.clicked.connect(self._abrir_reporte_gerencial)
-        fila.addWidget(boton_reporte)
-
+        # Combos compactos: que la fila entre en 1366 px sin pisar las etiquetas.
+        for combo in (self.combo_estado_parte, self.combo_estado, self.combo_tipo_filtro, self.combo_anio):
+            combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(9)
         return fila
 
-    def _abrir_reporte_gerencial(self) -> None:
-        from app.ui.reports_window import abrir_reporte_gerencial
-
-        abrir_reporte_gerencial(self)
-
     def _crear_barra_lote(self) -> QHBoxLayout:
+        """Acciones rápidas: Nueva Planilla + (con permiso RUBA) la carga a RUBA."""
         fila = QHBoxLayout()
         fila.setSpacing(10)
+        self.boton_nueva_planilla = QPushButton("📝 Nueva Planilla", self)
+        self.boton_nueva_planilla.setObjectName("botonPrimarioAzul")
+        self.boton_nueva_planilla.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.boton_nueva_planilla.setToolTip("Abrir el formulario para cargar un parte nuevo")
+        self.boton_nueva_planilla.clicked.connect(self.nueva_planilla_solicitada.emit)
+        fila.addWidget(self.boton_nueva_planilla)
+        fila.addSpacing(12)
+
         self.check_todos = QCheckBox("Seleccionar todos (pendientes / con error)", self)
         self.check_todos.setToolTip("Tilda o destilda todos los partes visibles que se pueden cargar en RUBA")
         self.check_todos.clicked.connect(self._seleccionar_todos)
         fila.addWidget(self.check_todos)
         fila.addStretch(1)
 
-        # KPIs del conjunto filtrado, a la izquierda de los botones de RUBA.
-        self.kpi_salidas = self._crear_kpi("Cantidad de servicios de la tabla (según los filtros y el año)")
-        self.kpi_horas = self._crear_kpi("Suma de la duración de cada servicio cerrado (salida → regreso)")
-        self.kpi_movil = self._crear_kpi("Horas de servicio por unidad / móvil")
-        for kpi in (self.kpi_salidas, self.kpi_horas, self.kpi_movil):
-            fila.addWidget(kpi)
-        fila.addSpacing(8)
+        self.label_sin_permiso_ruba = QLabel("🔒 Carga a RUBA: solo Jefatura, Administración o Estadística", self)
+        self.label_sin_permiso_ruba.setObjectName("chip")
+        self.label_sin_permiso_ruba.setToolTip(SIN_PERMISO_RUBA)
+        theme.set_tono(self.label_sin_permiso_ruba, "neutro")
+        self.label_sin_permiso_ruba.setFixedHeight(28)
+        self.boton_nueva_planilla.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        fila.addWidget(self.label_sin_permiso_ruba)
 
         self.boton_marcar_manual = QPushButton("✔ Marcar cargado manual", self)
         self.boton_marcar_manual.setToolTip(
@@ -246,14 +306,32 @@ class HistoryWindow(QWidget):
         self.boton_cargar_lote.clicked.connect(self._cargar_seleccionados)
         theme.aplicar_sombra(self.boton_cargar_lote, "rojo")
         fila.addWidget(self.boton_cargar_lote)
+        self._widgets_ruba = (self.check_todos, self.boton_marcar_manual, self.boton_cargar_lote)
+        self._aplicar_permiso_ruba()
         return fila
 
-    def _crear_kpi(self, tooltip: str) -> QLabel:
-        kpi = QLabel("—", self)
-        kpi.setObjectName("chip")
-        kpi.setToolTip(tooltip)
-        theme.set_tono(kpi, "info")
-        return kpi
+    # -- Permiso RUBA ------------------------------------------------------------
+
+    def set_permiso_ruba(self, permitido: bool) -> None:
+        """MainWindow: el operador identificado tiene (o no) el permiso RUBA."""
+        if permitido == self._permiso_ruba:
+            return
+        self._permiso_ruba = permitido
+        if not permitido:
+            self._seleccionados.clear()
+        self._aplicar_permiso_ruba()
+        self.refrescar()
+
+    @property
+    def permiso_ruba(self) -> bool:
+        return self._permiso_ruba
+
+    def _aplicar_permiso_ruba(self) -> None:
+        for widget in self._widgets_ruba:
+            widget.setVisible(self._permiso_ruba)
+        self.label_sin_permiso_ruba.setVisible(not self._permiso_ruba)
+        if hasattr(self, "tabla"):
+            self.tabla.setColumnHidden(COL_SELECCION, not self._permiso_ruba)
 
     def _cargar_tipos_filtro(self) -> None:
         self.combo_tipo_filtro.blockSignals(True)
@@ -271,6 +349,7 @@ class HistoryWindow(QWidget):
         filtro_estado = self.combo_estado.currentText()
         filtro_tipo_id = self.combo_tipo_filtro.currentData()
         filtro_anio = self.combo_anio.currentData()
+        filtro_estado_parte = self.combo_estado_parte.currentData()
 
         with get_session() as session:
             incidentes = (
@@ -290,12 +369,14 @@ class HistoryWindow(QWidget):
                 self._extraer_fila(inc)
                 for inc in incidentes
                 if (filtro_anio is None or (inc.fecha and inc.fecha.year == filtro_anio))
+                and (filtro_estado_parte is None or estado_parte(inc) == filtro_estado_parte)
                 and self._incidente_coincide(inc, texto, filtro_estado, filtro_tipo_id)
             ]
 
         self._poblar_tabla(filas)
-        self._actualizar_kpis(filas, filtro_anio)
-        self.label_estado.setText(f"{len(filas)} siniestro(s) encontrados.")
+        conteo = {e: sum(1 for f in filas if f["estado_parte"] == e) for e in ESTADOS_PARTE}
+        detalle = " · ".join(f"{TEXTO_ESTADO_PARTE[e]}: {n}" for e, n in conteo.items() if n)
+        self.label_estado.setText(f"{len(filas)} parte(s) encontrados." + (f"   {detalle}" if detalle else ""))
 
     def _actualizar_anios(self, anios: Set[int]) -> None:
         """Años con partes, del más nuevo al más viejo (conserva la elección)."""
@@ -310,27 +391,6 @@ class HistoryWindow(QWidget):
             self.combo_anio.addItem(str(anio), anio)
         self.combo_anio.setCurrentIndex(max(0, self.combo_anio.findData(elegido)))
         self.combo_anio.blockSignals(False)
-
-    def _actualizar_kpis(self, filas: List[dict], anio: Optional[int]) -> None:
-        sufijo = f" {anio}" if anio else ""
-        self.kpi_salidas.setText(f"🚒 Salidas{sufijo}: {len(filas)}")
-        total = sum(f["horas"] for f in filas)
-        por_movil: Dict[str, float] = defaultdict(float)
-        for f in filas:
-            for movil, horas in f["horas_por_movil"].items():
-                por_movil[movil] += horas
-        self.kpi_horas.setText(f"⏱ Horas{sufijo}: {formatear_horas(total)}")
-        ranking = sorted(por_movil.items(), key=lambda kv: kv[1], reverse=True)
-        detalle = "\n".join(f"{movil}: {formatear_horas(horas)}" for movil, horas in ranking)
-        self.kpi_horas.setToolTip("Suma de la duración de cada servicio cerrado (salida → regreso)"
-                                  + (f"\n\nPor unidad:\n{detalle}" if detalle else ""))
-        if ranking:
-            movil, horas = ranking[0]
-            self.kpi_movil.setText(f"🚐 {movil}: {formatear_horas(horas)}")
-            self.kpi_movil.setToolTip("Unidad con más horas de servicio. Todas:\n" + detalle)
-        else:
-            self.kpi_movil.setText("🚐 Sin horas por unidad")
-            self.kpi_movil.setToolTip("Todavía no hay servicios cerrados con horario de salida y regreso.")
 
     @staticmethod
     def _horas_incidente(inc: Incidente) -> tuple:
@@ -396,6 +456,7 @@ class HistoryWindow(QWidget):
             "reintentos_ruba": inc.reintentos_ruba or 0,
             "proximo_reintento_ruba": inc.proximo_reintento_ruba,
             "en_curso": inc.en_curso,
+            "estado_parte": estado_parte(inc),
             "carga_manual": bool(inc.ruba_carga_manual),
             "horas": horas,
             "horas_por_movil": horas_por_movil,
@@ -424,10 +485,18 @@ class HistoryWindow(QWidget):
             self.tabla.setItem(fila_idx, COL_TIPO, QTableWidgetItem(datos["tipo_categoria"]))
             self.tabla.setItem(fila_idx, COL_MOVIL, QTableWidgetItem(datos["movil_principal"]))
             self.tabla.setItem(fila_idx, COL_DIRECCION, QTableWidgetItem(datos["direccion"]))
+            item_parte = QTableWidgetItem(TEXTO_ESTADO_PARTE[datos["estado_parte"]])
+            item_parte.setToolTip(TOOLTIP_ESTADO_PARTE[datos["estado_parte"]])
+            item_parte.setForeground(QColor(theme.color({
+                ESTADO_PARTE_BORRADOR: "texto_secundario",
+                ESTADO_PARTE_EN_CURSO: "rojo_hover",
+                ESTADO_PARTE_FINALIZADO: "verde_texto",
+            }[datos["estado_parte"]])))
+            self.tabla.setItem(fila_idx, COL_ESTADO_PARTE, item_parte)
 
             if datos["en_curso"]:
-                item_estado = QTableWidgetItem("⏱️ En curso")
-                item_estado.setForeground(QColor(theme.color("rojo_hover")))
+                item_estado = QTableWidgetItem("⏸ Espera el cierre")
+                item_estado.setForeground(QColor(theme.color("texto_tenue")))
                 item_estado.setToolTip("Cerralo (con los horarios de regreso) para poder cargarlo en RUBA")
             else:
                 texto = self._texto_estado(datos["estado_ruba"])
@@ -447,7 +516,7 @@ class HistoryWindow(QWidget):
     def _crear_item_seleccion(self, datos: dict) -> QTableWidgetItem:
         item = QTableWidgetItem()
         item.setData(Qt.ItemDataRole.UserRole, datos["id"])
-        if self.seleccionable(datos):
+        if self.seleccionable(datos) and self._permiso_ruba:
             item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
             marcado = datos["id"] in self._seleccionados
             item.setCheckState(Qt.CheckState.Checked if marcado else Qt.CheckState.Unchecked)
@@ -456,8 +525,11 @@ class HistoryWindow(QWidget):
             # Bloqueado: sin ItemIsEnabled el checkbox se ve gris y no se puede tildar.
             item.setFlags(Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(Qt.CheckState.Unchecked)
-            item.setToolTip("🔒 Ya está cargado en RUBA" if not datos["en_curso"]
-                            else "Servicio en curso: cerralo antes de cargarlo en RUBA")
+            if not self._permiso_ruba:
+                item.setToolTip(SIN_PERMISO_RUBA)
+            else:
+                item.setToolTip("🔒 Ya está cargado en RUBA" if not datos["en_curso"]
+                                else "Servicio en curso: cerralo antes de cargarlo en RUBA")
         return item
 
     # -- Selección y carga en lote ------------------------------------------------
@@ -487,7 +559,7 @@ class HistoryWindow(QWidget):
 
     def _actualizar_boton_lote(self) -> None:
         self.boton_cargar_lote.setText(TEXTO_BOTON_LOTE.format(len(self._seleccionados)))
-        self.boton_cargar_lote.setEnabled(not self._carga_en_curso)
+        self.boton_cargar_lote.setEnabled(not self._carga_en_curso and self._permiso_ruba)
         visibles = self._items_seleccionables()
         self.check_todos.blockSignals(True)
         self.check_todos.setChecked(bool(visibles) and all(
@@ -499,8 +571,8 @@ class HistoryWindow(QWidget):
         return sorted(self._seleccionados)
 
     def set_carga_en_curso(self, en_curso: bool) -> None:
-        self.boton_marcar_manual.setEnabled(not en_curso)
         """MainWindow: mientras corre un lote no se puede lanzar otro."""
+        self.boton_marcar_manual.setEnabled(not en_curso)
         self._carga_en_curso = en_curso
         self.boton_cargar_lote.setToolTip(
             "Hay una carga en RUBA en curso: esperá a que termine." if en_curso
@@ -508,6 +580,9 @@ class HistoryWindow(QWidget):
         self._actualizar_boton_lote()
 
     def _cargar_seleccionados(self) -> None:
+        if not self._permiso_ruba:
+            QMessageBox.warning(self, "Sin permiso RUBA", SIN_PERMISO_RUBA)
+            return
         if not self._seleccionados:
             QMessageBox.warning(
                 self, "No hay partes seleccionados",
@@ -566,7 +641,7 @@ class HistoryWindow(QWidget):
             log_error = (datos.get("ultimo_error_ruba") or datos.get("ruba_error_log") or "").strip()
             return "Falló la carga en RUBA:\n" + (log_error.splitlines()[0] if log_error else "(sin detalle)") \
                 + "\n\nBotón ⚠ Log: detalle completo."
-        return "Pendiente de carga en RUBA: tildalo y usá 🚀 Cargar Seleccionados."
+        return "Pendiente de carga en RUBA: tildalo y usá 🚀 Cargar Seleccionados (requiere el permiso RUBA)."
 
     # -- Acciones por fila ------------------------------------------------------
 
@@ -599,36 +674,36 @@ class HistoryWindow(QWidget):
         boton_eliminar.setEnabled(puede_eliminar)
         boton_eliminar.clicked.connect(lambda: self.eliminar_solicitado.emit(incidente_id))
 
-        boton_pcs = QPushButton("🖨 PCS", contenedor)
-        boton_pcs.setToolTip("Reimprimir la planilla PCS")
-        boton_pcs.clicked.connect(lambda: self._reimprimir(incidente_id, numero_parte, generar_e_imprimir_pcs, "PCS"))
-        fila.addWidget(boton_pcs)
-
-        boton_pcd2 = QPushButton("🖨 PCD2", contenedor)
-        boton_pcd2.setToolTip("Reimprimir la planilla PCD2")
-        boton_pcd2.clicked.connect(
-            lambda: self._reimprimir(incidente_id, numero_parte, generar_e_imprimir_pcd2, "PCD2")
-        )
-        fila.addWidget(boton_pcd2)
-
-        boton_pdf = QPushButton("📄 Informe", contenedor)
-        boton_pdf.setToolTip("Generar el informe PDF del siniestro")
-        boton_pdf.clicked.connect(lambda: self._generar_informe_pdf(incidente_id, numero_parte))
-        fila.addWidget(boton_pdf)
+        # Impresiones agrupadas en un menú: la fila queda angosta y Tipo / Dirección se leen completos.
+        boton_imprimir = QPushButton("🖨 Imprimir ▾", contenedor)
+        boton_imprimir.setToolTip("Reimprimir PCS / PCD2 o generar el informe PDF")
+        menu_imprimir = QMenu(boton_imprimir)
+        menu_imprimir.addAction("🖨 Planilla PCS").triggered.connect(
+            lambda: self._reimprimir(incidente_id, numero_parte, generar_e_imprimir_pcs, "PCS"))
+        menu_imprimir.addAction("🖨 Planilla PCD2").triggered.connect(
+            lambda: self._reimprimir(incidente_id, numero_parte, generar_e_imprimir_pcd2, "PCD2"))
+        menu_imprimir.addAction("📄 Informe PDF").triggered.connect(
+            lambda: self._generar_informe_pdf(incidente_id, numero_parte))
+        boton_imprimir.setMenu(menu_imprimir)
+        fila.addWidget(boton_imprimir)
 
         boton_reintentar = QPushButton("↻ RUBA", contenedor)
-        boton_reintentar.setToolTip("Cargar solo este parte en RUBA")
-        boton_reintentar.setEnabled(self.seleccionable(datos) and not self._carga_en_curso)
+        boton_reintentar.setToolTip("Cargar solo este parte en RUBA" if self._permiso_ruba else SIN_PERMISO_RUBA)
+        boton_reintentar.setEnabled(self.seleccionable(datos) and not self._carga_en_curso and self._permiso_ruba)
         boton_reintentar.clicked.connect(lambda: self._reintentar_ruba(incidente_id, numero_parte))
+        boton_reintentar.setVisible(self._permiso_ruba)  # sin permiso RUBA ni se muestra
         fila.addWidget(boton_reintentar)
 
         boton_log = QPushButton("⚠ Log", contenedor)
         boton_log.setToolTip("Ver el log del último error de RUBA")
-        boton_log.setEnabled(bool(datos["ruba_error_log"]))
+        boton_log.setVisible(bool(datos["ruba_error_log"]))  # solo si hubo un error que mirar
         boton_log.clicked.connect(lambda: self._ver_log_error(numero_parte, datos["ruba_error_log"]))
         fila.addWidget(boton_log)
 
         fila.addWidget(boton_eliminar)  # al final: lejos de los botones de uso diario
+        for boton in contenedor.findChildren(QPushButton):
+            # Ancho mínimo según el texto: con el padding del tema, ResizeToContents lo cortaba.
+            boton.setMinimumWidth(boton.fontMetrics().horizontalAdvance(boton.text()) + 28)
         return contenedor
 
     def _datos_de_fila(self, fila: int) -> Optional[dict]:
@@ -648,10 +723,10 @@ class HistoryWindow(QWidget):
         marcables = [d for d in self._datos_seleccionados() if self.seleccionable(d)]
         texto_marcar = TEXTO_MARCAR_MANUAL + (f" ({len(marcables)})" if len(marcables) > 1 else "")
         accion_marcar = menu.addAction(texto_marcar)
-        accion_marcar.setEnabled(bool(marcables) and not self._carga_en_curso)
+        accion_marcar.setEnabled(bool(marcables) and not self._carga_en_curso and self._permiso_ruba)
         accion_marcar.setToolTip("Ya lo cargaste a mano en RUBA: queda sincronizado y no se envía a la automatización")
         accion_marcar.triggered.connect(lambda: self._marcar_manual([d["id"] for d in marcables]))
-        if datos["carga_manual"]:
+        if datos["carga_manual"] and self._permiso_ruba:
             accion_desmarcar = menu.addAction("↩ Deshacer marcado manual (volver a Pendiente)")
             accion_desmarcar.triggered.connect(lambda: self._desmarcar_manual(datos))
         menu.addSeparator()
@@ -693,6 +768,9 @@ class HistoryWindow(QWidget):
         self._marcar_manual(ids)
 
     def _marcar_manual(self, ids: List[int]) -> None:
+        if not self._permiso_ruba:
+            QMessageBox.warning(self, "Sin permiso RUBA", SIN_PERMISO_RUBA)
+            return
         if self._carga_en_curso:
             QMessageBox.information(self, "Carga en RUBA en curso", "Esperá a que termine la carga en RUBA.")
             return
@@ -767,6 +845,9 @@ class HistoryWindow(QWidget):
 
     def _reintentar_ruba(self, incidente_id: int, numero_parte: str) -> None:
         """Un lote de un solo parte: mismo motor y mismo diálogo de progreso."""
+        if not self._permiso_ruba:
+            QMessageBox.warning(self, "Sin permiso RUBA", SIN_PERMISO_RUBA)
+            return
         self.label_estado.setText(f"Carga del siniestro N° {numero_parte} en RUBA…")
         self.carga_lote_solicitada.emit([incidente_id])
 

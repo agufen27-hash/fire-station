@@ -19,7 +19,13 @@ Qué se embebe en el bundle (read-only, ver app/paths.py -> get_resource_path):
     la versión más nueva de cada uno si hay varias) + el driver Node interno
     del paquete `playwright` (via --collect-all playwright)
 
-Qué NO se embebe (a propósito):
+Qué NO se embebe (a propósito) -- `verificar_bundle_limpio` corta el build si
+aparece algo de esto en dist/: una instalación nueva arranca VACÍA y el
+padrón y las unidades se importan desde RUBA:
+  - ninguna base SQLite (`*.db`, `*.sqlite`), ni respaldos;
+  - `data/seed_bomberos.json` (personal y denunciante del cuartel), el
+    'Reporte de bomberos' / 'Reporte de vehiculos' ni ningún Excel fuera de
+    templates/;
   - `data/config.json` real (tiene el usuario/clave reales de RUBA -- si
     viajara adentro del .exe, cualquiera que lo abra con un descompresor de
     PyInstaller lo vería en texto plano). En el primer arranque en la
@@ -173,6 +179,27 @@ def verificar_mapa_embebido(dist_app: Path) -> None:
     print(f"Mapa interactivo OK en {interna / 'app' / 'ui' / 'map_assets'} (+ QtWebEngineProcess)")
 
 
+# Datos del cuartel que nunca pueden viajar dentro del ejecutable.
+_PROHIBIDOS_EN_BUNDLE = ("*.db", "*.sqlite", "*.sqlite3", "seed_bomberos.json", "config.json",
+                         "Reporte de bomberos*.xlsx", "Reporte de vehiculos*.xlsx", "*.db-journal")
+
+
+def verificar_bundle_limpio(dist_app: Path) -> None:
+    """Corta el build si en dist/FireStation/ hay bases, semillas, config real
+    o padrones: el instalador tiene que arrancar sin datos."""
+    encontrados = sorted({
+        ruta for patron in _PROHIBIDOS_EN_BUNDLE for ruta in dist_app.rglob(patron)
+        if "ms-playwright" not in ruta.parts and "node_modules" not in ruta.parts
+    })
+    xlsx_sueltos = [r for r in dist_app.rglob("*.xlsx")
+                    if r.parent.name != "templates" and "ms-playwright" not in r.parts]
+    encontrados += [r for r in xlsx_sueltos if r not in encontrados]
+    if encontrados:
+        sys.exit("El bundle tiene datos que no deben viajar (instalación limpia):\n  "
+                 + "\n  ".join(str(r.relative_to(dist_app)) for r in encontrados))
+    print("Bundle limpio: sin bases de datos, semillas, padrones ni config real.")
+
+
 def _preparar_config_example() -> Path:
     """Genera data/config.example.json (esqueleto SIN credenciales) a partir
     de la forma real de data/config.json, si existe, o con un esqueleto fijo
@@ -288,6 +315,7 @@ def main() -> None:
 
     verificar_chromium_embebido(DIST_DIR / NOMBRE_APP)
     verificar_mapa_embebido(DIST_DIR / NOMBRE_APP)
+    verificar_bundle_limpio(DIST_DIR / NOMBRE_APP)
 
     print()
     print(f"Listo: {DIST_DIR / NOMBRE_APP / (NOMBRE_APP + '.exe')}")

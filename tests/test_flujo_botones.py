@@ -70,6 +70,9 @@ def entorno(qapp, tmp_path, monkeypatch, padron):
 
     monkeypatch.setattr(ruba_service, "RubaServiceAutomation", AutomatizacionDePrueba)
     ventana = mw.MainWindow()
+    # La carga a RUBA exige el permiso RUBA (Jefatura / Administración / Estadística).
+    ventana._permisos = mw.permisos_de("ESTADISTICA")
+    ventana._pagina_historial.set_permiso_ruba(True)
     yield ventana, avisos, sitio
     ventana.close()
     sitio.detener()
@@ -231,3 +234,38 @@ def test_guardar_e_imprimir_y_limpiar(entorno, padron):
     assert ventana.panel_dotaciones.unidades() == []
     assert ventana.combo_tipo.currentIndex() == 0 and ventana.campo_hora_salida.value() is None
     assert ventana.entry_localidad.text() == "Adelia María"
+
+
+def test_cancelar_edicion_no_toca_lo_guardado_y_vuelve_a_planillas(entorno, padron, monkeypatch):
+    from app.ui import main_window as mw
+
+    ventana, _avisos, _ = entorno
+    incidente_id = _guardar_local(ventana, padron, calle="Belgrano 58")
+    ventana.editar_servicio(incidente_id)
+    assert ventana._incidente_en_edicion == incidente_id
+    ventana.entry_calle.setText("Calle cambiada sin guardar")
+    monkeypatch.setattr(mw.QMessageBox, "question", lambda *a, **k: mw.QMessageBox.StandardButton.Yes)
+    ventana.boton_cancelar.click()
+    assert ventana._incidente_en_edicion is None
+    assert ventana._stack.currentIndex() == mw.IDX_PLANILLAS
+    with db.get_session() as session:
+        assert session.get(Incidente, incidente_id).calle_altura == "Belgrano 58"
+
+    # "No" en la confirmación: sigue en el formulario con los cambios.
+    ventana.editar_servicio(incidente_id)
+    ventana.entry_calle.setText("Otra")
+    monkeypatch.setattr(mw.QMessageBox, "question", lambda *a, **k: mw.QMessageBox.StandardButton.No)
+    ventana.boton_cancelar.click()
+    assert ventana._incidente_en_edicion == incidente_id and ventana.entry_calle.text() == "Otra"
+
+
+def test_sin_permiso_ruba_no_encola(entorno, padron):
+    from app.ui import main_window as mw
+
+    ventana, avisos, _ = entorno
+    incidente_id = _guardar_local(ventana, padron)
+    ventana._permisos = mw.permisos_de("BOMBERO")
+    encolados = []
+    ventana._cola_ruba.encolar = lambda ids, *a, **k: encolados.append(ids) or list(ids)
+    ventana._cargar_lote_ruba([incidente_id])
+    assert encolados == [] and "Jefatura" in avisos[-1][1]

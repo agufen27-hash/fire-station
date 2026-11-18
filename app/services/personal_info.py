@@ -39,7 +39,10 @@ def es_mando(jerarquia: Optional[str], cargo: Optional[str] = None) -> bool:
 
 def grado_y_cargo(jerarquia: Optional[str], cargo: Optional[str]) -> str:
     """'Sargento — Jefe de Cuerpo Activo', 'Bombero', o '' si no hay datos."""
-    return " — ".join(x for x in ((jerarquia or "").strip(), (cargo or "").strip()) if x)
+    grado, funcion = (jerarquia or "").strip(), (cargo or "").strip()
+    if grado and funcion and grado.casefold() == funcion.casefold():
+        return grado
+    return " — ".join(x for x in (grado, funcion) if x)
 
 
 def jerarquias_por_id_ruba(ids: Iterable[int]) -> Dict[int, Optional[str]]:

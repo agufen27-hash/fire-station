@@ -32,7 +32,19 @@ def _identificar_app_en_windows() -> None:
         pass
 
 
+def _consola_tolerante() -> None:
+    """Los avisos de la cola de RUBA traen emojis ("⚠️"): en una consola cp1252
+    (o con la salida redirigida a un archivo) print() lanzaba UnicodeEncodeError
+    dentro del slot de Qt. Con errors="replace" se imprimen igual, sin cortar nada."""
+    for flujo in (sys.stdout, sys.stderr):
+        try:
+            flujo.reconfigure(errors="replace")
+        except (AttributeError, ValueError):  # sin consola (exe windowed) o flujo no reconfigurable
+            pass
+
+
 def main() -> None:
+    _consola_tolerante()
     asegurar_config_inicial()
     asegurar_calibracion_en_config()
     configurar_entorno_playwright()

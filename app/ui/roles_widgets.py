@@ -1,6 +1,6 @@
 """
 Configuración → "Usuarios y Roles": lista el personal activo con un combo
-de rol (Bombero / Jefatura / Administrador) por fila.
+de rol (Bombero / Jefatura / Administrador / Estadística) por fila.
 
 Guardar exige autorización institucional, no el rol del operador: la
 cuenta de RUBA guardada en Configuración (usuario + clave) o, si todavía no

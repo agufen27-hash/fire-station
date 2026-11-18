@@ -19,7 +19,7 @@ from app.core.catalogos import obtener_padron
 from app.models import DamnificadoCivil, DotacionSalida, EstadoOperativo, EstadoRuba, Incidente, SalidaUnidad
 from app.services import ruba_service
 from app.ui.damnificados_widgets import COL_C_NOMBRE
-from app.ui.history_window import COL_ACCIONES, COL_ESTADO, COL_SELECCION
+from app.ui.history_window import COL_ACCIONES, COL_ESTADO, COL_ESTADO_PARTE, COL_SELECCION
 from app.ui.servicio_en_curso import formatear_transcurrido
 from tests.ayudas import despachar, elegir_categoria
 
@@ -174,7 +174,8 @@ def test_en_curso_no_se_sincroniza_ni_cuenta_como_pendiente(ventana, padron):
 
     ventana._pagina_historial.refrescar()
     tabla = ventana._pagina_historial.tabla
-    assert tabla.item(0, COL_ESTADO).text() == "⏱️ En curso"
+    assert tabla.item(0, COL_ESTADO_PARTE).text() == "⏱️ En curso"
+    assert tabla.item(0, COL_ESTADO).text() == "⏸ Espera el cierre"
     assert not tabla.item(0, COL_SELECCION).flags() & Qt.ItemFlag.ItemIsEnabled  # no se puede tildar
     textos = [b.text() for b in tabla.cellWidget(0, COL_ACCIONES).findChildren(type(ventana.boton_limpiar))]
     assert "✏️ Continuar" in textos

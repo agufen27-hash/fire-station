@@ -16,7 +16,11 @@ Particularidades del export real de RUBA que se contemplan:
   - El mismo móvil puede aparecer dos veces (un alta vieja y la vigente):
     se queda la fila más completa y se avisa en el resumen.
   - El reporte de bomberos real NO trae 'Jerarquía': se usa esa columna si
-    existe y, si no, 'Formación' (Bombero / Aspirante / Cadete).
+    existe; si no, el grado que RUBA exporta en 'Cargo' (Cabo, Sargento,
+    Comisario...) y, si está vacío, 'Formación' (Bombero / Aspirante / Cadete).
+  - Tampoco trae 'Contacto de emergencia': si no existe esa columna se toma
+    'Familiares' ("APELLIDO,NOMBRE | DNI:12345678", varios separados por ';'
+    o saltos de línea) y se guarda como "APELLIDO, Nombre (DNI 12345678)".
   - Personal: lectura híbrida por nombre de encabezado + letra de columna
     (ver CAMPOS_PADRON), fechas normalizadas con `parsear_fecha_ruba` y
     upsert que nunca toca el PIN de un bombero existente.
@@ -338,6 +342,9 @@ CAMPOS_PADRON: Tuple[Tuple[str, Optional[str], Tuple[str, ...]], ...] = (
     ("domicilio", "M", ("Domicilio", "Dirección")),
     ("email", "N", ("Email", "E-mail", "Correo", "Correo electrónico")),
     ("telefono", "O", ("Telefono", "Teléfono", "Celular")),
+    ("contacto_emergencia", None, ("Contacto de emergencia", "Contacto emergencia", "Contacto en caso de emergencia",
+                                   "En caso de emergencia", "Teléfono de emergencia", "Telefono de emergencia")),
+    ("familiares", None, ("Familiares", "Familiar", "Grupo familiar")),
     ("grupo_sanguineo", "P", ("Grupo Sanguineo", "Grupo Sanguíneo", "Grupo")),
     ("factor", "Q", ("Factor", "Factor RH", "RH")),
     ("fecha_ingreso", "W", ("Fecha Ingreso", "Fecha de Ingreso", "Ingreso")),
@@ -437,6 +444,33 @@ def _legajo_limpio(valor: Any) -> Optional[str]:
     return texto or None
 
 
+_RE_FAMILIAR = re.compile(r"^\s*(?P<nombre>[^|]+?)\s*(?:\|\s*(?:DNI|DOC)\s*:?\s*(?P<dni>[\d.]+))?\s*$",
+                          re.IGNORECASE)
+
+
+def contacto_desde_familiares(valor: Any) -> Optional[str]:
+    """'PEREZ,JUAN CARLOS | DNI:12345678' -> 'PEREZ, Juan Carlos (DNI 12345678)'.
+    Varios familiares (';' o salto de línea) quedan separados por ' · '. Lo
+    que no respeta el formato se guarda tal cual (recortado a 200)."""
+    texto = _texto_limpio(valor)
+    if not texto:
+        return None
+    partes = []
+    for crudo in re.split(r"[;\n]+", texto):
+        crudo = crudo.strip()
+        if not crudo:
+            continue
+        m = _RE_FAMILIAR.match(crudo)
+        if not m or ("," not in m.group("nombre") and not m.group("dni")):
+            partes.append(crudo)
+            continue
+        apellido, _, nombre = m.group("nombre").partition(",")
+        nombre_fmt = ", ".join(x for x in (apellido.strip().upper(), nombre.strip().title()) if x)
+        dni = (m.group("dni") or "").replace(".", "")
+        partes.append(f"{nombre_fmt} (DNI {dni})" if dni else nombre_fmt)
+    return " · ".join(partes)[:200] or None
+
+
 def _grupo_sanguineo(grupo: Optional[str], factor: Optional[str]) -> Optional[str]:
     """'A' + 'Positivo' -> 'A+' (cabe en la columna y es como se lee en la ficha)."""
     if not grupo:
@@ -465,6 +499,7 @@ class BomberoRuba:
     domicilio: Optional[str] = None
     email: Optional[str] = None
     telefono: Optional[str] = None
+    contacto_emergencia: Optional[str] = None
     grupo_sanguineo: Optional[str] = None
     factor_rh: Optional[str] = None
     fecha_ingreso: Optional[date] = None
@@ -567,6 +602,9 @@ def leer_reporte_bomberos(ruta: Path) -> LecturaPadron:
 
     fila_header = _buscar_fila_encabezado(filas)
     indices, avisos = resolver_columnas(filas[fila_header])
+    if "jerarquia" not in indices and ("cargo" in indices or "formacion" in indices):
+        # Sin columna 'Jerarquía' el grado sale de 'Cargo' / 'Formación': no es un dato perdido.
+        avisos = [a for a in avisos if not a.startswith("'Jerarquía'")]
     faltan = [c for c in ("apellido", "nombre") if c not in indices]
     if faltan or ("id_ruba" not in indices and "dni" not in indices):
         raise ValueError(f"{ruta.name}: faltan columnas obligatorias ({', '.join(faltan) or 'Id o DNI'}). "
@@ -608,21 +646,27 @@ def leer_reporte_bomberos(ruta: Path) -> LecturaPadron:
         activo = _activo_ruba(celda(fila, "activo")) if "activo" in indices else True
         situacion = _texto_limpio(celda(fila, "estado"))
         formacion = _texto_limpio(celda(fila, "formacion"))
-        jerarquia = _texto_limpio(celda(fila, "jerarquia")) if hay_jerarquia else formacion
+        cargo = _texto_limpio(celda(fila, "cargo"))
+        # Grado: 'Jerarquía' si existe; si no, el grado de 'Cargo'; si no, 'Formación'.
+        jerarquia = _texto_limpio(celda(fila, "jerarquia")) if hay_jerarquia else (cargo or formacion)
+        jerarquia_oficial = hay_jerarquia or bool(cargo)
+        contacto = (_texto_limpio(celda(fila, "contacto_emergencia"))
+                    or contacto_desde_familiares(celda(fila, "familiares")))
         factor = _texto_limpio(celda(fila, "factor"))
         b = BomberoRuba(
             id_ruba=id_ruba, apellido=apellido, nombre=nombre, dni=dni,
             legajo=_legajo_limpio(celda(fila, "legajo")),
-            jerarquia=jerarquia, jerarquia_es_oficial=hay_jerarquia,
+            jerarquia=jerarquia[:40] if jerarquia else None, jerarquia_es_oficial=jerarquia_oficial,
             estado=_estado_personal(situacion, activo if "activo" in indices else None),
             activo=activo, fila=numero,
             sexo=_texto_limpio(celda(fila, "sexo")),
             domicilio=_texto_limpio(celda(fila, "domicilio")),
             email=(_texto_limpio(celda(fila, "email")) or "").lower() or None,
-            telefono=_texto_limpio(celda(fila, "telefono")),
+            telefono=(_texto_limpio(celda(fila, "telefono")) or "")[:30] or None,
+            contacto_emergencia=contacto[:200] if contacto else None,
             grupo_sanguineo=_grupo_sanguineo(_texto_limpio(celda(fila, "grupo_sanguineo")), factor),
             factor_rh=factor,
-            cargo=_texto_limpio(celda(fila, "cargo")),
+            cargo=cargo,
             formacion=formacion,
             nivel_educativo=_texto_limpio(celda(fila, "nivel_educativo")),
             titulo_obtenido=_texto_limpio(celda(fila, "titulo_obtenido")),
@@ -643,7 +687,8 @@ def leer_reporte_bomberos(ruta: Path) -> LecturaPadron:
 # Campos que la importación copia a `Personal` SOLO si el Excel trae el dato
 # (un vacío en RUBA nunca borra lo que se cargó a mano en Fire Station).
 _CAMPOS_COMPLETAR = (
-    "fecha_nacimiento", "sexo", "domicilio", "email", "telefono", "grupo_sanguineo", "factor_rh",
+    "fecha_nacimiento", "sexo", "domicilio", "email", "telefono", "contacto_emergencia", "grupo_sanguineo",
+    "factor_rh",
     "cargo", "formacion", "nivel_educativo", "titulo_obtenido", "situacion_revista", "fecha_ultimo_ascenso",
 )
 
@@ -657,8 +702,8 @@ def upsert_bomberos(session: Session, bomberos: List[BomberoRuba]) -> ResumenImp
       - legajo y DNI se actualizan solo si no los usa otra persona;
       - los demás datos (fechas, contacto, cargo...) solo se escriben si el
         Excel los trae: un vacío no borra un dato cargado a mano;
-      - la jerarquía se pisa solo si viene de la columna 'Jerarquía'; la
-        'Formación' (Bombero/Aspirante) solo completa jerarquías vacías;
+      - la jerarquía se pisa si viene de 'Jerarquía' o del grado de 'Cargo';
+        la 'Formación' (Bombero/Aspirante) solo completa jerarquías vacías;
       - a quien está de Baja y no existe en la base no se lo da de alta."""
     from app.core.security import PIN_DEFAULT, hash_pin
     from app.models import Personal
