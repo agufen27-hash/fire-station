@@ -23,7 +23,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.core.security import LARGO_MAX_PIN, PIN_DEFAULT, segundos_bloqueo_maestra
+from app.core.security import (
+    CLAVE_MAESTRA_DEFAULT,
+    LARGO_MAX_PIN,
+    LARGO_MIN_CLAVE_MAESTRA,
+    PIN_DEFAULT,
+    clave_maestra_es_default,
+    establecer_clave_maestra,
+    problema_clave_maestra_nueva,
+    segundos_bloqueo_maestra,
+)
 from app.db import get_session
 from app.models import Personal
 from app.services.personal_service import PinError, cambiar_pin, resetear_pin_con_clave_maestra
@@ -188,3 +197,49 @@ class DialogoResetPinMaestra(_DialogoPinBase):
             self._error(str(e), campo)
             return
         self.accept()
+
+
+class DialogoClaveMaestraInicial(_DialogoPinBase):
+    """Se muestra al abrir la app mientras la instalación siga con la clave
+    maestra de fábrica: define una propia del cuartel (data/config.json).
+    "Más tarde" deja seguir trabajando; se vuelve a pedir en el próximo inicio."""
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(
+            "Definir clave maestra del cuartel",
+            f"Esta instalación todavía usa la clave maestra de fábrica ({CLAVE_MAESTRA_DEFAULT}). "
+            "La clave maestra permite resetear PIN olvidados y designar el primer administrador, "
+            "así que conviene reemplazarla por una propia del cuartel. Anotala en un lugar seguro: "
+            "no se puede recuperar, solo volver a definir.",
+            "Guardar clave maestra", parent)
+        self.botones.button(QDialogButtonBox.StandardButton.Cancel).setText("Más tarde")
+        self.entry_nueva = _campo_secreto(
+            self, largo=128, ayuda=f"Al menos {LARGO_MIN_CLAVE_MAESTRA} caracteres")
+        self.entry_repetir = _campo_secreto(self, largo=128)
+        self.form.addRow("Clave nueva", self.entry_nueva)
+        self.form.addRow("Repetir clave", self.entry_repetir)
+        self.entry_nueva.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _confirmar(self) -> None:
+        nueva = self.entry_nueva.text()
+        problema = problema_clave_maestra_nueva(nueva)
+        if problema:
+            self._error(problema, self.entry_nueva)
+            return
+        if nueva != self.entry_repetir.text():
+            self._error("Las dos claves no coinciden.", self.entry_repetir)
+            return
+        try:
+            establecer_clave_maestra(nueva)
+        except (OSError, ValueError) as e:
+            self._error(f"No se pudo guardar la clave maestra: {e}")
+            return
+        self.accept()
+
+
+def pedir_clave_maestra_si_es_default(parent: Optional[QWidget] = None) -> bool:
+    """Al iniciar: si rige la clave maestra de fábrica, pide definir una
+    propia. Devuelve True si se guardó una clave nueva."""
+    if not clave_maestra_es_default():
+        return False
+    return DialogoClaveMaestraInicial(parent).exec() == QDialog.DialogCode.Accepted

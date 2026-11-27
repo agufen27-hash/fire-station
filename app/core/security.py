@@ -11,11 +11,13 @@ bruta de quien ya tiene la base en la mano. Por eso además de hashear se
 obliga a cambiar el PIN de fábrica (PIN_DEFAULT).
 
 Clave maestra: permite resetear el PIN de un bombero sin conocer el
-anterior. Se busca su hash (mismo formato "salt$hash") en este orden:
+anterior (y designar el primer ADMIN si no hay cuenta de RUBA). Se busca su
+hash (mismo formato "salt$hash") en este orden:
   1. data/config.json            -> {"seguridad": {"clave_maestra_hash": "..."}}
      (escribible, propio de cada cuartel; ver establecer_clave_maestra())
   2. config/app_config.json      -> misma clave (configuración del repo)
-  3. HASH_MAESTRO_EMERGENCIA     -> constante de emergencia (solo el hash)
+Si ninguno define una, vale la clave de fábrica CLAVE_MAESTRA_DEFAULT y la
+app pide reemplazarla al arrancar (ver clave_maestra_es_default()).
 """
 
 from __future__ import annotations
@@ -39,12 +41,10 @@ ITERACIONES = 100_000
 BYTES_SAL = 16
 SEPARADOR = "$"
 
-# Hash de la clave maestra de emergencia (la clave en sí NO está en el
-# código). Se usa solo si ningún archivo de configuración define otra.
-HASH_MAESTRO_EMERGENCIA = (
-    "f459c4026d49c30054d23a2d51c3d096$"
-    "17130d5f565a0c8d31ed3d20b15776a4adfe457c6c73e44c4c1c9cfc131dd531"
-)
+# Clave maestra de fábrica: vale en toda instalación que todavía no definió
+# una propia. Al abrir la app se pide cambiarla (run.py).
+CLAVE_MAESTRA_DEFAULT = "5903"
+LARGO_MIN_CLAVE_MAESTRA = 8
 
 # Freno a la fuerza bruta de la clave maestra (por proceso).
 MAX_INTENTOS_MAESTRA = 5
@@ -145,13 +145,35 @@ def _hash_maestro_de(datos: dict) -> Optional[str]:
     return valor if es_hash(valor) else None
 
 
-def hash_maestro_configurado() -> str:
-    """Hash vigente de la clave maestra (config del cuartel > app_config > emergencia)."""
+def hash_maestro_configurado() -> Optional[str]:
+    """Hash de la clave maestra propia (config del cuartel > app_config), o
+    None si todavía rige la de fábrica."""
     for ruta in (_ruta_config_escribible(), get_resource_path("config/app_config.json")):
         valor = _hash_maestro_de(_leer_json(ruta))
         if valor:
             return valor
-    return HASH_MAESTRO_EMERGENCIA
+    return None
+
+
+def clave_maestra_es_default() -> bool:
+    """True si esta instalación todavía usa la clave maestra de fábrica."""
+    return hash_maestro_configurado() is None
+
+
+def _coincide_clave_maestra(clave: str) -> bool:
+    hashed = hash_maestro_configurado()
+    if hashed is None:
+        return hmac.compare_digest(clave.encode("utf-8"), CLAVE_MAESTRA_DEFAULT.encode("utf-8"))
+    return verificar_pin_hash(clave, hashed)
+
+
+def problema_clave_maestra_nueva(clave: str) -> Optional[str]:
+    """Motivo por el que `clave` no sirve como clave maestra nueva, o None."""
+    if not clave or len(clave) < LARGO_MIN_CLAVE_MAESTRA:
+        return f"La clave maestra tiene que tener al menos {LARGO_MIN_CLAVE_MAESTRA} caracteres."
+    if clave == CLAVE_MAESTRA_DEFAULT:
+        return "No se puede usar la clave maestra de fábrica."
+    return None
 
 
 def segundos_bloqueo_maestra() -> int:
@@ -165,7 +187,7 @@ def verificar_clave_maestra(clave: str) -> bool:
     siquiera comparar)."""
     if segundos_bloqueo_maestra():
         return False
-    if clave and verificar_pin_hash(clave, hash_maestro_configurado()):
+    if clave and _coincide_clave_maestra(clave):
         _intentos_maestra["fallidos"] = 0
         return True
     _intentos_maestra["fallidos"] += 1
@@ -178,8 +200,9 @@ def verificar_clave_maestra(clave: str) -> bool:
 def establecer_clave_maestra(clave: str) -> None:
     """Guarda el hash de una clave maestra propia del cuartel en
     data/config.json (sección "seguridad"), conservando el resto del archivo."""
-    if not clave or len(clave) < 8:
-        raise ValueError("La clave maestra tiene que tener al menos 8 caracteres.")
+    problema = problema_clave_maestra_nueva(clave)
+    if problema:
+        raise ValueError(problema)
     ruta = _ruta_config_escribible()
     datos = _leer_json(ruta)
     seccion = datos.get("seguridad") if isinstance(datos.get("seguridad"), dict) else {}

@@ -14,6 +14,7 @@ from app.paths import ICONO_APP, asegurar_config_inicial, configurar_entorno_pla
 from app.services.cartografia import asegurar_calibracion_en_config
 from app.ui.actualizaciones import iniciar_actualizaciones
 from app.ui.main_window import MainWindow
+from app.ui.pin_dialogs import pedir_clave_maestra_si_es_default
 from app.ui.theme import aplicar_tema
 from app.ui.widgets import instalar_filtro_rueda
 
@@ -60,6 +61,7 @@ def main() -> None:
 
     ventana = MainWindow()
     ventana.show()
+    pedir_clave_maestra_si_es_default(ventana)  # instalación nueva: reemplazar la 5903
     iniciar_actualizaciones(ventana)  # busca en segundo plano (GitHub Releases / git)
 
     sys.exit(app.exec())
